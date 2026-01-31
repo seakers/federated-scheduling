@@ -5,9 +5,12 @@ import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import numpy as np
 import math
-import pandas as pd
-import bisect
-import uuid
+from scipy.spatial.transform import Rotation
+# from scipy.optimize import bisect as scipy_bisect
+from scipy.optimize import newton as scipy_newton
+# import pandas as pd
+# import bisect
+# import uuid
 from enum import Enum
 import cartopy.io.shapereader as shpreader
 import shapely.geometry as sgeom
@@ -383,3 +386,117 @@ land = prep(land_geom)
 
 def is_land(x, y):
     return land.contains(sgeom.Point(x, y))
+
+def spacecraft_fov(time: dt.datetime, satellite: Satellite, instrument: str, ground_lla: Location, num_samples: int = 12, USE_SPHERICAL_APPROXIMATION=False):
+    '''
+    Input: a Satellite, a list of the instrument/instruments to show, and a LLA that the satellite is pointing to.
+    Output: a Polygon showing the extent of the satellite FOV.
+    '''
+    # Compute the satellite location in space.
+    # Compute the satellite-to-ground (s2g) vector.
+    # Rotate that vector by half the FOV along an axis perpendicular to the s2g vector.
+    # Rotate _that_ vector around the s2g vector n times.
+    # For each, find the intersection with the ground, defined as: e2s+s2g vector modulo is Earth radius.
+    # Find the LLA in the J2K frame.
+    # Rotate longitude by time.
+
+    # Compute the satellite location in space.
+    satellite_position_inertial, _ = satellite.orbit.get_position(time, normalize=False)
+    # print("e2s: {}".format(satellite_position_inertial))
+    # satellite_position_inertial = satellite_position_velocity[0]
+    # Compute the satellite-to-ground (s2g) vector.
+    ground_position_inertial, _ = pyorbital.astronomy.observer_position(time, ground_lla.lon_deg, ground_lla.lat_deg, ground_lla.alt_km)
+    # print("e2g: {}".format(ground_position_inertial))
+    # e2o = e2s+s2o. So s2o = e2o - e2s.
+    sat_to_ground_vector_inertial = ground_position_inertial - satellite_position_inertial
+    # print("s2g: {}".format(sat_to_ground_vector_inertial))
+    sat_to_ground_versor_inertial = sat_to_ground_vector_inertial/np.linalg.norm(sat_to_ground_vector_inertial,2)
+    # Rotate that vector by half the FOV along an axis perpendicular to the s2g vector.
+    sat_easting_versor = np.cross(sat_to_ground_versor_inertial, [0,0,1]) # This vector is perpendicular to the s2g unit vector. It should also be perpendicular to the N vector, but we care less about that.
+    sat_easting_versor/=np.linalg.norm(sat_easting_versor,2)
+    
+    off_axis_versor_rotation = Rotation.from_rotvec(satellite.instrument_fov_rad[instrument]/2. * sat_easting_versor)
+    # Rotate _that_ vector around the s2g vector n times.
+    around_axis_versor_rotation = Rotation.from_rotvec(2*np.pi/num_samples * sat_to_ground_versor_inertial)
+
+    # For each, find the intersection with the ground, defined as: e2s+s2g vector modulo is Earth radius.
+    llas = []
+
+    for sample_ix in range(num_samples):
+        gaze_vector = off_axis_versor_rotation.apply(sat_to_ground_vector_inertial)
+        for _s in range(sample_ix):
+            gaze_vector = around_axis_versor_rotation.apply(gaze_vector)
+        
+        if USE_SPHERICAL_APPROXIMATION:
+            # Let's start with the circular approximation
+            # We want norm(satellite_position_inertial+lambda*gaze_vector) to be 6371. This is just a search, right? There may even be an analytical solution.
+            # satellite_position_inertial+lambda*gaze_vector = (e2sx+l*s2gx, e2sy+l*s2gy, e2sz+l*s2gz)
+            # (e2sx+l*s2gx)^2 + (e2sy+l*s2gy)^2 + (e2sz+l*s2gz)^2 = R^2
+            # e2sx^2 + e2sy^2 + e2sz^2 + l^2*(s2gx^2+s2gy^2+s2gz^2) + 2*l * (e2sx*s2gx + e2sy*s2gy + e2sz*s2gz) = R^2
+            # a* l^2 + b * l + c = 0 with
+            # a = (s2gx^2+s2gy^2+s2gz^2)=norm(s2g) ; b = 2*(e2sx*s2gx + e2sy*s2gy + e2sz*s2gz) = 2*dot(e2s, s2g); c= e2sx^2 + e2sy^2 + e2sz^2-R^2=norm(e2s) - R^2;
+            # l = (-b \pm sqrt (b^2-4*a*c))/2a
+            _b = 2*np.dot(satellite_position_inertial, gaze_vector)
+            _c = np.dot(satellite_position_inertial,satellite_position_inertial) - (R_earth_km+ground_lla.alt_km)**2
+            _a = np.dot(gaze_vector,gaze_vector)
+            # The gaze vector intersects the Earth twice (or zero times if it just looks away).
+            # We pick the closest intersection.
+            gaze_vector_lambda = (-_b-np.sqrt(_b*_b - 4*_a*_c))/(2*_a)
+            # print(gaze_vector_lambda)
+        else:
+            # But in fact the Earth is oblate! We need to explicitly think about oblateness.
+            # What we want here is that norm(satellite_position_inertial+lambda*gaze_vector) = R_oblate(lon, lat, alt).
+            # Where lon is a function of lambda.
+            # Specifically we want:
+            # gaze_vector_on_ground = satellite_position_inertial+lambda*gaze_vector
+            # latitude_rad = np.atan2(gaze_vector_on_ground[2], np.linalg.norm(gaze_vector_on_ground[:2]))
+            # longitude_rad = np.atan2(gaze_vector_on_ground[1], gaze_vector_on_ground[0]) - pyorbital.astronomy.gmst(time)
+            # np.linalg.norm(satellite_position_inertial+lambda*gaze_vector)=oblate_altitude(latitude_rad, longitude_rad)+altitude
+            # And we can bisect our way home
+            def wgs84_oblate_elevation(geocentric_latitude_rad):
+                semi_major_axis = pyorbital.astronomy.A
+                # f = (major-minor)/major; f*major = major-minor; minor = major(1-f)
+                semi_minor_axis = pyorbital.astronomy.A*(1-pyorbital.astronomy.F)
+                eccentricity = math.sqrt(2*pyorbital.astronomy.F-pyorbital.astronomy.F**2)
+                oblate_elevation = semi_minor_axis/math.sqrt(1-(eccentricity*np.cos(geocentric_latitude_rad))**2)
+                return oblate_elevation
+
+            def radius_error_with_oblateness(gaze_vector_lambda):
+                gaze_vector_on_ground = satellite_position_inertial+gaze_vector_lambda*gaze_vector
+                gaze_radius = np.linalg.norm(gaze_vector_on_ground)
+                
+                geocentric_latitude_rad = np.atan2(gaze_vector_on_ground[2], np.linalg.norm(gaze_vector_on_ground[:2]))
+                # geodetic_latitude_rad = np.atan(np.tan(geocentric_latitude_rad)/(1-pyorbital.astronomy.F)**2)
+
+                # longitude_rad = np.atan2(gaze_vector_on_ground[1], gaze_vector_on_ground[0]) - pyorbital.astronomy.gmst(time)
+                oblate_earth_radius = wgs84_oblate_elevation(geocentric_latitude_rad)+ground_lla.alt_km
+                return (gaze_radius-oblate_earth_radius)
+
+            try:
+                # gaze_vector_lambda = scipy_bisect(radius_error_with_oblateness,0.5, 1.2)
+                gaze_vector_lambda = scipy_newton(radius_error_with_oblateness,1.0)
+            except ValueError as e:
+                print(e)
+                # Just skip the sample
+                continue
+
+
+        # Find the LLA in the J2K frame.
+        gaze_vector_on_ground = satellite_position_inertial+gaze_vector_lambda*gaze_vector
+        # Now we have a position in ECI/J2K. What is the corresponding lon-lat?
+        # Geocentric latitude is easy.
+        geocentric_latitude_rad = np.atan2(gaze_vector_on_ground[2], np.linalg.norm(gaze_vector_on_ground[:2]))
+        # From that, we get the geodetic latitude. https://celestrak.org/columns/v02n03/
+        geodetic_latitude_rad = np.atan(np.tan(geocentric_latitude_rad)/(1-pyorbital.astronomy.F)**2)
+        
+        # For longitude, let's get the angle from the vernal equinox (x).
+        local_sidereal_time_rad = np.atan2(gaze_vector_on_ground[1], gaze_vector_on_ground[0])
+        # And then we will convert that to longitude by remembering that local sidereal time = GMT sidereal time + longitude
+        greenwich_mean_sidereal_time = pyorbital.astronomy.gmst(time)
+        longitude_rad = local_sidereal_time_rad-greenwich_mean_sidereal_time
+        
+        # Finally we pack things together
+        llas.append((longitude_rad*180./np.pi, geodetic_latitude_rad*180./np.pi, 0))
+        # ground_footprint_poly = Polygon([(_lla[0], _lla[1]) for _lla in ground_footprint_llas])
+    return llas
+        

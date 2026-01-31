@@ -98,6 +98,7 @@ class World():
             self.history.append({
                 'time': _event.time,
                 'event': _event,
+                'phenomena': [copy.deepcopy(p) for p in self.phenomena],
                 'states': {
                     'satellites': [copy.deepcopy(s) for s in self.satellites],
                     # Constellations and brokers have a pointer to World, which has a pointer to constellations, which...recursion!
@@ -883,3 +884,10 @@ class Broker():
 
 
 
+def retell_history(world: World):
+    for _chronicle in world.history:
+        print("Time: {}. Event: {}".format(_chronicle['time'], _chronicle['event']))
+        if type(_chronicle['event'])==ObservationEvent:
+            print("Observation: sat {} and opportunity {}".format(_chronicle['event'].satellite, _chronicle['event'].opportunity))
+        if type(_chronicle['event'])==CommunicationEvent:
+            print("Communication: station {} to sat {} during pass {}".format(_chronicle['event'].station, _chronicle['event'].satellite, _chronicle['event'].comm_pass))
