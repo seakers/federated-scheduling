@@ -58,14 +58,14 @@ class CommunicationEvent(Event):
         self.station = station
         self.comm_pass = comm_pass
 
-class Phenomenon(Location):
-    def __init__(self, lon_deg: float, lat_deg: float, alt_km: float, start_time: dt.datetime, end_time: dt.datetime, name: str=""):
-        super().__init__(lon_deg=lon_deg, lat_deg=lat_deg, alt_km=alt_km, name=name)
+class Phenomenon(Pose):
+    def __init__(self, lon_deg: float, lat_deg: float, alt_km: float, start_time: dt.datetime, end_time: dt.datetime, heading_deg: float=None, speed_kph: float=None, name: str=""):
+        super().__init__(lon_deg=lon_deg, lat_deg=lat_deg, alt_km=alt_km, heading_deg=heading_deg, speed_kph=speed_kph, name=name)
         self.start_time = start_time
         self.end_time = end_time
 
     def __str__(self):
-        return "{}: Lon {}, lat {}, alt {}, start {}, end {}".format(self.name, self.lon_deg,self.lat_deg,self.alt_km, self.start_time, self.end_time)
+        return "{}: Lon {}°, lat {}°, alt {} km, hdg {}°, speed {} km/h, start {}, end {}".format(self.name, self.lon_deg,self.lat_deg,self.alt_km, self.heading_deg, self.speed_kph, self.start_time, self.end_time)
     def __repr__(self):
         return self.__str__()
 
@@ -127,7 +127,7 @@ class World():
             raise ValueError("Event {} is earlier than sim time {}".format(event, self.time)) 
         bisect.insort(self.events, event, key=lambda x: x.time)
         
-    def do_observation(self, observation: ObservationOpportunity, spacecraft: Satellite):
+    def do_observation(self, observation: ObservationOpportunity, spacecraft: Satellite, phenomenon_processor=lambda o, s, p: p):
         # Find phenomena close to the observation location in space and at the right time
         # Return a data product and a list of event states
         # print("Obs opp {}".format(observation))
@@ -161,7 +161,7 @@ class World():
         # Store SOMETHING for the completed observation
         if observation not in spacecraft.data_products.keys():
             spacecraft.data_products[observation] = []
-        spacecraft.data_products[observation].extend(observed_phenomena)
+        spacecraft.data_products[observation].extend([phenomenon_processor(observation, spacecraft, p) for p in observed_phenomena])
         spacecraft.known_phenomena.append(observed_phenomena)
         
         return True
@@ -297,6 +297,7 @@ class ConstellationGroundScheduler():
             callback_request_scheduled=lambda req_pass: None,
             callback_request_unscheduled=lambda reason: None,
             callback_request_ready=lambda data_product: None,
+            phenomenon_processor=lambda o, s, p: p
             ):
         # Pick the best satellite to fulfill this. This is where we'll need to be smarter. Or not! Just pick something starting the day after.
         print("[{}] Scheduling request {}".format(self.name, request))
@@ -459,7 +460,7 @@ class ConstellationGroundScheduler():
             return -3
         #
 
-        schedule_observation_uplink(self.world, _best_sat_object, _best_uplink_comm_opportunity, _best_pass.highest, _best_uplink_comm_opportunity_station)
+        schedule_observation_uplink(self.world, _best_sat_object, _best_uplink_comm_opportunity, _best_pass.highest, _best_uplink_comm_opportunity_station, phenomenon_processor=phenomenon_processor)
         schedule_sat_downlink(_world=self.world, satellite=_best_sat_object, comm_pass = _best_downlink_comm_opportunity, station = _best_downlink_comm_opportunity_station, constellation_scheduler=self)
         # # Do downlink
         
@@ -531,7 +532,7 @@ class ConstellationGroundScheduler():
     def get_request_status(self, request: ObservationRequest):
         return self._requests[self._requests['request'] == request].status
 
-def schedule_observation(_world, satellite: Satellite, obs_opportunity):
+def schedule_observation(_world, satellite: Satellite, obs_opportunity, phenomenon_processor= lambda o, s, p: p):
     # An observation fires at the time of the observation. It adds known events to the satellite's known_phenomena store.
     # TODO it also adds an observation product to the satellite's 
 
@@ -559,7 +560,7 @@ def schedule_observation(_world, satellite: Satellite, obs_opportunity):
             action_callable = lambda _sate=satellite: unlock_satellite(_sate)
         )
         _world.add_event(_unlock_event)
-        return __world.do_observation(_obs_opportunity, _satellite)
+        return __world.do_observation(_obs_opportunity, _satellite, phenomenon_processor=phenomenon_processor)
     
     _event = ObservationEvent(
         name = "Obs, sat {}".format(satellite.name),
@@ -573,7 +574,7 @@ def schedule_observation(_world, satellite: Satellite, obs_opportunity):
 
     return 0
 
-def schedule_observation_uplink(_world: World, satellite: Satellite, comm_opportunity: ObservationPass, obs_opportunity: ObservationOpportunity, station: Location):
+def schedule_observation_uplink(_world: World, satellite: Satellite, comm_opportunity: ObservationPass, obs_opportunity: ObservationOpportunity, station: Location, phenomenon_processor=lambda o, s, p: p):
     # An observation uplink fires at the time of the uplink. It adds an event that will trigger the observation at the appropriate time. 
     if (comm_opportunity.highest.time>obs_opportunity.time):
         raise ValueError("Uplink {} is after related observation {}".format(comm_opportunity, obs_opportunity))
@@ -601,7 +602,7 @@ def schedule_observation_uplink(_world: World, satellite: Satellite, comm_opport
             action_callable = lambda _sate=satellite: unlock_satellite(_sate)
         )
         __world.add_event(_unlock_event)
-        return schedule_observation(__world, __satellite, __obsopp)
+        return schedule_observation(__world, __satellite, __obsopp, phenomenon_processor=phenomenon_processor)
 
     _event = CommunicationEvent(
         name="Uplink, station {} to sat {}".format(station.name, satellite.name),
@@ -702,6 +703,7 @@ class Broker():
             number_of_submissions: int=1,
             follow_up_action_success=lambda data_product: None,
             follow_up_action_failure=lambda reason: None,
+            phenomenon_processor=lambda o, s, p: p
             ):
         # Pick the best satellite to fulfill this. This is where we'll need to be smarter. Or not! Just pick something starting the day after.
         print("[{}] scheduling request {}".format(self.name, request))
@@ -850,6 +852,7 @@ class Broker():
                     callback_request_scheduled=callback_request_scheduled,
                     callback_request_unscheduled=callback_request_unscheduled,
                     callback_request_ready=callback_request_ready,
+                    phenomenon_processor=phenomenon_processor,
                 )
         if successful_submissions_for_this_request == 0:
             print("No unconflicted opportunities here")

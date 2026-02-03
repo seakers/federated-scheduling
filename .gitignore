@@ -217,6 +217,10 @@ __marimo__/
 
 # Plot intermediate products
 *.png
+*.pdf
 *.mp4
 *.gif
 *.xlsx
+*.zip
+*.json
+*.txt

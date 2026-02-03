@@ -159,6 +159,25 @@ class Location():
     def __repr__(self):
         return self.__str__()
     
+class Pose(Location):
+    def __init__(self, lon_deg: float, lat_deg: float, time: dt.datetime=dt.datetime.fromtimestamp(0), alt_km: float=None, heading_deg: float=None, speed_kph: float=None, name: str=""):
+        super().__init__(lon_deg=lon_deg, lat_deg=lat_deg, alt_km=alt_km, name=name)
+        self.time = time
+        self.heading_deg = heading_deg
+        self.speed_kph = speed_kph
+    def __str__(self):
+        return "Pose {} | Lon {}°, lat {}°, alt {} km, heading {}°, speed {} km/h at {}".format(
+            self.name,
+            self.lon_deg,
+            self.lat_deg,
+            self.alt_km,
+            self.heading_deg,
+            self.speed_kph,
+            self.time
+        )
+    def __repr__(self):
+        return self.__str__()
+    
 # Let's search for opportunities. 
 # Input: a number of satellites, each with instruments. A number of ground locations we would like to image, with time windows.
 # Output: a map from locations to satellite passes.
