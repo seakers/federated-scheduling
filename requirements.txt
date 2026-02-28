@@ -2,3 +2,5 @@ pyorbital~=1.10.2
 matplotlib~=3.10.6
 cartopy~=0.25.0
 pandas~=2.3.3
+networkx~=3.6.1
+networkx-temporal~=1.3.0

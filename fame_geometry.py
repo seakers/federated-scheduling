@@ -266,6 +266,7 @@ class Satellite():
         self.known_phenomena = []
         self.attitude_controller_state = AttitudeController.FREE
         self.busy_with = None
+        self.isl_links = {} # Satellite: range_km
     def __str__(self):
         return self.name
     def __repr__(self):
@@ -401,10 +402,10 @@ land_shp_fname = shpreader.natural_earth(resolution='50m',
                                        category='physical', name='land')
 
 land_geom = unary_union(list(shpreader.Reader(land_shp_fname).geometries()))
-land = prep(land_geom)
+_land = prep(land_geom)
 
 def is_land(x, y):
-    return land.contains(sgeom.Point(x, y))
+    return _land.contains(sgeom.Point(x, y))
 
 def spacecraft_fov(time: dt.datetime, satellite: Satellite, instrument: str, ground_lla: Location, num_samples: int = 12, USE_SPHERICAL_APPROXIMATION=False):
     '''
