@@ -16,6 +16,8 @@ import cartopy.io.shapereader as shpreader
 import shapely.geometry as sgeom
 from shapely.ops import unary_union
 from shapely.prepared import prep
+import networkx as nx
+import bisect
 
 from fame_geometry import *
 
@@ -280,6 +282,16 @@ def observation_quality(opportunity: ObservationOpportunity, preferred_zenith_an
     return abs(90.-opportunity.look_angle_dec_deg)/90. + abs(preferred_zenith_angle_deg-opportunity.sun_zenith_angle_deg)/90 - opportunity.range_km/1000
 
 def find_observation_opportunities(observation_requests: list, satellites: list, passes_error_s=60):
+    """ A function that finds observation opportunities for a tiven observation request
+
+    Args:
+        observation_requests (list[ObservationRequest]): A list of ObservationRequests
+        satellites (list[Spacecraft]): a list of spacecraft to search for
+        passes_error_s (int, optional): the discretization of the satellite orbit, used when searching for overflights. Defaults to 60.
+
+    Returns:
+        dict[Request][Spacecraft]: list[ObservationPass]: A list of passes (an object with a rise time, fall time, and highest time, each with geometric properties) for a given opportunity and spacecraft
+    """
     opportunities = {}
     
     for request in observation_requests:
@@ -520,3 +532,402 @@ def spacecraft_fov(time: dt.datetime, satellite: Satellite, instrument: str, gro
         # ground_footprint_poly = Polygon([(_lla[0], _lla[1]) for _lla in ground_footprint_llas])
     return llas
         
+
+class ISLLink():
+    def __init__(self, source: Satellite, destination: Satellite, time: dt.datetime):
+        self.source = source
+        self.destination = destination
+        self.time = time
+    def __str__(self):
+        return "ISL link from {} to {} at {}".format(self.source, self.destination, self.time)
+    def __repr__(self):
+        return self.__str__()
+    
+def find_isl_opportunities(satellites: list, min_time: dt.datetime, max_time: dt.datetime, passes_error_s=60, passes_horizon_deg=15):
+    # We check at one-minute resolution. Is it close enough? Maybe.
+    isl_links = []
+    times = min_time + np.array([dt.timedelta(minutes=minutes)
+                                for minutes in range( int(math.ceil((max_time-min_time).total_seconds()/60))) ])
+    poses = {}
+    for satellite in satellites:
+        poses[satellite] = {}
+        for time in times:
+            poses[satellite][time] = np.array(satellite.orbit.get_position(time, normalize=False)[:3])
+
+    for time in times:
+        for satellite in satellites:
+            # pose = np.array(satellite.orbit.get_position(time, normalize=False)[:3])
+            pose = poses[satellite][time]
+            for other_satellite, isl_range in satellite.isl_links.items():
+                # other_pose = np.array(other_satellite.orbit.get_position(time, normalize=False)[:3])
+                other_pose = poses[other_satellite][time]
+                _range = np.linalg.norm(other_pose-pose)
+                if (_range<isl_range):
+                    isl_links.append(
+                        ISLLink(
+                            source=satellite,
+                            destination=other_satellite,
+                            time=time
+                        )
+                    )
+    return isl_links
+
+def build_unrolled_temporal_graph(comm_opportunities_by_sat: dict, isl_links: list, ground_stations: list=None):
+    # Make a list of GSs we talk to
+    if ground_stations is None:
+        ground_stations = []
+        for _links in comm_opportunities_by_sat.values():
+            for _link in _links:
+                ground_stations.append(_link[0])
+        ground_stations = list(set(ground_stations))
+
+    satellites = list(comm_opportunities_by_sat.keys())
+    for isl_link in isl_links:
+        satellites.append(isl_link.source)
+        satellites.append(isl_link.destination)
+
+    satellites = list(set(satellites))
+
+
+    # Make a list of times
+    times = []
+    for isl_link in isl_links:
+        times.append(isl_link.time)
+    for _links in comm_opportunities_by_sat.values():
+        for _link in _links:
+            times.append(_link[1].rise.time)
+            times.append(_link[1].fall.time)
+
+    times = list(set(times))
+    times.sort()
+
+    contact_graph = nx.DiGraph()
+
+    # Create the nodes
+    for time in times:
+        for satellite in satellites:
+            contact_graph.add_node(
+                f"{satellite.name}_{time.timestamp()}",
+                station=satellite,
+                station_type="satellite",
+                time=time,
+                )
+        for gs in ground_stations:
+            contact_graph.add_node(
+                f"{gs.name}_{time.timestamp()}",
+                station=gs,
+                station_type="ground_station",
+                time=time,
+                )
+
+    # Also create some convenience nodes
+    for satellite in satellites:
+        contact_graph.add_node(f"{satellite.name}_EARLIEST_OUT", station=satellite, station_type="satellite")
+        contact_graph.add_node(f"{satellite.name}_LATEST_IN", station=satellite, station_type="satellite")
+    for gs in ground_stations:
+        contact_graph.add_node(f"{gs.name}_EARLIEST_OUT", station=gs, station_type="ground_station")
+        contact_graph.add_node(f"{gs.name}_LATEST_IN", station=gs, station_type="ground_station")
+
+    # Self links
+    for time_index in range(len(times)-1):
+        for satellite in satellites:
+            contact_graph.add_edge(
+                f"{satellite.name}_{times[time_index].timestamp()}",
+                f"{satellite.name}_{times[time_index+1].timestamp()}",
+                time=times[time_index],
+                duration=times[time_index+1]-times[time_index],
+                source_station=satellite,
+                target_station=satellite,
+                source_station_type="satellite",
+                target_station_type="satellite",
+                )
+        for gs in ground_stations:
+            contact_graph.add_edge(
+                f"{gs.name}_{times[time_index].timestamp()}",
+                f"{gs.name}_{times[time_index+1].timestamp()}",
+                time=times[time_index],
+                duration=times[time_index+1]-times[time_index],
+                source_station=gs,
+                target_station=gs,
+                source_station_type="ground_station",
+                target_station_type="ground_station",
+                )
+            
+    # Links for earliest, latest
+    for time in times:
+        for satellite in satellites:
+            contact_graph.add_edge(
+                f"{satellite.name}_{time.timestamp()}",
+                f"{satellite.name}_EARLIEST_OUT",
+                time=times[time_index],
+                duration=dt.timedelta(seconds=0),
+                source_station=satellite,
+                target_station=satellite,
+                source_station_type="satellite",
+                target_station_type="satellite",
+                )
+            contact_graph.add_edge(
+                f"{satellite.name}_LATEST_IN",
+                f"{satellite.name}_{time.timestamp()}",
+                time=times[time_index],
+                duration=dt.timedelta(seconds=0),
+                source_station=satellite,
+                target_station=satellite,
+                source_station_type="satellite",
+                target_station_type="satellite",
+                )
+        for gs in ground_stations:
+            contact_graph.add_edge(
+                f"{gs.name}_{time.timestamp()}",
+                f"{gs.name}_EARLIEST_OUT",
+                time=times[time_index],
+                duration=dt.timedelta(seconds=0),
+                source_station=gs,
+                target_station=gs,
+                source_station_type="ground_station",
+                target_station_type="ground_station",
+                )
+            contact_graph.add_edge(
+                f"{gs.name}_LATEST_IN",
+                f"{gs.name}_{time.timestamp()}",
+                time=times[time_index],
+                duration=dt.timedelta(seconds=0),
+                source_station=gs,
+                target_station=gs,
+                source_station_type="ground_station",
+                target_station_type="ground_station",
+                )
+            
+    # The broader Internet connecting ground stations
+    for _time in times:
+        for gs1 in ground_stations:
+            for gs2 in ground_stations:
+                if gs2 != gs1:
+                    contact_graph.add_edge(
+                        f"{gs1.name}_{_time.timestamp()}",
+                        f"{gs2.name}_{_time.timestamp()}",
+                        time=_time,
+                        duration=dt.timedelta(seconds=0),
+                        source_station=gs1,
+                        target_station=gs2,
+                        source_station_type="ground_station",
+                        target_station_type="ground_station",
+                        )
+
+    # ISL link
+    for isl_link in isl_links:
+        contact_graph.add_edge(
+            f"{isl_link.source.name}_{(isl_link.time.timestamp())}",
+            f"{isl_link.destination.name}_{(isl_link.time.timestamp())}",
+            time=isl_link.time,
+            duration=dt.timedelta(seconds=0),
+                source_station=isl_link.source,
+                target_station=isl_link.destination,
+                source_station_type="satellite",
+                target_station_type="satellite",
+            )
+    
+    # GS passes
+    for satellite, opportunities in comm_opportunities_by_sat.items():
+        for opportunity in opportunities:
+            station = opportunity[0]
+            obs_pass = opportunity[1]
+            
+            # IF we have contacts at both rise and fall time, we will be able to route both early and late transmissions.
+            contact_graph.add_edge(
+                f"{station.name}_{(obs_pass.rise.time.timestamp())}",
+                f"{satellite.name}_{(obs_pass.rise.time.timestamp())}",
+                time=obs_pass.rise.time,
+                duration=dt.timedelta(seconds=0),
+                source_station=station,
+                target_station=satellite,
+                source_station_type="ground_station",
+                target_station_type="satellite",
+                )
+            contact_graph.add_edge(
+                f"{satellite.name}_{(obs_pass.rise.time.timestamp())}",
+                f"{station.name}_{(obs_pass.rise.time.timestamp())}",
+                time=obs_pass.rise.time,
+                duration=dt.timedelta(seconds=0),
+                source_station=satellite,
+                target_station=station,
+                source_station_type="satellite",
+                target_station_type="ground_station",
+                )
+            contact_graph.add_edge(
+                f"{station.name}_{(obs_pass.rise.time.timestamp())}",
+                f"{satellite.name}_{(obs_pass.rise.time.timestamp())}",
+                time=obs_pass.fall.time,
+                duration=dt.timedelta(seconds=0),
+                source_station=station,
+                target_station=satellite,
+                source_station_type="ground_station",
+                target_station_type="satellite",
+                )
+            contact_graph.add_edge(
+                f"{satellite.name}_{(obs_pass.rise.time.timestamp())}",
+                f"{station.name}_{(obs_pass.rise.time.timestamp())}",
+                time=obs_pass.fall.time,
+                duration=dt.timedelta(seconds=0),
+                source_station=satellite,
+                target_station=station,
+                source_station_type="satellite",
+                target_station_type="ground_station",
+                )
+
+
+    return contact_graph, times
+
+def find_nodes_closest_to_time(station, desired_time: dt.datetime, contact_graph_times: list):
+
+    insert_index = bisect.bisect(contact_graph_times, desired_time)
+    if insert_index == len(contact_graph_times):
+        # Last entry, so there is no node after that
+        # return ValueError("Node is after end time for contact graph")
+        closest_time_post = None
+        node_name_post = None
+    else: 
+        closest_time_post = contact_graph_times[insert_index]
+        node_name_post = f"{station.name}_{closest_time_post.timestamp()}"
+    if insert_index == 0:
+        # First entry, so there is no node before that
+        closest_time_pre = None
+        node_name_pre = None
+        # return ValueError("Node is before start time for contact graph")
+    else:
+        closest_time_pre = contact_graph_times[insert_index]-1
+        node_name_pre = f"{station.name}_{closest_time_pre.timestamp()}"
+
+    return (node_name_pre, node_name_post)
+
+def shortest_path_between_stations(
+        source_station_name,
+        target_station_name,
+        start_time: dt.datetime,
+        contact_graph: nx.DiGraph,
+        contact_graph_times: list,
+        max_time: dt.datetime=None,
+        edge_cost=lambda s, t, edge: edge['duration'].total_seconds()
+        ):
+    
+    index_time_closest_to_start_time = bisect.bisect(contact_graph_times, start_time)
+    time_closest_to_start_time = contact_graph_times[index_time_closest_to_start_time]
+    start_station_name = f"{source_station_name}_{time_closest_to_start_time.timestamp()}"
+
+    if max_time is None:
+        end_station_name = f"{target_station_name}_EARLIEST_OUT"
+    else:
+        index_time_closest_to_end_time = bisect.bisect(contact_graph_times, max_time)
+        if index_time_closest_to_end_time>0:
+            time_closest_to_end_time = contact_graph_times[index_time_closest_to_end_time]-1
+            end_station_name = f"{target_station_name}_{time_closest_to_end_time.timestamp()}"
+        else:
+            raise nx.NetworkXNoPath("Max end time {} is earlier than earliest link time {}".format(max_time, contact_graph_times[0]))
+
+    if (not (start_station_name in contact_graph.nodes())):
+        # print("Start node {} is not reachable!")
+        raise nx.NetworkXNoPath("Start node {} is not reachable!")
+        # return [], []
+    if (not (end_station_name in contact_graph.nodes())):
+        raise nx.NetworkXNoPath("End node {} is not reachable!")
+        # print("End node {} is not reachable!")
+        # return [], []
+
+    _path = nx.shortest_path(
+        contact_graph,
+        source=start_station_name,
+        target=end_station_name,
+        weight=edge_cost
+        )
+    # TODO remove all the self-loops
+    abbreviated_path = [contact_graph.nodes[_path[0]]]
+    for index in range(1,len(_path)):
+        _source = contact_graph.nodes[_path[index-1]]
+        _dest = contact_graph.nodes[_path[index]]
+        if _source['station']!=_dest['station']:
+            if _source != abbreviated_path[-1]:
+                abbreviated_path.append(_source)    
+            abbreviated_path.append(_dest)
+    return abbreviated_path, _path
+
+def plot_shortest_path_between_stations(shortest_path: list):
+    
+        # comm_opportunities_by_sat
+
+        figglobal = plt.figure(figsize=(24,10))
+        axglobal = figglobal.add_subplot(1,2,1, projection=ccrs.Robinson())
+        axglobal.set_global()
+        axglobal.coastlines()
+
+        stride_s = 5
+        _dt = dt.timedelta(seconds=stride_s)
+
+        for hop_index in range(len(shortest_path)-1):
+            hop_source = shortest_path[hop_index]
+            hop_target = shortest_path[hop_index+1]
+
+            # If both are ground stations, very light dash between them.
+            # If both are satellites, and they are different, heavy ISL link between them.
+            # If both are satellites, and they are the same, draw the orbit.
+            # If station-sat, draw the link.
+
+            if ((hop_source['station_type'] == "satellite") and (hop_target['station_type'] == "satellite")):
+                if (hop_source['station'] == hop_target['station']):
+                    # Plot trajectory
+                    
+                    time_steps_for_plotting = [hop_source['time'] + _dt*i for i in range(int(math.ceil((hop_target['time']-hop_source['time']).total_seconds()/_dt.total_seconds())))]
+                
+                    _orbit = hop_source['station'].orbit
+                    _llas = [_orbit.get_lonlatalt(t) for t in time_steps_for_plotting]
+                    # ax.plot([lla[0] for lla in _llas],[lla[1] for lla in _llas],transform=ccrs.Geodetic())
+                    axglobal.plot([lla[0] for lla in _llas],[lla[1] for lla in _llas],transform=ccrs.Geodetic(), label=hop_source['station'].name) #, color=satcolor[satellite.name])
+
+                else:
+                    # Plot ISL link
+                    if (hop_source['time'] != hop_target['time']):
+                        raise ValueError("Times should be the same for a ISL")
+                    
+                    _llas_source = hop_source['station'].orbit.get_lonlatalt(hop_source['time'])
+                    _llas_target = hop_target['station'].orbit.get_lonlatalt(hop_target['time'])
+
+                    # ax.plot([lla[0] for lla in _llas],[lla[1] for lla in _llas],transform=ccrs.Geodetic())
+                    axglobal.plot([_llas_source[0], _llas_target[0]],[_llas_source[1], _llas_target[1]],transform=ccrs.Geodetic(), label=f"ISL {hop_source['station'].name}-{hop_target['station'].name}") #, color=satcolor[satellite.name])
+
+
+            elif ((hop_source['station_type'] == "ground_station") and (hop_target['station_type'] == "ground_station")):
+                if (hop_source['station'] == hop_target['station']):
+                    # Do nothing, this is a local loop
+                    pass
+                else:
+                    # Plot inter-GS link
+                    if (hop_source['time'] != hop_target['time']):
+                        raise ValueError("Times should be the same for a GS-GS link")
+
+                    # ax.plot([lla[0] for lla in _llas],[lla[1] for lla in _llas],transform=ccrs.Geodetic())
+                    axglobal.plot([hop_source['station'].lon_deg, hop_target['station'].lon_deg],[hop_source['station'].lat_deg, hop_target['station'].lat_deg],transform=ccrs.PlateCarree(), label=f"GS {hop_source['station'].name}-{hop_target['station'].name}", linewidth=.2, linestyle=":") #, color=satcolor[satellite.name])
+
+            else:
+                # Ground-to-space link link
+                if (hop_source['time'] != hop_target['time']):
+                    raise ValueError("Times should be the same for a uplink-downlink")
+                if (hop_source['station_type'] == "ground_station"):
+                    _llas_dest = hop_target['station'].orbit.get_lonlatalt(hop_target['time'])
+                    axglobal.plot([hop_source['station'].lon_deg, _llas_dest[0]],[hop_source['station'].lat_deg, _llas_dest[1]],transform=ccrs.Geodetic(), label=f"Uplink {hop_source['station'].name}-{hop_target['station'].name}") #, color=satcolor[satellite.name])
+                else:
+                    _llas_source = hop_source['station'].orbit.get_lonlatalt(hop_source['time'])
+                    axglobal.plot([_llas_source[0], hop_target['station'].lon_deg],[_llas_source[1], hop_target['station'].lat_deg],transform=ccrs.Geodetic(), label=f"Downlink {hop_source['station'].name}-{hop_target['station'].name}") #, color=satcolor[satellite.name])
+
+        if (len(shortest_path)>1 and (shortest_path[-1]['station_type'] == 'satellite') and (shortest_path[-1]['station'] != shortest_path[-2]['station'])):
+            final_sat_node = shortest_path[-1]
+            # Hack: if the endpoint is a satellite, draw its trajectory for a bit longer
+            time_steps_for_plotting = [final_sat_node['time'] + _dt*i for i in range(int(math.ceil(300/_dt.total_seconds())))]
+        
+            _orbit = final_sat_node['station'].orbit
+            _llas = [_orbit.get_lonlatalt(t) for t in time_steps_for_plotting]
+            # ax.plot([lla[0] for lla in _llas],[lla[1] for lla in _llas],transform=ccrs.Geodetic())
+            axglobal.plot([lla[0] for lla in _llas],[lla[1] for lla in _llas],transform=ccrs.Geodetic(), label=final_sat_node['station'].name) #, color=satcolor[satellite.name])
+
+
+        axglobal.legend()
+        # axglobal.set_title("{}-{}".format(min_time.strftime("%Y-%m-%d, %H"), (min_time+duration).strftime("%H")))
+        # plt.savefig("{}-{}-{}h.png".format(min_time.strftime("%Y-%m-%d %H"),(min_time+duration).strftime("%H"), duration_h), bbox_inches='tight')

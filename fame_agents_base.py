@@ -1,0 +1,215 @@
+import pyorbital
+from pyorbital.orbital import Orbital
+import datetime as dt
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import numpy as np
+import math
+import pandas as pd
+import bisect
+import uuid
+from enum import Enum
+
+from fame_geometry import *
+import copy
+
+import requests
+import urllib
+import json
+
+MIN_HORIZON_ANGLE_FOR_PASS_DEG = 15
+# MIN_HORIZON_ANGLE_FOR_OBS_DEG = 15
+
+class Event():
+    """ An Event has a time and a function that is called at that time.
+    """
+    def __init__(self, time: dt.datetime, action_callable, name: str="", id: str=None):
+        self.time = time
+        self.action_callable = action_callable
+        self.name = name
+        if id is None:
+            id = uuid.uuid4()
+        self.id = id
+    def __str__(self):
+        return "Event {} at {}".format(self.name, self.time)
+    def __repr__(self):
+        return self.__str__()
+
+class ObservationEvent(Event):
+    def __init__(self, time: dt.datetime, action_callable, name: str="", id: str=None, satellite: Satellite=None, opportunity: ObservationOpportunity=None):
+        """_summary_
+
+        Args:
+            time (dt.datetime): The time of the event
+            action_callable (_type_): The function that is called at the time of the event.
+            name (str, optional): the name of the event. Defaults to "".
+            id (str, optional): a unique event ID. Defaults to None (in which case a UUID4 is generated).
+            satellite (Satellite, optional): The satellite where the event occurs. Defaults to None.
+            opportunity (ObservationOpportunity, optional): The observation opportunity performed by the satellite. Defaults to None.
+        """
+        super().__init__(time, action_callable, name, id)
+        self.satellite = satellite
+        self.opportunity = opportunity
+
+class CommunicationEvent(Event):
+    def __init__(self, time: dt.datetime, action_callable, name: str="", id: str=None, satellite: Satellite=None, station: Location=None, comm_pass: ObservationPass=None):
+        super().__init__(time, action_callable, name, id)
+        self.satellite = satellite
+        self.station = station
+        self.comm_pass = comm_pass
+
+class Phenomenon(Pose):
+    def __init__(self, lon_deg: float, lat_deg: float, alt_km: float, start_time: dt.datetime, end_time: dt.datetime, heading_deg: float=None, speed_kph: float=None, name: str=""):
+        super().__init__(lon_deg=lon_deg, lat_deg=lat_deg, alt_km=alt_km, heading_deg=heading_deg, speed_kph=speed_kph, name=name)
+        self.start_time = start_time
+        self.end_time = end_time
+
+    def __str__(self):
+        return "{}: Lon {}°, lat {}°, alt {} km, hdg {}°, speed {} km/h, start {}, end {}".format(self.name, self.lon_deg,self.lat_deg,self.alt_km, self.heading_deg, self.speed_kph, self.start_time, self.end_time)
+    def __repr__(self):
+        return self.__str__()
+
+   
+class World():
+    def __init__(self, satellites: list=[], constellations: list = [], brokers: list = [], phenomena: list = [], events: list = []):
+        self.satellites = satellites
+        self.constellations = constellations
+        self.brokers = brokers
+        self.phenomena = phenomena
+        self.events = events
+        self.time = dt.datetime.min
+        self.history = []
+    
+    def tick(self, print_forbidden_prefixes=[]):
+        if len(self.events):
+            _event = self.events.pop(0)
+
+            _print_event_name = True
+            for forbidden_names in print_forbidden_prefixes:
+                if _event.name.startswith(forbidden_names):
+                    _print_event_name = False
+                    break
+            if _print_event_name:
+                print("Executing {}".format(_event))
+
+            self.time = _event.time
+            outcome = _event.action_callable()
+
+            self.history.append({
+                'time': _event.time,
+                'event': _event,
+                'phenomena': [copy.deepcopy(p) for p in self.phenomena],
+                'states': {
+                    'satellites': [copy.deepcopy(s) for s in self.satellites],
+                    # Constellations and brokers have a pointer to World, which has a pointer to constellations, which...recursion!
+                    # 'constellations': [copy.deepcopy(c) for c in self.constellations],
+                    # 'brokers': [copy.deepcopy(b) for b in self.brokers],
+                }
+            })
+            
+        else:
+            print("No more events")
+            
+        return len(self.events)
+
+    def add_satellite(self, satellite):
+        self.satellite.append(satellite)
+
+    def add_constellation(self, constellation):
+        self.constellations.append(constellation)
+    
+    def add_broker(self, broker):
+        self.brokers.append(broker)
+    
+    def add_event(self, event):
+        # print("Adding {}".format(event))
+        if (event.time<self.time):
+            raise ValueError("Event {} is earlier than sim time {}".format(event, self.time)) 
+        bisect.insort(self.events, event, key=lambda x: x.time)
+        
+    def do_observation(self, observation: ObservationOpportunity, spacecraft: Satellite, phenomenon_processor=lambda o, s, p: p):
+        # Find phenomena close to the observation location in space and at the right time
+        # Return a data product and a list of event states
+        # print("Obs opp {}".format(observation))
+        observed_phenomena = []
+
+        # Now let's see what we observed
+        for _phenomenon in self.phenomena:
+            if (_phenomenon.start_time <= observation.time and _phenomenon.end_time > observation.time):
+                
+                # Compute phenomenon location on the planet
+                _ph_location_ecf = np.array(pyorbital.astronomy.observer_position(observation.time, _phenomenon.lon_deg, _phenomenon.lat_deg, _phenomenon.alt_km)[0][:3])
+                # Compute observation location on the planet
+                _obs_location_ecf = np.array(pyorbital.astronomy.observer_position(observation.time, observation.lon_deg, observation.lat_deg, observation.alt_km)[0][:3])
+                # Compute SC location
+                _sc_location_ecf = np.array(spacecraft.orbit.get_position(observation.time, normalize=False)[0][:3])
+                # Compute angle between sc-observation and sc-phenomenon
+                _ph_sc_vector = _ph_location_ecf-_sc_location_ecf
+                _obs_sc_vector = _obs_location_ecf - _sc_location_ecf
+                # print("PhSc {} || ObsSc {}".format(_ph_sc_vector, _obs_sc_vector))
+                # print("Dot: {} || N1: {} N2: {}".format(np.dot(_ph_sc_vector,_obs_sc_vector),np.linalg.norm(_ph_sc_vector,2), np.linalg.norm(_obs_sc_vector,2))) 
+                # print("Acos: {}, angle: {}".format(np.dot(_ph_sc_vector,_obs_sc_vector)/(np.linalg.norm(_ph_sc_vector,2)*np.linalg.norm(_obs_sc_vector,2)), np.arccos(np.dot(_ph_sc_vector,_obs_sc_vector)/(np.linalg.norm(_ph_sc_vector,2)*np.linalg.norm(_obs_sc_vector,2)))))
+                _ph_obs_angle_rad = np.arccos(np.clip(np.dot(_ph_sc_vector,_obs_sc_vector)/(np.linalg.norm(_ph_sc_vector,2)*np.linalg.norm(_obs_sc_vector,2)),-1,1))
+                # print("Obs angle (rad) {}".format(_ph_obs_angle_rad))
+                # If angle<FOV, return phobservation
+                if _ph_obs_angle_rad < spacecraft.instrument_fov_rad[observation.instrument]:
+                    # print("Close enough")
+                    observed_phenomena.append(_phenomenon)
+                else:
+                    # print("Too far")
+                    pass
+        # Store SOMETHING for the completed observation
+        if observation not in spacecraft.data_products.keys():
+            spacecraft.data_products[observation] = []
+        spacecraft.data_products[observation].extend([phenomenon_processor(observation, spacecraft, p) for p in observed_phenomena])
+        spacecraft.known_phenomena.append(observed_phenomena)
+        
+        return True
+    
+def do_downlink(spacecraft: Satellite, scheduler, comm_pass: ObservationPass): # scheduler is a ConstellationGroundScheduler,defined next 
+    # Simple: downlink all. Future: downlink up to x.
+    
+    # Duration is unused for now
+    duration = comm_pass.fall.time - comm_pass.rise.time
+
+    _downlinked = []
+    if len(spacecraft.data_products):
+        print("Spacecraft {} has {} data products to download".format(spacecraft, len(spacecraft.data_products)))
+        
+    for _observation, data_product in spacecraft.data_products.items():
+        print("  Downlinked {}".format(_observation))
+        _downlinked.append(_observation)
+        
+        # TODO here we assume the DP is for a given observation
+        matching_requests = scheduler._requests[scheduler._requests['observation']==_observation]
+        # print(scheduler._requests)
+        # print(matching_requests)
+        if len(matching_requests)>=1:
+            # print(data_product)
+            # try:
+            scheduler._requests.loc[scheduler._requests['observation']==_observation, 'status'] = "OK! Data received"
+            # scheduler._requests.loc[scheduler._requests['observation']==_observation, 'data_product'] = data_product
+            for _ix, _ready_callback in scheduler._requests.loc[scheduler._requests['observation']==_observation, 'ready_callback'].items():
+                scheduler._requests.loc[_ix, 'data_product'] = data_product
+                _ready_callback(data_product)
+            # except Exception as e:
+            #     import pdb; pdb.set_trace()
+        else:
+            print("   Could not find matching request for observation {}".format(_observation))
+        if len(matching_requests)>1:
+            print("   I found multiple requests for observation {}!".format(_observation))
+
+        
+
+    for _observation in _downlinked:
+        spacecraft.data_products.pop(_observation)
+
+
+
+def retell_history(world: World):
+    for _chronicle in world.history:
+        print("Time: {}. Event: {}".format(_chronicle['time'], _chronicle['event']))
+        if type(_chronicle['event'])==ObservationEvent:
+            print("Observation: sat {} and opportunity {}".format(_chronicle['event'].satellite, _chronicle['event'].opportunity))
+        if type(_chronicle['event'])==CommunicationEvent:
+            print("Communication: station {} to sat {} during pass {}".format(_chronicle['event'].station, _chronicle['event'].satellite, _chronicle['event'].comm_pass))
