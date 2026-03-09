@@ -148,7 +148,7 @@ class ConstellationGroundScheduler():
         if len(_opportunities):
             # best_request = None
             passes = _opportunities[request]
-            # for request, passes in _opportunities.items(): # Only one request, so this just unpacks the opportunities and its OK to reset best_quality below
+            # Only one request, so this just unpacks the opportunities and its OK to reset best_quality below
             if len(passes):
                 _best_quality = - np.inf
                 _best_satellite = None
@@ -158,6 +158,10 @@ class ConstellationGroundScheduler():
                 _best_downlink_comm_opportunity = None
                 _best_downlink_comm_opportunity_station = None
 
+                # TODO this O(n) search is ridiculous. We should:
+                # - Sort by quality
+                # - Check feasibility going down the list
+                # - Return the first feasible entry 
                 for satellite, satpasses in passes.items():
                     for satpass in satpasses:
                         # Check if the satellite is free at this time.
@@ -180,7 +184,6 @@ class ConstellationGroundScheduler():
                         )
 
                         if ((satellite in ul_comm_opportunities.keys()) and (len(ul_comm_opportunities[satellite])))==0:
-                            # No contacts for this satellite! Maybe we were too greedy
                             print("No contacts for this satellite! Maybe we were too greedy")
                             continue
                         
@@ -193,7 +196,6 @@ class ConstellationGroundScheduler():
                                 break
 
                         if ((earliest_ul_opportunity is None) or (earliest_ul_opportunity_station is None)):
-                            # No timely *unconflicted* contact! Maybe we were too greedy
                             print("No timely *unconflicted* contact! Maybe we were too greedy")
                             continue
 
@@ -214,11 +216,6 @@ class ConstellationGroundScheduler():
                             print("Could not find a suitable downlink")
                             # Could not find a suitable downlink
                             continue
-                            # self._requests.loc[self._requests['request']==request, 'status'] = "No timely downlink";
-                            # callback_request_unscheduled("No timely downlink")
-                            # return -4
-                        
-                        ## 
 
                         # Passes are sorted by time. An we checked above that there is at least one pass
                         dl_station = None
@@ -233,10 +230,6 @@ class ConstellationGroundScheduler():
                             # Could not find a suitable unconflicted downlink
                             print("Could not find a suitable unconflicted downlink")
                             break
-                            # self._requests.loc[self._requests['request']==request, 'status'] = "No timely unconflicted downlink";
-                            # callback_request_unscheduled("No timely unconflicted downlink")
-                            # return -4.5
-
 
                         if _quality >= _best_quality:
                             _best_quality = _quality
@@ -256,8 +249,6 @@ class ConstellationGroundScheduler():
                     return -5
             else:
                 print("No observation opportunities here")
-                # print(_opportunities)
-                # self.requests[request]['status'] = "No observation opportunities"
                 self._requests.loc[self._requests['request']==request, 'status'] = "No observation opportunities"
                 callback_request_unscheduled("No observation opportunities")
                 return -1
@@ -270,7 +261,6 @@ class ConstellationGroundScheduler():
                 _best_sat_object = sat
         if (_best_sat_object is None):
             print("ERROR! Something wrong with finding the satellite")
-            # self.requests[request]['status'] = "Could not find best satellite";
             self._requests.loc[self._requests['request']==request, 'status'] = "Could not find best satellite";
 
             callback_request_unscheduled("Could not find best satellite")
