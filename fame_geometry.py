@@ -199,18 +199,21 @@ class ObservationRequest(Location):
         self.instrument = instrument
         self.min_elevation_deg = min_elevation_deg
     def __str__(self):
-        return "Request {} | Lon {}°, lat {}°, alt {} km from {} to {} with {}, min elevation {} deg".format(
+        return "Request {}".format(
             self.name,
-            self.lon_deg,
-            self.lat_deg,
-            self.alt_km,
-            self.min_time,
-            self.max_time,
-            self.instrument,
-            self.min_elevation_deg
         )
     def __repr__(self):
         return self.__str__()
+        # return "Request {} | Lon {}°, lat {}°, alt {} km from {} to {} with {}, min elevation {} deg".format(
+        #     self.name,
+        #     self.lon_deg,
+        #     self.lat_deg,
+        #     self.alt_km,
+        #     self.min_time,
+        #     self.max_time,
+        #     self.instrument,
+        #     self.min_elevation_deg
+        # )
 
 class ObservationOpportunity(Location):
     '''
