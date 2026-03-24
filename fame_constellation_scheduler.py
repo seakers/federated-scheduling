@@ -19,8 +19,6 @@ import json
 
 from fame_agents_base import *
 
-MIN_HORIZON_ANGLE_FOR_PASS_DEG = 15
-
 class ConstellationGroundScheduler():
     def __init__(self, satellites: list, ground_stations: list, world: World, name="Constellation"):
         self.name = name
@@ -28,84 +26,13 @@ class ConstellationGroundScheduler():
         self.ground_stations = ground_stations
         self.world = world
         # self.requests = {}
-        self._requests = pd.DataFrame(columns=['request', 'satellite', 'observation', 'uplink', 'downlink', 'status', 'data_product', 'scheduled_callback', 'unscheduled_callback', 'ready_callback'])
+        self._requests = pd.DataFrame(columns=requests_data_frame_columns)
 
     def screen_request_for_feasibility(self, satellite: Satellite, _request: ObservationRequest, screen_against_comm_passes:bool=True):
-        # Check if a given request conflicts with existing requests.
-        # TODO this is horrifyingly expensive because we do not exploit the fact that
-        #  requests are sorted. We should improve this, ideally without rebuilding a full on timeline library.
-        conflicting_requests = self._requests.loc[
-            self._requests.apply(
-            lambda x: 
-                (x['status']=="Scheduled") and # We have actually scheduled this
-                (x['observation'].time+x['observation'].duration > _request.time) and # The end of the other observation is after we start
-                (x['observation'].time < _request.time+_request.duration) and # The start of the other observation is before we end
-                (x['satellite'] == satellite) # This request is on the same satellite. Note that we check these are the same OBJECT, not just the same name.
-            , axis=1)]
-        if len(conflicting_requests):
-            print("   [{}:{}]Conflict with another request".format(self.name, satellite.name))
-            return False
-        if (screen_against_comm_passes):
-            conflicting_uplinks = self._requests.loc[
-                self._requests.apply(
-                lambda x: 
-                    (x['status']=="Scheduled") and # We have actually scheduled this
-                    (x['uplink'].fall.time > _request.time) and # The end of the comm pass is after we start
-                    (x['uplink'].rise.time < _request.time + _request.duration) and # The start of the comm pass is before we end
-                    (x['satellite'] == satellite) # This request is on the same satellite
-                , axis=1)]
-            if len(conflicting_uplinks):
-                print("   [{}:{}]Conflict with an uplink".format(self.name, satellite.name))
-                return False
-            conflicting_downlinks = self._requests.loc[
-                self._requests.apply(
-                lambda x: 
-                    (x['status']=="Scheduled") and # We have actually scheduled this
-                    (x['downlink'].fall.time > _request.time) and # The end of the comm pass is after we start
-                    (x['downlink'].rise.time < _request.time + _request.duration) and # The start of the comm pass is before we end
-                    (x['satellite'] == satellite) # This request is on the same satellite
-                , axis=1)]
-            if len(conflicting_downlinks):
-                print("   [{}:{}]Conflict with a downlink".format(self.name, satellite.name))
-                return False
-        return True
+        return screen_request_for_feasibility(existing_requests=self._requests, satellite=satellite, _request=_request, screen_against_comm_passes=screen_against_comm_passes, log_prefix=self.name)
     
     def screen_pass_for_feasibility(self, satellite: Satellite,  _obs_pass: ObservationPass, screen_against_comm_passes:bool=False):
-        # Check if a given pass conflicts with existing requests.
-        # TODO this is horrifyingly expensive because we do not exploit the fact that
-        #  requests are sorted. We should improve this, ideally without rebuilding a full on timeline library.
-        conflicting_requests = self._requests.loc[
-            self._requests.apply(
-            lambda x: 
-                (x['status']=="Scheduled") and # We have actually scheduled this
-                (x['observation'].time+x['observation'].duration > _obs_pass.rise.time) and # The end of the other observation is after we start
-                (x['observation'].time < _obs_pass.fall.time) and # The start of the other observation is before we end
-                (x['satellite'] == satellite) # This request is on the same satellite. Note that we check these are the same OBJECT, not just the same name.
-            , axis=1)]
-        if len(conflicting_requests):
-            return False
-        if (screen_against_comm_passes):
-            conflicting_uplinks = self._requests.loc[
-                self._requests.apply(
-                lambda x: 
-                    (x['status']=="Scheduled") and # We have actually scheduled this
-                    (x['uplink'].fall.time > _obs_pass.rise.time) and # The end of the comm pass is after we start
-                    (x['uplink'].rise.time < _obs_pass.fall.time) and # The start of the comm pass is before we end
-                    (x['satellite'] == satellite) # This request is on the same satellite
-                , axis=1)]
-            if len(conflicting_uplinks):
-                return False
-            conflicting_downlinks = self._requests.loc[
-                self._requests.apply(
-                lambda x: 
-                    (x['status']=="Scheduled") and # We have actually scheduled this
-                    (x['downlink'].fall.time > _obs_pass.rise.time) and # The end of the comm pass is after we start
-                    (x['downlink'].rise.time < _obs_pass.fall.time) and # The start of the comm pass is before we end
-                    (x['satellite'] == satellite) # This request is on the same satellite
-                , axis=1)]
-            if len(conflicting_downlinks):
-                return False
-        return True
+        return screen_pass_for_feasibility(existing_requests=self._requests, satellite=satellite, _obs_pass=_obs_pass, screen_against_comm_passes=screen_against_comm_passes, log_prefix=self.name)
 
     def schedule_request(
             self,

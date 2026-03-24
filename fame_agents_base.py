@@ -18,7 +18,8 @@ import urllib
 import json
 
 MIN_HORIZON_ANGLE_FOR_PASS_DEG = 15
-# MIN_HORIZON_ANGLE_FOR_OBS_DEG = 15
+
+requests_data_frame_columns = ['request', 'satellite', 'observation', 'uplink', 'downlink', 'status', 'data_product', 'scheduled_callback', 'unscheduled_callback', 'ready_callback']
 
 class Event():
     """ An Event has a time and a function that is called at that time.
@@ -213,3 +214,80 @@ def retell_history(world: World):
             print("Observation: sat {} and opportunity {}".format(_chronicle['event'].satellite, _chronicle['event'].opportunity))
         if type(_chronicle['event'])==CommunicationEvent:
             print("Communication: station {} to sat {} during pass {}".format(_chronicle['event'].station, _chronicle['event'].satellite, _chronicle['event'].comm_pass))
+
+def screen_request_for_feasibility(existing_requests: pd.DataFrame, satellite: Satellite, _request: ObservationRequest, screen_against_comm_passes:bool=True, log_prefix: str=""):
+    # Check if a given request conflicts with existing requests.
+    # TODO this is horrifyingly expensive because we do not exploit the fact that
+    #  requests are sorted. We should improve this, ideally without rebuilding a full on timeline library.
+    conflicting_requests = existing_requests.loc[
+        existing_requests.apply(
+        lambda x: 
+            (x['status']=="Scheduled") and # We have actually scheduled this
+            (x['observation'].time+x['observation'].duration > _request.time) and # The end of the other observation is after we start
+            (x['observation'].time < _request.time+_request.duration) and # The start of the other observation is before we end
+            (x['satellite'] == satellite) # This request is on the same satellite. Note that we check these are the same OBJECT, not just the same name.
+        , axis=1)]
+    if len(conflicting_requests):
+        print("   [{}:{}]Conflict with another request".format(log_prefix, satellite.name))
+        return False
+    if (screen_against_comm_passes):
+        conflicting_uplinks = existing_requests.loc[
+            existing_requests.apply(
+            lambda x: 
+                (x['status']=="Scheduled") and # We have actually scheduled this
+                (x['uplink'].fall.time > _request.time) and # The end of the comm pass is after we start
+                (x['uplink'].rise.time < _request.time + _request.duration) and # The start of the comm pass is before we end
+                (x['satellite'] == satellite) # This request is on the same satellite
+            , axis=1)]
+        if len(conflicting_uplinks):
+            print("   [{}:{}]Conflict with an uplink".format(log_prefix, satellite.name))
+            return False
+        conflicting_downlinks = existing_requests.loc[
+            existing_requests.apply(
+            lambda x: 
+                (x['status']=="Scheduled") and # We have actually scheduled this
+                (x['downlink'].fall.time > _request.time) and # The end of the comm pass is after we start
+                (x['downlink'].rise.time < _request.time + _request.duration) and # The start of the comm pass is before we end
+                (x['satellite'] == satellite) # This request is on the same satellite
+            , axis=1)]
+        if len(conflicting_downlinks):
+            print("   [{}:{}]Conflict with a downlink".format(log_prefix, satellite.name))
+            return False
+    return True
+
+def screen_pass_for_feasibility(existing_requests: pd.DataFrame, satellite: Satellite,  _obs_pass: ObservationPass, screen_against_comm_passes:bool=False, log_prefix: str=""):
+    # Check if a given pass conflicts with existing requests.
+    # TODO this is horrifyingly expensive because we do not exploit the fact that
+    #  requests are sorted. We should improve this, ideally without rebuilding a full on timeline library.
+    conflicting_requests = existing_requests.loc[
+        existing_requests.apply(
+        lambda x: 
+            (x['status']=="Scheduled") and # We have actually scheduled this
+            (x['observation'].time+x['observation'].duration > _obs_pass.rise.time) and # The end of the other observation is after we start
+            (x['observation'].time < _obs_pass.fall.time) and # The start of the other observation is before we end
+            (x['satellite'] == satellite) # This request is on the same satellite. Note that we check these are the same OBJECT, not just the same name.
+        , axis=1)]
+    if len(conflicting_requests):
+        return False
+    if (screen_against_comm_passes):
+        conflicting_uplinks = existing_requests.loc[
+            existing_requests.apply(
+            lambda x: 
+                (x['status']=="Scheduled") and # We have actually scheduled this
+                (x['uplink'].fall.time > _obs_pass.rise.time) and # The end of the comm pass is after we start
+                (x['uplink'].rise.time < _obs_pass.fall.time) and # The start of the comm pass is before we end
+                (x['satellite'] == satellite) # This request is on the same satellite
+            , axis=1)]
+        if len(conflicting_uplinks):
+            return False
+        conflicting_downlinks = existing_requests.loc[
+            existing_requests.apply(
+            lambda x: 
+                (x['status']=="Scheduled") and # We have actually scheduled this
+                (x['downlink'].fall.time > _obs_pass.rise.time) and # The end of the comm pass is after we start
+                (x['downlink'].rise.time < _obs_pass.fall.time) and # The start of the comm pass is before we end
+                (x['satellite'] == satellite) # This request is on the same satellite
+            , axis=1)]
+        if len(conflicting_downlinks):
+            return False
+    return True
