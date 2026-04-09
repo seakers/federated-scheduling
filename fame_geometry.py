@@ -261,7 +261,7 @@ class AttitudeController(Enum):
     COMMUNICATION = 2
 
 class Satellite():
-    def __init__(self, name: str,  orbit: Orbital, instruments: list = ["RGB"], instrument_fov_rad: dict = {"RGB": 15.*np.pi/180.}):
+    def __init__(self, name: str,  orbit: Orbital, instruments: list = ["RGB"], instrument_fov_rad: dict = {"RGB": 15.*np.pi/180.}, isl_links: dict={}, has_continuous_isl_to_ground: bool=False):
         self.name = name
         self.orbit = orbit
         self.instruments = instruments
@@ -271,7 +271,8 @@ class Satellite():
         self.known_phenomena = []
         self.attitude_controller_state = AttitudeController.FREE
         self.busy_with = None
-        self.isl_links = {} # Satellite: range_km
+        self.isl_links = isl_links # Satellite: range_km
+        self.has_continuous_isl_to_ground = has_continuous_isl_to_ground
     def __str__(self):
         return self.name
     def __repr__(self):

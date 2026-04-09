@@ -9,6 +9,8 @@ from fame_agents_base import *
 
 from matplotlib.pyplot import cm
 
+from ortools.linear_solver import pywraplp
+
 # import random
 
 
@@ -56,7 +58,7 @@ class GeometryConstraintType(Enum):
     LLA = 0
 
 class Constraint():
-    def __init__(self, constraint_class: ConstraintClass, constraint_type, parent: ObservationRequest, parameters: dict={}):
+    def __init__(self, constraint_class: ConstraintClass, constraint_type, parent: ObservationRequest, parameters: dict={'offset': 0, 'geometry_generator': lambda _obs_req, _data_product: _obs_req}):
         self.constraint_class = constraint_class
         self.constraint_type = constraint_type
         self.parent = parent
@@ -71,29 +73,43 @@ class ConstrainedObservationRequest():
             self,
             observation_request: ObservationRequest,
             constraints: list = [],
+            is_mandatory: bool=False,
             schedule_policy_if_constraint_unsatisfied: dict={c: True for c in ConstraintClass},
             dispatch_policy_if_constraint_unsatisfied: dict={c: False for c in ConstraintClass},
+            success_declarer=lambda data_product: True,
             follow_up_action_failure=lambda reason: None,
             follow_up_action_success=lambda data_product: None,
+            phenomenon_processor=lambda o, s, p: p
             ):
         self.observation_request = observation_request
         self.constraints = constraints
+        self.is_mandatory = is_mandatory
         self.schedule_policy = schedule_policy_if_constraint_unsatisfied
         self.dispatch_policy = dispatch_policy_if_constraint_unsatisfied
+        self.success_declarer = success_declarer
         self.follow_up_action_failure = follow_up_action_failure
         self.follow_up_action_success= follow_up_action_success
         self.observation_opportunity: ObservationOpportunity = None
+        self.observation_opportunity_pass: ObservationPass = None
         self.observation_opportunity_satellite: Satellite = None
         self.scheduled: bool = False
         self.feasible: bool = True
         self.dispatched: bool = False
         self.completed: bool = False
         self.successful_execution: bool = False
+        self.phenomenon_processor = phenomenon_processor
 
     def __str__(self):
         return f"{self.observation_request} with {len(self.constraints)} constraints"
     def __repr__(self):
         return self.__str__()
+    
+# class Workflow():
+#     def __init__(
+#             self,
+#             constrained_observation_requests: list[ConstrainedObservationRequest]
+#     ):
+#         self.constrained_observation_requests = constrained_observation_requests
     
 def build_workflow_graph(workflow: list):
     # Build a dependency graph
@@ -128,7 +144,13 @@ def build_workflow_graph(workflow: list):
 # Pick the heuristically best opportunity
 # Continue
 
-def greedy_schedule_workflow(workflow_graph: nx.MultiDiGraph, satellites: list, existing_requests: pd.DataFrame= pd.DataFrame(columns=requests_data_frame_columns)):
+def greedy_schedule_workflow(
+        workflow_graph: nx.MultiDiGraph,
+        satellites: list,
+        feasibility_screener = lambda satellite, observation_pass: True,
+        existing_requests: pd.DataFrame= pd.DataFrame(columns=requests_data_frame_columns), current_time: dt.datetime=None,
+        verbose: int=99,
+        ):
     
     
     # Build a dependency graph
@@ -153,20 +175,47 @@ def greedy_schedule_workflow(workflow_graph: nx.MultiDiGraph, satellites: list, 
     
     # workflow_graph.remove_nodes_from(requests_to_skip_data_not_ready)
 
-    print(f"WG: {workflow_graph}")
+    if verbose>2:
+        print(f"   [Scheduler] WG: {workflow_graph}")
+
+    # We will reschedule everything that is not dispatched. 
+    for node_id in workflow_graph.nodes():
+        if ((workflow_graph.nodes[node_id]['dispatched'] == False) and (workflow_graph.nodes[node_id]['completed'] == False)):
+             workflow_graph.nodes[node_id]['scheduled'] = False
+
     # Walk through requests
     # Start with the root nodes
     nodes_to_visit = [node for node, in_degree in workflow_graph.in_degree() if in_degree == 0]
+    # TODO also dump the mandatory nodes here? Hmm.
+    
     while len(nodes_to_visit):
-        print(f"Nodes to visit: {nodes_to_visit}")
+        if verbose>2:
+            print(f"   [Scheduler] Nodes to visit: {nodes_to_visit}")
 
         constrained_request = nodes_to_visit.pop(0)
 
-        print(f"Current request: {constrained_request}")
+        # Add the successors, so we will try to schedule them even if this one fails
+        for child_request in workflow_graph.successors(constrained_request):
+            if workflow_graph.nodes[child_request]['scheduled']==False:
+            # assert workflow_graph.nodes[child_request]['scheduled']==False, "ERROR: we are traversing the dependency graph in a strange and incorrect way (children)"
+                nodes_to_visit.append(child_request)
+        if verbose>2:
+            print(f"   [Scheduler] Current request: {constrained_request}")
         # If the request has gone off, nothing we can do about it
-        if ((constrained_request.dispatched is True) or (constrained_request.completed is True)):
-            print("Request {} is already dispatched or completed, skipping")
+        if ((workflow_graph.nodes[constrained_request]['dispatched'] == True) or (workflow_graph.nodes[constrained_request]['completed'] == True)):
+            if verbose>0:
+                print(f"   [Scheduler] Request {constrained_request} is already dispatched or completed, skipping")
             continue
+        else:
+            if verbose>2:
+                print("   [Scheduler] This request is still in play, let's revisit it")
+
+        # Check if constraints are resolvable. For some constraints (bool, geometry) we need the predecessor task
+        # to be completed. If the task is not completed, and the schedule policy is `wait for the information`, we
+        # will skip scheduling these tasks (but may still schedule their successors, ignoring the constraints).
+        # If the task is completed, or if the shcedule_policy is `do not wait for information`, we just roll through
+        # and, crucially, implicitly assume that the constraint will be resolved successfully, and that the default
+        # geometric value should be used to identify opportunities.
 
         _constraints_are_resolvable = True
         for parent_request in workflow_graph.predecessors(constrained_request):
@@ -175,39 +224,44 @@ def greedy_schedule_workflow(workflow_graph: nx.MultiDiGraph, satellites: list, 
                 _constraint_class = constraint['constraint_class']
                 if (
                     (
-                        constrained_request.schedule_policy[_constraint_class] == False and
+                        workflow_graph.nodes[constrained_request]['schedule_policy'][_constraint_class] == False and
                         workflow_graph.nodes[parent_request]['completed'] == False
                     )
                 ):
                     _constraints_are_resolvable = False
                     break
         if (_constraints_are_resolvable is False):
-            print("Request {} has unresolved predecessors and its policy require waiting; skipping.")
+            if verbose>1:
+                print("   [Scheduler] Request {} has unresolved predecessors and its policy require waiting; skipping.")
             continue
 
-        # Add the successors, so we will try to schedule them even if this one fails
-        for child_request in workflow_graph.successors(constrained_request):
-            if workflow_graph.nodes[child_request]['scheduled']==False:
-            # assert workflow_graph.nodes[child_request]['scheduled']==False, "ERROR: we are traversing the dependency graph in a strange and incorrect way (children)"
-                nodes_to_visit.append(child_request)
 
-        min_time = constrained_request.observation_request.min_time
-        max_time = constrained_request.observation_request.max_time
+        # Now we start with temporal scheduling. We will identify a single interval that works.
+        min_time = workflow_graph.nodes[constrained_request]['observation_request'].min_time
+        if (current_time is not None):
+            min_time = max(min_time, current_time)
+        max_time = workflow_graph.nodes[constrained_request]['observation_request'].max_time
 
-        # TODO check if any constraints are violated.
-        # For temporal constraints that is auto-handled below.
-        # Data constraints are handled externally? Or we could use this to bring the data from the parent to the child.
-        # Bool (success) constraints should be checked here.
-        #  When iterating over parents, if there is a success dependency, and the parent is reporting completed with failure, do not attempt to schedule.
 
-        print(f"This request has {len(list(workflow_graph.successors(constrained_request)))} children: {list(workflow_graph.successors(constrained_request))}")
+        if ((current_time is not None) and (max_time<current_time)):
+            if verbose>1:
+                print("   [Scheduler] Request {} max time is in the past; skipping.")
+            workflow_graph.nodes[constrained_request]['scheduled']=True
+            workflow_graph.nodes[constrained_request]['feasible']=False
+            continue
+
+
+
+        # First, we check if any CHILDREN have been scheduled and apply the constraints backwards.
+        # If the dependency graph is not degenerate, the check three lines below should fail, and we should do nothing in this cycle. 
+        if verbose>3:
+            print(f"   [Scheduler] This request has {len(list(workflow_graph.successors(constrained_request)))} children: {list(workflow_graph.successors(constrained_request))}")
         for child_request in workflow_graph.successors(constrained_request):
             if ((workflow_graph.nodes[child_request]['scheduled']==True) and (workflow_graph.nodes[child_request]['feasible']==True)):
                 outedges = workflow_graph.get_edge_data(constrained_request, child_request)
-                print(f"Child: {child_request}")
-                # print(type(workflow_graph.edges[request]))
+                if verbose>3:
+                    print(f"   [Scheduler] Child: {child_request}")
                 for constraint_key, constraint in outedges.items():
-                    # print(constraint)
                     match constraint['constraint_class']:
                         case ConstraintClass.TEMPORAL:
                             match constraint['constraint_type']:
@@ -230,16 +284,24 @@ def greedy_schedule_workflow(workflow_graph: nx.MultiDiGraph, satellites: list, 
                         case ConstraintClass.GEOMETRY:
                             max_time = min(max_time, workflow_graph.nodes[child_request]['observation_opportunity'].time)
             else:
-                print(f"Skipping constraints for child {child_request}, currently unscheduled")
+                if verbose>3:
+                    print(f"Skipping constraints for child {child_request}, currently unscheduled")
 
-        print(f"This request has {len(list(workflow_graph.predecessors(constrained_request)))} parents: {list(workflow_graph.predecessors(constrained_request))}")
+        # Check if any constraints are violated.
+        # For temporal constraints that is auto-handled below.
+        # Geometry constraints are handled externally. We could also use this to bring the data from the parent to the child.
+        # Bool (success) constraints are checked here.
+        #  When iterating over parents, if there is a success dependency, and the parent is reporting completed with failure, do not attempt to schedule.
+
+        # Next, we check the PARENTS of a request. This is arguably the more interesting bit.
+        if verbose>3:
+            print(f"   [Scheduler] This request has {len(list(workflow_graph.predecessors(constrained_request)))} parents: {list(workflow_graph.predecessors(constrained_request))}")
         for parent_request in workflow_graph.predecessors(constrained_request):
             if ((workflow_graph.nodes[parent_request]['scheduled']==True) and (workflow_graph.nodes[parent_request]['feasible']==True)):
                 inedges = workflow_graph.get_edge_data(parent_request, constrained_request)
-                print(f"Parent: {parent_request}")
-                # print(type(workflow_graph.edges[request]))
+                if verbose>3:
+                    print(f"   [Scheduler] Parent: {parent_request}")
                 for constraint_key, constraint in inedges.items():
-                    # print(constraint)
                     match constraint['constraint_class']:
                         case ConstraintClass.TEMPORAL:
                             match constraint['constraint_type']:
@@ -275,9 +337,18 @@ def greedy_schedule_workflow(workflow_graph: nx.MultiDiGraph, satellites: list, 
                         case ConstraintClass.GEOMETRY:
                             min_time = max(min_time, workflow_graph.nodes[parent_request]['observation_opportunity'].time)
             else:
-                print(f"Skipping constraints for parent {parent_request}, currently unscheduled")
+                # REVIEW this is where we can exclude a successor if the parent is infeasible. 
+                if (workflow_graph.nodes[parent_request]['feasible']==False):
+                    workflow_graph.nodes[constrained_request]['scheduled']=True
+                    workflow_graph.nodes[constrained_request]['feasible']=False
+                    break
+                else:
+                    if verbose>2:
+                        print(f"   [Scheduler] Skipping constraints for parent {parent_request}, currently unscheduled")
         
         if (workflow_graph.nodes[constrained_request]['feasible']==False):
+            if verbose>1:
+                print(f"   [Scheduler] This request is infeasible due to parents")
             continue
 
         # Search for opportunities
@@ -301,7 +372,8 @@ def greedy_schedule_workflow(workflow_graph: nx.MultiDiGraph, satellites: list, 
             # TODO make a note of this in the graph
             workflow_graph.nodes[constrained_request]['scheduled']=True
             workflow_graph.nodes[constrained_request]['feasible']=False
-            print("Could not schedule {} (no passes)".format(constrained_request))
+            if verbose>0:
+                print("   [Scheduler] Could not schedule {} (no passes)".format(constrained_request))
             continue
             # raise ValueError("Could not schedule {} (no passes)".format(constrained_request))
         
@@ -312,7 +384,8 @@ def greedy_schedule_workflow(workflow_graph: nx.MultiDiGraph, satellites: list, 
         allsatpasses = [(satellite, satpass, observation_quality(satpass.highest)) for satellite, satpasses in passes.items() for satpass in satpasses]
         allsatpasses.sort(key=lambda x: x[2], reverse=True) # Sort by observation quality
         for (satellite, satpass, _quality) in allsatpasses:
-            if screen_pass_for_feasibility(existing_requests=existing_requests, satellite=satellite, _obs_pass=satpass, screen_against_comm_passes=True):
+            # if screen_pass_for_feasibility(existing_requests=existing_requests, satellite=satellite, _obs_pass=satpass, screen_against_comm_passes=True):
+            if feasibility_screener(satellite, satpass):
                 _best_quality = _quality
                 _best_satellite = satellite
                 _best_pass = satpass
@@ -326,12 +399,227 @@ def greedy_schedule_workflow(workflow_graph: nx.MultiDiGraph, satellites: list, 
         #                 _best_satellite = satellite
         #                 _best_pass = satpass
         if _best_pass is None:
-            raise ValueError("Could not schedule {}".format(constrained_request))
+            workflow_graph.nodes[constrained_request]['scheduled']=True
+            workflow_graph.nodes[constrained_request]['feasible']=False
+            if verbose>0:
+                print("   [Scheduler] Could not schedule {} (all conflicts)".format(constrained_request))
+            continue
+            raise ValueError("Could not schedule {} (all conflicts)".format(constrained_request))
 
         # Pick the best opportunity
+        workflow_graph.nodes[constrained_request]['observation_opportunity_pass'] = _best_pass
         workflow_graph.nodes[constrained_request]['observation_opportunity'] = _best_pass.highest
         workflow_graph.nodes[constrained_request]['observation_opportunity_satellite'] = _best_satellite
         workflow_graph.nodes[constrained_request]['scheduled']=True
+        if verbose>2:
+            print(f"   [Scheduler] Scheduled request on {_best_satellite} at {_best_pass.highest}")
+
+    return workflow_graph
+
+
+
+def ilp_schedule_workflow(
+        workflow_graph: nx.MultiDiGraph,
+        satellites: list,
+        feasibility_screener = lambda satellite, observation_pass: True,
+        existing_requests: pd.DataFrame= pd.DataFrame(columns=requests_data_frame_columns), current_time: dt.datetime=None,
+        verbose: int=99,
+        ):
+    
+    if verbose>2:
+        print(f"   [Scheduler] WG: {workflow_graph}")
+
+    # We will reschedule everything that is not dispatched. 
+    for node_id in workflow_graph.nodes():
+        if ((workflow_graph.nodes[node_id]['dispatched'] == False) and (workflow_graph.nodes[node_id]['completed'] == False)):
+             workflow_graph.nodes[node_id]['scheduled'] = False
+
+    # Create the mip solver with the CP-SAT backend.
+    solver = pywraplp.Solver.CreateSolver("SCIP_MIXED_INTEGER_PROGRAMMING")
+    if not solver:
+        raise ValueError("Solver SCIP_MIXED_INTEGER_PROGRAMMING not found")
+    
+    objective = solver.Objective()
+
+    # for request in graph nodes
+    # enumerate the possible opportunities
+    # create a variable for each opportunity
+    # for each constraint
+    # for each pair of opportunities
+    # if they do not comply with the constraint, exclude them through sum<1
+    # if the predecessor is not scheduled, the successor should ALSO not be scheduled (sum(succ)<sum(pred))
+    # if something is already dispatched or executed
+    # set the relevant variable to 1
+    # 
+    solution_holder = {}
+    for constrained_request in workflow_graph.nodes():
+        solution_holder[constrained_request] = {}
+
+        observation_opportunities = find_observation_opportunities([constrained_request.observation_request,], satellites)
+        workflow_graph.nodes[constrained_request]['observation_opportunities'] = observation_opportunities[constrained_request.observation_request]
+        # print(f"Found opportunities: {observation_opportunities}")
+        if constrained_request.observation_request not in observation_opportunities.keys():
+            raise ValueError("Could not schedule {}".format(constrained_request))
+        passes = observation_opportunities[constrained_request.observation_request]
+
+        if len(passes)==0:
+            workflow_graph.nodes[constrained_request]['scheduled']=True
+            workflow_graph.nodes[constrained_request]['feasible']=False
+            if verbose>0:
+                print("   [Scheduler] Could not schedule {} (no passes)".format(constrained_request))
+            continue
+        
+        _best_quality = - np.inf
+        _best_satellite = None
+        _best_pass = None
+        allsatpasses = [(satellite, satpass, observation_quality(satpass.highest)) for satellite, satpasses in passes.items() for satpass in satpasses]
+        allsatpasses.sort(key=lambda x: x[2], reverse=True) # Sort by observation quality
+        for (satellite, satpass, _quality) in allsatpasses:
+            # if feasibility_screener(satellite, satpass):
+            _best_quality = _quality
+            _best_satellite = satellite
+            _best_pass = satpass
+
+            if satellite not in solution_holder[constrained_request].keys():
+                solution_holder[constrained_request][satellite] = {}
+            solution_holder[constrained_request][satellite][satpass] = solver.BoolVar(f"{constrained_request}_{satellite}_{satpass}")
+            objective.SetCoefficient(solution_holder[constrained_request][satellite][satpass], _quality)
+
+        if _best_pass is None:
+            workflow_graph.nodes[constrained_request]['scheduled']=True
+            workflow_graph.nodes[constrained_request]['feasible']=False
+            if verbose>0:
+                print("   [Scheduler] Could not schedule {} (all conflicts)".format(constrained_request))
+
+        # At most one observation per request is assigned
+        solver.Add(sum([solution_holder[constrained_request][_satellite][_satpass] for _satellite, _satpasses in passes.items() for _satpass in _satpasses]) <= 1)
+
+        if verbose>3:
+            print(f"   [Scheduler] This request has {len(list(workflow_graph.predecessors(constrained_request)))} parents: {list(workflow_graph.predecessors(constrained_request))}")
+        for parent_request in workflow_graph.predecessors(constrained_request):
+            inedges = workflow_graph.get_edge_data(parent_request, constrained_request)
+            if verbose>3:
+                print(f"   [Scheduler] Parent: {parent_request}")
+            for constraint_key, constraint in inedges.items():
+                match constraint['constraint_class']:
+                    case ConstraintClass.TEMPORAL:
+                        match constraint['constraint_type']:
+                            # These are constraints on the CURRENT node. So START_AFTER means the parent has to start before
+                            case TemporalConstraintType.START_AFTER:
+                                for this_satellite in solution_holder[constrained_request].keys():
+                                    for this_pass, this_decision_variable in solution_holder[constrained_request][this_satellite].items():
+                                        for parent_satellite in solution_holder[parent_request].keys():
+                                            for parent_pass, parent_decision_variable in solution_holder[parent_request][parent_satellite].items():
+                                                # If the parent request starts after the current request, then they can't be true at the same time
+                                                if parent_pass.highest.time>this_pass.highest.time:
+                                                    solver.Add(this_decision_variable + parent_decision_variable <= 1)
+
+
+                                # min_time = max(min_time, workflow_graph.nodes[parent_request]['observation_opportunity'].time)
+                            case TemporalConstraintType.START_AFTER_OFFSET:
+                                offset = constraint['parameters']['offset']
+                                # min_time = max(min_time, workflow_graph.nodes[parent_request]['observation_opportunity'].time+offset)
+                                for this_satellite in solution_holder[constrained_request].keys():
+                                    for this_pass, this_decision_variable in solution_holder[constrained_request][this_satellite].items():
+                                        for parent_satellite in solution_holder[parent_request].keys():
+                                            for parent_pass, parent_decision_variable in solution_holder[parent_request][parent_satellite].items():
+                                                # If the parent request starts after the current request, then they can't be true at the same time
+                                                if parent_pass.highest.time+offset>this_pass.highest.time:
+                                                    solver.Add(this_decision_variable + parent_decision_variable <= 1)
+                            case TemporalConstraintType.START_BEFORE:
+                                # max_time = min(max_time, workflow_graph.nodes[parent_request]['observation_opportunity'].time)
+                                for this_satellite in solution_holder[constrained_request].keys():
+                                    for this_pass, this_decision_variable in solution_holder[constrained_request][this_satellite].items():
+                                        for parent_satellite in solution_holder[parent_request].keys():
+                                            for parent_pass, parent_decision_variable in solution_holder[parent_request][parent_satellite].items():
+                                                # If the parent request starts after the current request, then they can't be true at the same time
+                                                if parent_pass.highest.time<this_pass.highest.time:
+                                                    solver.Add(this_decision_variable + parent_decision_variable <= 1)
+                            case TemporalConstraintType.START_BEFORE_OFFSET:
+                                offset = constraint['parameters']['offset']
+                                # max_time = min(max_time, workflow_graph.nodes[parent_request]['observation_opportunity'].time+offset)
+                                for this_satellite in solution_holder[constrained_request].keys():
+                                    for this_pass, this_decision_variable in solution_holder[constrained_request][this_satellite].items():
+                                        for parent_satellite in solution_holder[parent_request].keys():
+                                            for parent_pass, parent_decision_variable in solution_holder[parent_request][parent_satellite].items():
+                                                # If the parent request starts after the current request, then they can't be true at the same time
+                                                if parent_pass.highest.time+offset<this_pass.highest.time:
+                                                    solver.Add(this_decision_variable + parent_decision_variable <= 1)
+                    case ConstraintClass.SUCCESS:
+                        # The current node needs to know if the parent succeeded. So we constrain the current node to start after the parent
+                        # min_time = max(min_time, workflow_graph.nodes[parent_request]['observation_opportunity'].time)
+                        for this_satellite in solution_holder[constrained_request].keys():
+                            for this_pass, this_decision_variable in solution_holder[constrained_request][this_satellite].items():
+                                for parent_satellite in solution_holder[parent_request].keys():
+                                    for parent_pass, parent_decision_variable in solution_holder[parent_request][parent_satellite].items():
+                                        # If the parent request starts after the current request, then they can't be true at the same time
+                                        if parent_pass.highest.time>this_pass.highest.time:
+                                            solver.Add(this_decision_variable + parent_decision_variable <= 1)
+
+                        if (workflow_graph.nodes[parent_request]['completed'] is True):
+                            if (
+                                (
+                                    (constraint['constraint_type'] == SuccessConstraintType.START_IF_FAILED) and 
+                                    (workflow_graph.nodes[parent_request]['successful_execution'] == True)
+                                    ) or (
+                                    (constraint['constraint_type'] == SuccessConstraintType.START_IF_SUCCESSFUL) and 
+                                    (workflow_graph.nodes[parent_request]['successful_execution'] == False)
+                                    )
+                                ):
+                            # If incompatible, skip
+                                for this_satellite in solution_holder[constrained_request].keys():
+                                    for this_pass, this_decision_variable in solution_holder[constrained_request][this_satellite].items():
+                                        solver.Add(this_decision_variable == 0)
+                                workflow_graph.nodes[constrained_request]['scheduled']=True
+                                workflow_graph.nodes[constrained_request]['feasible']=False
+                                break
+                            
+                    case ConstraintClass.GEOMETRY:
+                        # min_time = max(min_time, workflow_graph.nodes[parent_request]['observation_opportunity'].time)
+                        for this_satellite in solution_holder[constrained_request].keys():
+                            for this_pass, this_decision_variable in solution_holder[constrained_request][this_satellite].items():
+                                for parent_satellite in solution_holder[parent_request].keys():
+                                    for parent_pass, parent_decision_variable in solution_holder[parent_request][parent_satellite].items():
+                                        # If the parent request starts after the current request, then they can't be true at the same time
+                                        if parent_pass.highest.time>this_pass.highest.time:
+                                            solver.Add(this_decision_variable + parent_decision_variable <= 1)
+
+        if workflow_graph.nodes[constrained_request]['is_mandatory'] is True:
+            solver.Add(sum([solution_holder[constrained_request][_satellite][_satpass] for _satellite, _satpasses in passes.items() for _satpass in _satpasses]) == 1)
+
+    # Only one assignment per request: see above
+
+    # On the same vehicle, no overlapping requests (not considering comms at this stage)
+
+    # for j in range(data["num_vars"]):
+    #     objective.SetCoefficient(x[j], data["obj_coeffs"][j])
+    objective.SetMaximization()
+
+    status = solver.Solve()
+
+    if status == pywraplp.Solver.OPTIMAL:
+        print("Objective value =", solver.Objective().Value())
+        for constrained_request in workflow_graph.nodes():
+            _feasible = False
+            for this_satellite in solution_holder[constrained_request].keys():
+                for this_pass, this_decision_variable in solution_holder[constrained_request][this_satellite].items():
+                    
+                    if this_decision_variable.solution_value()>0:
+                        print(this_decision_variable.name(), " = ", this_decision_variable.solution_value())
+                        _feasible = True
+                        workflow_graph.nodes[constrained_request]['observation_opportunity_pass'] = this_pass
+                        workflow_graph.nodes[constrained_request]['observation_opportunity'] = this_pass.highest
+                        workflow_graph.nodes[constrained_request]['observation_opportunity_satellite'] = this_satellite
+                        workflow_graph.nodes[constrained_request]['scheduled']=True
+            workflow_graph.nodes[constrained_request]['feasible']=_feasible
+
+        print()
+        print(f"Problem solved in {solver.wall_time():d} milliseconds")
+        print(f"Problem solved in {solver.iterations():d} iterations")
+        print(f"Problem solved in {solver.nodes():d} branch-and-bound nodes")
+    else:
+        print("The problem does not have an optimal solution.")
+
 
     return workflow_graph
 
@@ -352,16 +640,17 @@ def plot_workflow_schedule(workflow_graph, ax=None):
     for request in workflow_graph.nodes():
         request_data = workflow_graph.nodes[request]
         # Plot other times where it could have been scheduled.
-        for _sat, _opportunities in request_data['observation_opportunities'].items():
-            for _opportunity in _opportunities:
-                if _all_requests_min_time is None:
-                    _all_requests_min_time = _opportunity.rise.time
-                else:
-                    _all_requests_min_time = min(_all_requests_min_time, _opportunity.rise.time)
-                if _all_requests_max_time is None:
-                    _all_requests_max_time = _opportunity.fall.time
-                else:
-                    _all_requests_max_time = max(_all_requests_max_time, _opportunity.fall.time)
+        if (request_data['scheduled'] and request_data['feasible']):        # if 'observation_opportunities' in request_data.keys():
+            for _sat, _opportunities in request_data['observation_opportunities'].items():
+                for _opportunity in _opportunities:
+                    if _all_requests_min_time is None:
+                        _all_requests_min_time = _opportunity.rise.time
+                    else:
+                        _all_requests_min_time = min(_all_requests_min_time, _opportunity.rise.time)
+                    if _all_requests_max_time is None:
+                        _all_requests_max_time = _opportunity.fall.time
+                    else:
+                        _all_requests_max_time = max(_all_requests_max_time, _opportunity.fall.time)
 
     # Annotete the plot
     ax.set_yticks(np.array(range(num_requests))+0.5, request_names)
@@ -415,6 +704,9 @@ def find_dispatchable_tasks(workflow_graph = nx.MultiDiGraph()):
     for request in workflow_graph.nodes():
         _dispatchable = True
         request_data = workflow_graph.nodes[request]
+        if ((request_data['scheduled'] == False) or (request_data['feasible'] == False) or (request_data['dispatched'] == True) or (request_data['completed'] == True)):
+             _dispatchable = False
+             continue
         for parent_request in workflow_graph.predecessors(request):
             parent_request_data = workflow_graph.nodes[parent_request]
             constraint_edges = workflow_graph.get_edge_data(parent_request, request)

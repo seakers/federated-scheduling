@@ -19,6 +19,15 @@ import json
 
 MIN_HORIZON_ANGLE_FOR_PASS_DEG = 15
 
+class ObservationStatus(Enum):
+    UNKNOWN = 0
+    ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING=1
+    NO_OBSERVATION_OPPORTUNITIES=2
+    COULD_NOT_FIND_BEST_SATELLITE=3
+    SCHEDULED=4
+    SUBMITTED=5
+    DATA_RECEIVED=6
+
 requests_data_frame_columns = ['request', 'satellite', 'observation', 'uplink', 'downlink', 'status', 'data_product', 'scheduled_callback', 'unscheduled_callback', 'ready_callback']
 
 class Event():
@@ -171,7 +180,7 @@ def do_downlink(spacecraft: Satellite, scheduler, comm_pass: ObservationPass): #
     # Simple: downlink all. Future: downlink up to x.
     
     # Duration is unused for now
-    duration = comm_pass.fall.time - comm_pass.rise.time
+    # duration = comm_pass.fall.time - comm_pass.rise.time
 
     _downlinked = []
     if len(spacecraft.data_products):
@@ -188,7 +197,7 @@ def do_downlink(spacecraft: Satellite, scheduler, comm_pass: ObservationPass): #
         if len(matching_requests)>=1:
             # print(data_product)
             # try:
-            scheduler._requests.loc[scheduler._requests['observation']==_observation, 'status'] = "OK! Data received"
+            scheduler._requests.loc[scheduler._requests['observation']==_observation, 'status'] = ObservationStatus.DATA_RECEIVED
             # scheduler._requests.loc[scheduler._requests['observation']==_observation, 'data_product'] = data_product
             for _ix, _ready_callback in scheduler._requests.loc[scheduler._requests['observation']==_observation, 'ready_callback'].items():
                 scheduler._requests.loc[_ix, 'data_product'] = data_product
@@ -205,7 +214,7 @@ def do_downlink(spacecraft: Satellite, scheduler, comm_pass: ObservationPass): #
     for _observation in _downlinked:
         spacecraft.data_products.pop(_observation)
 
-
+## History
 
 def retell_history(world: World):
     for _chronicle in world.history:
@@ -215,6 +224,206 @@ def retell_history(world: World):
         if type(_chronicle['event'])==CommunicationEvent:
             print("Communication: station {} to sat {} during pass {}".format(_chronicle['event'].station, _chronicle['event'].satellite, _chronicle['event'].comm_pass))
 
+def plot_event(
+        _chronicle: dict,
+        world: World,
+        ax=None,
+        satellite_colors: dict={},
+        satellite_markers: dict={},
+        constellation_colors: dict={},
+        plot_time: bool=True,
+        plot_phenomena: bool=True,
+        plot_ground_stations: bool=True,
+        plot_satellites: bool=True,
+        plot_satellite_tracks: bool=True,
+        plot_observation_gaze: bool=True,
+        plot_observation_target: bool=True,
+        plot_observation_footprint: bool=True,
+        plot_comm_gaze: bool=True,
+        plot_comm_station: bool=True,
+        ):
+    if ax is None:
+        figglobal = plt.figure(figsize=(10,5))
+        ax = figglobal.add_subplot(1,1,1, projection=ccrs.Robinson())
+        ax.set_global()
+        ax.coastlines()
+
+    _time_to_plot_ground_track = dt.timedelta(seconds=3*60)
+    _dt_to_plot_ground_track = dt.timedelta(seconds=5)
+
+    time_steps_for_plotting = [_chronicle['time']- _dt_to_plot_ground_track*i for i in range(int(math.ceil(_time_to_plot_ground_track/_dt_to_plot_ground_track)))]
+
+    if plot_time:
+        ax.text(0,0,"{}".format(_chronicle['time']), transform=ax.transAxes)
+    
+    constellation_palette = cmap['viridis'].resampled(len(world.constellations))
+
+    if plot_phenomena:
+        for phenomenon in _chronicle['phenomena']:
+            if (phenomenon.start_time<_chronicle['time'] and phenomenon.end_time>_chronicle['time']): 
+                ax.plot(phenomenon.lon_deg, phenomenon.lat_deg, 'D', transform=ccrs.PlateCarree(), color='m')
+
+    for constellation_ix, constellation in enumerate(world.constellations):
+        constellation_color = constellation_colors.get(constellation.name, constellation_palette(constellation_ix/len(world.constellations)))
+        
+
+        # Plot the ground stations
+        if plot_ground_stations:
+            for ground_station in constellation.ground_stations:
+                ax.plot(float(ground_station.lon_deg), float(ground_station.lat_deg), '*', transform=ccrs.PlateCarree(), color=constellation_color)
+
+        # Plot the satellites
+        if plot_satellite_tracks:
+            for satellite in constellation.satellites:
+                satellite_color = satellite_colors.get(satellite.name, constellation_color)
+                _orbit = satellite.orbit
+                _llas = [_orbit.get_lonlatalt(t) for t in time_steps_for_plotting]
+                # ax.plot([lla[0] for lla in _llas],[lla[1] for lla in _llas],transform=ccrs.Geodetic(), color=constellation_color)
+                for lla_ix in range(len(time_steps_for_plotting)-1):
+                    ax.plot([_llas[lla_ix+1][0], _llas[lla_ix][0]], [_llas[lla_ix+1][1], _llas[lla_ix][1]], transform=ccrs.Geodetic(), color=satellite_color, alpha = 1-(lla_ix+1)/len(_llas))
+
+    if type(_chronicle['event'])==ObservationEvent:
+        
+        # Where are we looking - dashed line
+        if plot_observation_gaze:
+            ax.plot(
+                [_chronicle['event'].opportunity.lon_deg, _chronicle['event'].satellite.orbit.get_lonlatalt(_chronicle['time'])[0]],
+                [_chronicle['event'].opportunity.lat_deg, _chronicle['event'].satellite.orbit.get_lonlatalt(_chronicle['time'])[1]],
+                ':k',
+                transform=ccrs.Geodetic()
+            )
+
+        # The satellite location
+        satellite_color  = satellite_colors.get(_chronicle['event'].satellite.name, 'b')
+        satellite_marker = satellite_markers.get(_chronicle['event'].satellite.name, '.')
+        
+        if plot_satellites:
+            ax.plot(
+                _chronicle['event'].satellite.orbit.get_lonlatalt(_chronicle['time'])[0],
+                _chronicle['event'].satellite.orbit.get_lonlatalt(_chronicle['time'])[1],
+                satellite_marker,
+                color=satellite_color,
+                markersize=10,
+                transform=ccrs.Geodetic()
+            )
+
+        # The center of the observation area
+        if plot_observation_target:
+            ax.plot(
+                _chronicle['event'].opportunity.lon_deg,
+                _chronicle['event'].opportunity.lat_deg,
+                'Dr',
+                # markersize=10,
+                transform=ccrs.Geodetic()
+            )
+
+        # The sensor footprint
+        if plot_observation_footprint:
+            ground_footprint_llas = spacecraft_fov(
+                _chronicle['time'],
+                _chronicle['event'].satellite,
+                _chronicle['event'].opportunity.instrument,
+                _chronicle['event'].opportunity
+                )
+            ground_footprint_poly = Polygon([(_lla[0], _lla[1]) for _lla in ground_footprint_llas])
+            ax.add_patch(patch_from_polygon(ground_footprint_poly, fc=satellite_color, ec='none', alpha=0.5, transform=ccrs.Geodetic()))
+
+    elif type(_chronicle['event'])==CommunicationEvent:
+        # The line from the GS to the satellite
+        if plot_comm_gaze:
+            ax.plot(
+                [_chronicle['event'].station.lon_deg, _chronicle['event'].satellite.orbit.get_lonlatalt(_chronicle['time'])[0]],
+                [_chronicle['event'].station.lat_deg, _chronicle['event'].satellite.orbit.get_lonlatalt(_chronicle['time'])[1]],
+                '-.k',
+                transform=ccrs.Geodetic()
+            )
+        # The station
+        if plot_comm_station:
+            ax.plot(
+                _chronicle['event'].station.lon_deg,
+                _chronicle['event'].station.lat_deg,
+                '*',
+                markersize=10,
+                transform=ccrs.Geodetic()
+            )
+        # And the satellite
+        if plot_satellites:
+            satellite_color  = satellite_colors.get(_chronicle['event'].satellite.name, 'b')
+            satellite_marker = satellite_markers.get(_chronicle['event'].satellite.name, '.')
+            ax.plot(
+                _chronicle['event'].satellite.orbit.get_lonlatalt(_chronicle['time'])[0],
+                _chronicle['event'].satellite.orbit.get_lonlatalt(_chronicle['time'])[1],
+                satellite_marker,
+                color=satellite_color,
+                markersize=10,
+                transform=ccrs.Geodetic()
+            )
+    return ax
+
+
+def plot_history(
+        world: World,
+        events_to_show: list,
+        axes_extents: tuple=None,
+        satellite_colors: dict={},
+        satellite_markers: dict={},
+        constellation_colors: dict={},
+        plot_time: bool=True,
+        plot_phenomena: bool=True,
+        plot_ground_stations: bool=True,
+        plot_satellites: bool=True,
+        plot_satellite_tracks: bool=True,
+        plot_observation_gaze: bool=True,
+        plot_observation_target: bool=True,
+        plot_observation_footprint: bool=True,
+        plot_comm_gaze: bool=True,
+        plot_comm_station: bool=True,
+        ):
+    artists = []
+    for _chronicle_ix, _chronicle in enumerate(world.history):
+        if type(_chronicle['event']) in events_to_show:
+            figglobal = plt.figure(figsize=(10,5))
+            ax = figglobal.add_subplot(1,1,1, projection=ccrs.Robinson())
+            if axes_extents is None:
+                ax.set_global()
+            
+            else:
+                # _plot_offset_deg = 4
+                # axes_extents = (float(Rotterdam.lon_deg)-_plot_offset_deg, float(Rotterdam.lon_deg)+_plot_offset_deg, float(Rotterdam.lat_deg)-_plot_offset_deg, float(Rotterdam.lat_deg)+_plot_offset_deg)
+                ax.set_extent(axes_extents, crs=ccrs.PlateCarree())
+            
+            ax.coastlines()
+
+            _ax = plot_event(
+                _chronicle,
+                world,
+                ax=ax,
+                satellite_colors=satellite_colors,
+                satellite_markers=satellite_markers,
+                constellation_colors=constellation_colors,
+                plot_time=plot_time,
+                plot_phenomena=plot_phenomena,
+                plot_ground_stations=plot_ground_stations,
+                plot_satellites=plot_satellites,
+                plot_satellite_tracks=plot_satellite_tracks,
+                plot_observation_gaze=plot_observation_gaze,
+                plot_observation_target=plot_observation_target,
+                plot_observation_footprint=plot_observation_footprint,
+                plot_comm_gaze=plot_comm_gaze,
+                plot_comm_station=plot_comm_station,
+                )
+            plt.savefig("History_{:05d}.png".format(_chronicle_ix))
+            # artists.append(_ax)
+        
+    # plt.show()
+        # if type(_chronicle['event'])==ObservationEvent:
+        #     print("Observation: sat {} and opportunity {}".format(_chronicle['event'].satellite, _chronicle['event'].opportunity))
+        # if type(_chronicle['event'])==CommunicationEvent:
+        #     print("Communication: station {} to sat {} during pass {}".format(_chronicle['event'].station, _chronicle['event'].satellite, _chronicle['event'].comm_pass))
+
+
+## Utilities
+
 def screen_request_for_feasibility(existing_requests: pd.DataFrame, satellite: Satellite, _request: ObservationRequest, screen_against_comm_passes:bool=True, log_prefix: str=""):
     # Check if a given request conflicts with existing requests.
     # TODO this is horrifyingly expensive because we do not exploit the fact that
@@ -222,7 +431,7 @@ def screen_request_for_feasibility(existing_requests: pd.DataFrame, satellite: S
     conflicting_requests = existing_requests.loc[
         existing_requests.apply(
         lambda x: 
-            (x['status']=="Scheduled") and # We have actually scheduled this
+            (x['status']== ObservationStatus.SCHEDULED) and # We have actually scheduled this
             (x['observation'].time+x['observation'].duration > _request.time) and # The end of the other observation is after we start
             (x['observation'].time < _request.time+_request.duration) and # The start of the other observation is before we end
             (x['satellite'] == satellite) # This request is on the same satellite. Note that we check these are the same OBJECT, not just the same name.
@@ -234,7 +443,8 @@ def screen_request_for_feasibility(existing_requests: pd.DataFrame, satellite: S
         conflicting_uplinks = existing_requests.loc[
             existing_requests.apply(
             lambda x: 
-                (x['status']=="Scheduled") and # We have actually scheduled this
+                (x['status']==ObservationStatus.SCHEDULED) and # We have actually scheduled this
+                (type(x['uplink']) == ObservationPass) and
                 (x['uplink'].fall.time > _request.time) and # The end of the comm pass is after we start
                 (x['uplink'].rise.time < _request.time + _request.duration) and # The start of the comm pass is before we end
                 (x['satellite'] == satellite) # This request is on the same satellite
@@ -245,7 +455,8 @@ def screen_request_for_feasibility(existing_requests: pd.DataFrame, satellite: S
         conflicting_downlinks = existing_requests.loc[
             existing_requests.apply(
             lambda x: 
-                (x['status']=="Scheduled") and # We have actually scheduled this
+                (x['status']==ObservationStatus.SCHEDULED) and # We have actually scheduled this
+                (type(x['downlink']) == ObservationPass) and
                 (x['downlink'].fall.time > _request.time) and # The end of the comm pass is after we start
                 (x['downlink'].rise.time < _request.time + _request.duration) and # The start of the comm pass is before we end
                 (x['satellite'] == satellite) # This request is on the same satellite
@@ -262,7 +473,7 @@ def screen_pass_for_feasibility(existing_requests: pd.DataFrame, satellite: Sate
     conflicting_requests = existing_requests.loc[
         existing_requests.apply(
         lambda x: 
-            (x['status']=="Scheduled") and # We have actually scheduled this
+            (x['status']==ObservationStatus.SCHEDULED) and # We have actually scheduled this
             (x['observation'].time+x['observation'].duration > _obs_pass.rise.time) and # The end of the other observation is after we start
             (x['observation'].time < _obs_pass.fall.time) and # The start of the other observation is before we end
             (x['satellite'] == satellite) # This request is on the same satellite. Note that we check these are the same OBJECT, not just the same name.
@@ -273,7 +484,8 @@ def screen_pass_for_feasibility(existing_requests: pd.DataFrame, satellite: Sate
         conflicting_uplinks = existing_requests.loc[
             existing_requests.apply(
             lambda x: 
-                (x['status']=="Scheduled") and # We have actually scheduled this
+                (x['status']==ObservationStatus.SCHEDULED) and # We have actually scheduled this
+                (type(x['uplink']) == ObservationPass) and
                 (x['uplink'].fall.time > _obs_pass.rise.time) and # The end of the comm pass is after we start
                 (x['uplink'].rise.time < _obs_pass.fall.time) and # The start of the comm pass is before we end
                 (x['satellite'] == satellite) # This request is on the same satellite
@@ -283,7 +495,8 @@ def screen_pass_for_feasibility(existing_requests: pd.DataFrame, satellite: Sate
         conflicting_downlinks = existing_requests.loc[
             existing_requests.apply(
             lambda x: 
-                (x['status']=="Scheduled") and # We have actually scheduled this
+                (x['status']==ObservationStatus.SCHEDULED) and # We have actually scheduled this
+                (type(x['downlink']) == ObservationPass) and
                 (x['downlink'].fall.time > _obs_pass.rise.time) and # The end of the comm pass is after we start
                 (x['downlink'].rise.time < _obs_pass.fall.time) and # The start of the comm pass is before we end
                 (x['satellite'] == satellite) # This request is on the same satellite

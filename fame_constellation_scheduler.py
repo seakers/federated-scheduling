@@ -19,6 +19,10 @@ import json
 
 from fame_agents_base import *
 
+
+
+
+
 class ConstellationGroundScheduler():
     def __init__(self, satellites: list, ground_stations: list, world: World, name="Constellation"):
         self.name = name
@@ -27,6 +31,11 @@ class ConstellationGroundScheduler():
         self.world = world
         # self.requests = {}
         self._requests = pd.DataFrame(columns=requests_data_frame_columns)
+
+    def __str__(self):
+        return f"Constellation scheduler {self.name} with {len(self.satellites)} satellites"
+    def __repr__(self):
+        return self.__str__()
 
     def screen_request_for_feasibility(self, satellite: Satellite, _request: ObservationRequest, screen_against_comm_passes:bool=True):
         return screen_request_for_feasibility(existing_requests=self._requests, satellite=satellite, _request=_request, screen_against_comm_passes=screen_against_comm_passes, log_prefix=self.name)
@@ -52,7 +61,7 @@ class ConstellationGroundScheduler():
             'observation': None,
             'uplink': None,
             'downlink': None,
-            'status': None,
+            'status': ObservationStatus.UNKNOWN,
             'data_product': None,
             'scheduled_callback': callback_request_scheduled,
             'unscheduled_callback': callback_request_unscheduled,
@@ -72,6 +81,7 @@ class ConstellationGroundScheduler():
             passes_error_s=60,
             # passes_horizon_deg=MIN_HORIZON_ANGLE_FOR_OBS_DEG
         )
+
         if len(_opportunities):
             # best_request = None
             passes = _opportunities[request]
@@ -100,63 +110,73 @@ class ConstellationGroundScheduler():
                             continue
 
                         _quality = observation_quality(satpass.highest)
-                        # Find a feasible uplink for this opportunity
-                        _, ul_comm_opportunities = find_contact_opportunities(
-                            ground_stations=self.ground_stations,
-                            satellites=[satellite, ],
-                            min_time=current_time,
-                            max_time=satpass.highest.time,
-                            passes_error_s=60,
-                            passes_horizon_deg=MIN_HORIZON_ANGLE_FOR_PASS_DEG,
-                        )
 
-                        if ((satellite in ul_comm_opportunities.keys()) and (len(ul_comm_opportunities[satellite])))==0:
-                            print("No contacts for this satellite! Maybe we were too greedy")
-                            continue
+                        # TODO if satellite has continuous ISL, skip the uplink and downlink search
                         
-                        earliest_ul_opportunity = None
-                        earliest_ul_opportunity_station = None
-                        for comm_opportunity in ul_comm_opportunities[satellite]:
-                            if self.screen_pass_for_feasibility(satellite, comm_opportunity[1], screen_against_comm_passes=False):
-                                earliest_ul_opportunity = comm_opportunity[1]
-                                earliest_ul_opportunity_station = comm_opportunity[0]
-                                break
+                        if (satellite.has_continuous_isl_to_ground == True):
+                            earliest_ul_opportunity = "ISL"
+                            earliest_ul_opportunity_station = "ISL"
+                            dl_pass = "ISL"
+                            dl_station = "ISL"
+                        else:
 
-                        if ((earliest_ul_opportunity is None) or (earliest_ul_opportunity_station is None)):
-                            print("No timely *unconflicted* contact! Maybe we were too greedy")
-                            continue
+                            # Find a feasible uplink for this opportunity
+                            _, ul_comm_opportunities = find_contact_opportunities(
+                                ground_stations=self.ground_stations,
+                                satellites=[satellite, ],
+                                min_time=current_time,
+                                max_time=satpass.highest.time,
+                                passes_error_s=60,
+                                passes_horizon_deg=MIN_HORIZON_ANGLE_FOR_PASS_DEG,
+                            )
 
-                        # At this point, satpass contains the satellite pass, earliest_ul_opportunity contains the corresponding uplink
+                            if ((satellite in ul_comm_opportunities.keys()) and (len(ul_comm_opportunities[satellite])))==0:
+                                print("   No contacts for this satellite! Maybe we were too greedy")
+                                continue
+                            
+                            earliest_ul_opportunity = None
+                            earliest_ul_opportunity_station = None
+                            for comm_opportunity in ul_comm_opportunities[satellite]:
+                                if self.screen_pass_for_feasibility(satellite, comm_opportunity[1], screen_against_comm_passes=False):
+                                    earliest_ul_opportunity = comm_opportunity[1]
+                                    earliest_ul_opportunity_station = comm_opportunity[0]
+                                    break
 
-                        # Find a feasible downlink for this opportunity after the event
-                        # Find downlink opportunities
-                        _, _dl_comm_opportunities = find_contact_opportunities(
-                            ground_stations=self.ground_stations,
-                            satellites=[satellite, ],
-                            min_time=satpass.highest.time+satpass.highest.duration,
-                            max_time=satpass.highest.time+satpass.highest.duration+dt.timedelta(hours=48),
-                            passes_error_s=60,
-                            passes_horizon_deg=MIN_HORIZON_ANGLE_FOR_PASS_DEG,
-                        )
-                        # # Schedule downlink events for those
-                        if satellite not in _dl_comm_opportunities.keys() or len(_dl_comm_opportunities[satellite]) == 0:
-                            print("Could not find a suitable downlink")
-                            # Could not find a suitable downlink
-                            continue
+                            if ((earliest_ul_opportunity is None) or (earliest_ul_opportunity_station is None)):
+                                print("No timely *unconflicted* contact! Maybe we were too greedy")
+                                continue
 
-                        # Passes are sorted by time. An we checked above that there is at least one pass
-                        dl_station = None
-                        dl_pass = None
-                        for comm_opportunity in _dl_comm_opportunities[satellite]:
-                            if self.screen_pass_for_feasibility(satellite, comm_opportunity[1], screen_against_comm_passes=False):
-                                dl_pass = comm_opportunity[1]
-                                dl_station = comm_opportunity[0]
-                                break
+                            # At this point, satpass contains the satellite pass, earliest_ul_opportunity contains the corresponding uplink
 
-                        if ((dl_pass is None) or (dl_station is None)):
-                            # Could not find a suitable unconflicted downlink
-                            print("Could not find a suitable unconflicted downlink")
-                            break
+                            # Find a feasible downlink for this opportunity after the event
+                            # Find downlink opportunities
+                            _, _dl_comm_opportunities = find_contact_opportunities(
+                                ground_stations=self.ground_stations,
+                                satellites=[satellite, ],
+                                min_time=satpass.highest.time+satpass.highest.duration,
+                                max_time=satpass.highest.time+satpass.highest.duration+dt.timedelta(hours=48),
+                                passes_error_s=60,
+                                passes_horizon_deg=MIN_HORIZON_ANGLE_FOR_PASS_DEG,
+                            )
+                            # # Schedule downlink events for those
+                            if satellite not in _dl_comm_opportunities.keys() or len(_dl_comm_opportunities[satellite]) == 0:
+                                print("Could not find a suitable downlink")
+                                # Could not find a suitable downlink
+                                continue
+
+                            # Passes are sorted by time. An we checked above that there is at least one pass
+                            dl_station = None
+                            dl_pass = None
+                            for comm_opportunity in _dl_comm_opportunities[satellite]:
+                                if self.screen_pass_for_feasibility(satellite, comm_opportunity[1], screen_against_comm_passes=False):
+                                    dl_pass = comm_opportunity[1]
+                                    dl_station = comm_opportunity[0]
+                                    break
+
+                            if ((dl_pass is None) or (dl_station is None)):
+                                # Could not find a suitable unconflicted downlink
+                                print("Could not find a suitable unconflicted downlink")
+                                continue
 
                         if _quality >= _best_quality:
                             _best_quality = _quality
@@ -171,13 +191,13 @@ class ConstellationGroundScheduler():
                 print(" [{}] Best request: {} with {}".format(self.name, _best_pass, _best_satellite))
                 if (_best_pass is None):
                     print("   All observation opportunities are conflicting")
-                    self._requests.loc[self._requests['request']==request, 'status'] = "All observation opportunities are conflicting"
-                    callback_request_unscheduled("All observation opportunities are conflicting")
+                    self._requests.loc[self._requests['request']==request, 'status'] = ObservationStatus.ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING
+                    callback_request_unscheduled(ObservationStatus.ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING)
                     return -5
             else:
                 print("No observation opportunities here")
-                self._requests.loc[self._requests['request']==request, 'status'] = "No observation opportunities"
-                callback_request_unscheduled("No observation opportunities")
+                self._requests.loc[self._requests['request']==request, 'status'] = ObservationStatus.NO_OBSERVATION_OPPORTUNITIES
+                callback_request_unscheduled(ObservationStatus.NO_OBSERVATION_OPPORTUNITIES)
                 return -1
         else:
             print("Something wrong with requests list, did you pass a request?")
@@ -188,14 +208,22 @@ class ConstellationGroundScheduler():
                 _best_sat_object = sat
         if (_best_sat_object is None):
             print("ERROR! Something wrong with finding the satellite")
-            self._requests.loc[self._requests['request']==request, 'status'] = "Could not find best satellite";
+            self._requests.loc[self._requests['request']==request, 'status'] = ObservationStatus.COULD_NOT_FIND_BEST_SATELLITE
 
-            callback_request_unscheduled("Could not find best satellite")
+            callback_request_unscheduled(ObservationStatus.COULD_NOT_FIND_BEST_SATELLITE)
             return -3
         #
 
-        schedule_observation_uplink(self.world, _best_sat_object, _best_uplink_comm_opportunity, _best_pass.highest, _best_uplink_comm_opportunity_station, phenomenon_processor=phenomenon_processor)
-        schedule_sat_downlink(_world=self.world, satellite=_best_sat_object, comm_pass = _best_downlink_comm_opportunity, station = _best_downlink_comm_opportunity_station, constellation_scheduler=self)
+        # If we have ISL, just schedule the observation through the magic comm link 
+        if _best_uplink_comm_opportunity == "ISL":
+            schedule_observation(self.world, _best_sat_object, _best_pass.highest, phenomenon_processor=phenomenon_processor)
+        else:
+            schedule_observation_uplink(self.world, _best_sat_object, _best_uplink_comm_opportunity, _best_pass.highest, _best_uplink_comm_opportunity_station, phenomenon_processor=phenomenon_processor)
+        
+        if _best_downlink_comm_opportunity == "ISL":
+            schedule_isl_downlink(_world=self.world, satellite=_best_sat_object, time = _best_pass.highest.time, constellation_scheduler=self)
+        else:
+            schedule_sat_downlink(_world=self.world, satellite=_best_sat_object, comm_pass = _best_downlink_comm_opportunity, station = _best_downlink_comm_opportunity_station, constellation_scheduler=self)
         # # Do downlink
         
         # # Schedule an event where we tell the satellite about this. The event calls schedule_observation
@@ -206,7 +234,7 @@ class ConstellationGroundScheduler():
         self._requests.loc[self._requests['request']==request, 'observation'] = _best_pass.highest
         self._requests.loc[self._requests['request']==request, 'uplink'] = _best_uplink_comm_opportunity
         self._requests.loc[self._requests['request']==request, 'downlink'] = _best_downlink_comm_opportunity
-        self._requests.loc[self._requests['request']==request, 'status'] = "Scheduled";
+        self._requests.loc[self._requests['request']==request, 'status'] = ObservationStatus.SCHEDULED
 
         callback_request_scheduled(_best_pass.highest)
         return 0
@@ -396,6 +424,23 @@ def schedule_sat_downlink(
         action_callable = lambda _cs=constellation_scheduler, _s=satellite, _c=comm_pass: start_downlink_event(_spacecraft=_s, _scheduler=_cs, _comm_pass=_c),
         satellite=satellite,
         station=station,
+        comm_pass=comm_pass
+    )
+    _world.add_event(_event)
+
+def schedule_isl_downlink(
+    _world: World,
+    satellite: Satellite,
+    time: dt.datetime,
+    constellation_scheduler: ConstellationGroundScheduler
+):       
+    comm_pass = "ISL"
+    _event = CommunicationEvent(
+        name="ISL Downlink from sat {}".format(satellite.name),
+        time = time,
+        action_callable = lambda _cs=constellation_scheduler, _s=satellite, _c=comm_pass: do_downlink(spacecraft=_s, scheduler=_cs, comm_pass=_c),
+        satellite=satellite,
+        station="ISL",
         comm_pass=comm_pass
     )
     _world.add_event(_event)
