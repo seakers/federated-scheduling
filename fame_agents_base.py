@@ -424,7 +424,7 @@ def plot_history(
 
 ## Utilities
 
-def screen_request_for_feasibility(existing_requests: pd.DataFrame, satellite: Satellite, _request: ObservationRequest, screen_against_comm_passes:bool=True, log_prefix: str=""):
+def screen_opportunity_for_feasibility(existing_requests: pd.DataFrame, satellite: Satellite, _request: ObservationOpportunity, screen_against_comm_passes:bool=True, log_prefix: str=""):
     # Check if a given request conflicts with existing requests.
     # TODO this is horrifyingly expensive because we do not exploit the fact that
     #  requests are sorted. We should improve this, ideally without rebuilding a full on timeline library.

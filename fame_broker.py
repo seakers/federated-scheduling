@@ -240,9 +240,9 @@ class Broker():
             _pdrequest = pd.DataFrame([_request_dict])
             self._requests = pd.concat([self._requests, _pdrequest], ignore_index=True)
                 
-    def add_workflow(self, workflow):
+    def add_workflow(self, workflow: Workflow):
         self.workflow = workflow
-        self._workflow_graph = build_workflow_graph(self.workflow)
+        self._workflow_graph, self._timeline_graph = build_workflow_graph(self.workflow)
         self._workflow_schedule_epoch = 0 # We use this to keep track of whether we rescheduled during dispatch
 
     def schedule_workflow(
@@ -252,6 +252,7 @@ class Broker():
         # Come up with a schedule that satisfies the workflow
         _ = greedy_schedule_workflow(
             workflow_graph=self._workflow_graph,
+            timeline_graph=self._timeline_graph,
             satellites=self._known_satellites,
             feasibility_screener=self._screen_pass_for_feasibility,
             current_time=current_time,

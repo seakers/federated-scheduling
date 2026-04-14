@@ -37,8 +37,8 @@ class ConstellationGroundScheduler():
     def __repr__(self):
         return self.__str__()
 
-    def screen_request_for_feasibility(self, satellite: Satellite, _request: ObservationRequest, screen_against_comm_passes:bool=True):
-        return screen_request_for_feasibility(existing_requests=self._requests, satellite=satellite, _request=_request, screen_against_comm_passes=screen_against_comm_passes, log_prefix=self.name)
+    def screen_opportunity_for_feasibility(self, satellite: Satellite, _request: ObservationRequest, screen_against_comm_passes:bool=True):
+        return screen_opportunity_for_feasibility(existing_requests=self._requests, satellite=satellite, _request=_request, screen_against_comm_passes=screen_against_comm_passes, log_prefix=self.name)
     
     def screen_pass_for_feasibility(self, satellite: Satellite,  _obs_pass: ObservationPass, screen_against_comm_passes:bool=False):
         return screen_pass_for_feasibility(existing_requests=self._requests, satellite=satellite, _obs_pass=_obs_pass, screen_against_comm_passes=screen_against_comm_passes, log_prefix=self.name)
@@ -105,7 +105,7 @@ class ConstellationGroundScheduler():
                         # Query the table of observations for 1. planned, 2. on the satellite we are examining.
                         # Check by time if there is something nearby.
                         # If there is, back off.
-                        _pass_is_feasible = self.screen_request_for_feasibility(satellite, satpass.highest)
+                        _pass_is_feasible = self.screen_opportunity_for_feasibility(satellite, satpass.highest)
                         if (_pass_is_feasible == False):
                             continue
 

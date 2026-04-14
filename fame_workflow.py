@@ -11,6 +11,8 @@ from matplotlib.pyplot import cm
 
 from ortools.linear_solver import pywraplp
 
+import bisect
+
 # import random
 
 
@@ -72,7 +74,9 @@ class ConstrainedObservationRequest():
     def __init__(
             self,
             observation_request: ObservationRequest,
-            constraints: list = [],
+            task_constraints: list = [],
+            timeline_constraints: list = [],
+            timeline_impacts: list = [],
             is_mandatory: bool=False,
             schedule_policy_if_constraint_unsatisfied: dict={c: True for c in ConstraintClass},
             dispatch_policy_if_constraint_unsatisfied: dict={c: False for c in ConstraintClass},
@@ -81,8 +85,25 @@ class ConstrainedObservationRequest():
             follow_up_action_success=lambda data_product: None,
             phenomenon_processor=lambda o, s, p: p
             ):
+        """_summary_
+
+        Args:
+            observation_request (ObservationRequest): An observation request
+            task_constraints (list, optional): a list of Constraints linking this task to other tasks. Defaults to [].
+            timeline_constraints (list, optional): a list of TaskTimelineConstraint linking this task to other timelines. Defaults to [].
+            timeline_impacts (list, optional): a list of TaskTimelineImpact linking this task to other timelines. Defaults to [].
+            is_mandatory (bool, optional): Is the task mandatory? Only used by the ILP scheduler. Defaults to False.
+            schedule_policy_if_constraint_unsatisfied (_type_, optional): do we schedule this task if some of the constraints are not yet resolved? Defaults to {c: True for c in ConstraintClass}.
+            dispatch_policy_if_constraint_unsatisfied (_type_, optional): do we dispatch this task if some of the constraints are not yet resolved? Defaults to {c: False for c in ConstraintClass}.
+            success_declarer (function, optional): did the observation succeed (from the perspective of tasks constrained on this). Defaults to lambda(data_product):True.
+            follow_up_action_failure (function, optional): What to do when the observation fails to schedule. Defaults to lambda(reason): None.
+            follow_up_action_success (function, optional): What to do when the observation returns successfully . Defaults to lambda(data_product:None.
+            phenomenon_processor (function, optional): _description_. Defaults to lambda (observation, spacecraft, phenomenon): phenomenon.
+        """
         self.observation_request = observation_request
-        self.constraints = constraints
+        self.task_constraints = task_constraints
+        self.timeline_constraints = timeline_constraints
+        self.timeline_impacts = timeline_impacts
         self.is_mandatory = is_mandatory
         self.schedule_policy = schedule_policy_if_constraint_unsatisfied
         self.dispatch_policy = dispatch_policy_if_constraint_unsatisfied
@@ -100,27 +121,180 @@ class ConstrainedObservationRequest():
         self.phenomenon_processor = phenomenon_processor
 
     def __str__(self):
-        return f"{self.observation_request} with {len(self.constraints)} constraints"
+        return f"{self.observation_request} with {len(self.task_constraints)} task constraints"
     def __repr__(self):
         return self.__str__()
     
-# class Workflow():
-#     def __init__(
-#             self,
-#             constrained_observation_requests: list[ConstrainedObservationRequest]
-#     ):
-#         self.constrained_observation_requests = constrained_observation_requests
+
+class ImpactType(Enum):
+    ASSIGNMENT = 0 # Make the timeline this
+    ADDITION = 1 # Add this to the initial value
+    RATE_ADDITION = 2 # Add this to the rate at this time
+
+class Impact():
+    def __init__(self, time: dt.datetime, type: ImpactType, value, owner: ConstrainedObservationRequest=None):
+        self.time = time
+        self.type = type
+        self.value = value
+        self.owner = owner
+
+class Timeline():
+    def __init__(self, name: str, initial_time: dt.datetime, initial_value: float, initial_rate: float):
+        self.name = name
+        self.impact_container = [Impact(initial_time, ImpactType.ASSIGNMENT, initial_value), Impact(initial_time, ImpactType.RATE_ADDITION, initial_rate)]
+
+    def add_impact(self, impact: Impact):
+        bisect.insort(self.impact_container, impact, key=lambda x: x.time)
     
-def build_workflow_graph(workflow: list):
+    def _get_value_and_rate_at(self, time: dt.datetime):
+
+        # Select only the impacts that apply
+        closest_index = bisect.bisect(self.impact_container, time, key=lambda x: x.time)
+        
+        # Accumulators
+        _value = 0
+        _rate = 0
+
+        _previous_time = dt.datetime.now()
+        assert (self.impact_container[0].type == ImpactType.ASSIGNMENT), "ERROR: The initial value in a timeline must be an assignment"
+        
+        for _impact in self.impact_container[:closest_index+1]:
+            match _impact.type:
+                case ImpactType.ASSIGNMENT:
+                    _value = _impact.value
+                    _previous_time = _impact.time
+                case ImpactType.ADDITION:
+                    # Propagate the rate
+                    _dt = _impact.time-_previous_time
+                    _integrated_rate = _rate*dt.total_seconds()
+                    _value += _integrated_rate
+                    
+                    # Now actually add the impact
+                    _value += _impact.value
+
+                    # Reset time
+                    _previous_time = _impact.time
+                    
+                case ImpactType.RATE_ADDITION:
+                    # Propagate the rate
+                    _dt = _impact.time-_previous_time
+                    _integrated_rate = _rate*dt.total_seconds()
+                    _value += _integrated_rate
+
+                    # Now update the rate
+                    _rate += _impact.value
+
+                    # Reset time
+                    _previous_time = _impact.time
+
+        # Bring to current time
+        # Propagate the rate
+        _dt = time-_previous_time
+        _integrated_rate = _rate*dt.total_seconds()
+        _value += _integrated_rate
+
+        return _value, _rate
+    
+    def get_value_at(self, time: dt.datetime):
+        value, rate = self._get_value_and_rate_at(time)
+        return value
+    
+    def consolidate_impacts(self, time: dt.datetime):
+        _value_at_time, _rate_at_time = self._get_value_and_rate_at(time)
+
+        closest_index = bisect.bisect(self.impact_container, time, key=lambda x: x.time)
+        self.impact_container= self.impact_container[closest_index+1:]
+        self.add_impact(Impact(time, ImpactType.ASSIGNMENT, _value_at_time))
+        self.add_impact(Impact(time, ImpactType.RATE_ADDITION, _rate_at_time))
+
+    def remove_impacts_from_owner(self, owner: ConstrainedObservationRequest):
+        new_impact_container = [i for i in self.impact_container if i.owner != owner]
+        self.impact_container = new_impact_container
+
+class AssignmentTimeline(Timeline):
+    def __init__(self, name: str, initial_time: dt.datetime, initial_value: bool):
+        super().__init__(name, initial_time=initial_time, initial_value=initial_value)
+
+    def add_impact(self, impact: Impact):
+        assert (impact.type == ImpactType.ASSIGNMENT), "ERROR: non-assignment impact on assignment timeline"
+        bisect.insort(self.impact_container, impact, key=lambda x: x.time)
+    
+    def consolidate_impacts(self, time: dt.datetime):
+        closest_index = bisect.bisect(self.impact_container, time, key=lambda x: x.time)
+        self.impact_container= self.impact_container[closest_index:]
+    
+    def get_value_at(self, time: dt.datetime):
+        closest_index = bisect.bisect(self.impact_container, time, key=lambda x: x.time)
+        return self.impact_container[closest_index].value
+    
+class AdditiveTimeline(Timeline):
+    def __init__(self, name: str, initial_time: dt.datetime, initial_value: float):
+        super().__init__(name, initial_time=initial_time, initial_value=initial_value)
+    
+    def add_impact(self, impact: Impact):
+        assert (impact.type == ImpactType.ADDITION), "ERROR: non-additive impact on additive timeline"
+        bisect.insort(self.impact_container, impact, key=lambda x: x.time)
+
+    def get_value_at(self, time):
+        closest_index = bisect.bisect(self.impact_container, time, key=lambda x: x.time)
+        return np.sum([_impact.value for _impact in self.impact_container[:closest_index+1]])
+    
+    def consolidate_impacts(self, time):
+        _value_at_time = self.get_value_at(time)
+        closest_index = bisect.bisect(self.impact_container, time, key=lambda x: x.time)
+        self.impact_container= self.impact_container[closest_index+1:]
+        assert (self.impact_container[0].time>=time), "ERROR: something went horribly wrong consolidating impacts"
+        self.impact_container.insert(0, Impact(time, ImpactType.ASSIGNMENT, _value_at_time))
+
+class TaskImpactTime(Enum):
+    PRE = 0 
+    POST = 1
+
+class TimelineConstraintType(Enum):
+    GREATER_OR_EQUAL = 0 
+    LESSER_OR_EQUAL = 1
+    EQUAL = 2
+
+class TaskTimelineImpact():
+    def __init__(self, timeline: Timeline, time: TaskImpactTime, type: ImpactType, value):
+        self.timeline = Timeline
+        self.time = time
+        self.type = type
+        self.value = value
+
+class TaskTimelineConstraint():
+    def __init__(self, timeline: Timeline, time: TaskImpactTime, type: TimelineConstraintType, value):
+        self.timeline = Timeline
+        self.time = time
+        self.type = type
+        self.value = value
+
+class Workflow():
+    def __init__(
+            self,
+            constrained_observation_requests: list[ConstrainedObservationRequest],
+            timelines: list[Timeline]=[],
+    ):
+        self.constrained_observation_requests = constrained_observation_requests
+        self.timelines = timelines
+
+
+def build_workflow_graph(workflow: Workflow):
     # Build a dependency graph
     workflow_graph = nx.MultiDiGraph()
-    for constrained_request in workflow:
+    timeline_graph = nx.MultiDiGraph()
+
+    for constrained_request in workflow.constrained_observation_requests:
         # this_node = request
         workflow_graph.add_node(constrained_request, **constrained_request.__dict__) # Father forgive me for I have sinned against Python
+        timeline_graph.add_node(constrained_request, **constrained_request.__dict__)
 
-    for constrained_request in workflow:
+    for timeline in workflow.timelines:
+        timeline_graph.add_node(timeline, **timeline.__dict__) # Father forgive me for I have sinned against Python
+
+    for constrained_request in workflow.constrained_observation_requests:
         # this_node = request
-        for constraint in constrained_request.constraints:
+        for constraint in constrained_request.task_constraints:
             workflow_graph.add_edge(
                 constraint.parent,
                 constrained_request,
@@ -128,8 +302,28 @@ def build_workflow_graph(workflow: list):
                 constraint_type=constraint.constraint_type,
                 parameters=constraint.parameters,
                 )
-    
-    return workflow_graph
+            
+    for constrained_request in workflow.constrained_observation_requests:
+        # this_node = request
+        for tconstraint in constrained_request.timeline_constraints:
+            timeline_graph.add_edge(
+                constrained_request,
+                tconstraint.timeline,
+                constraint_time=tconstraint.time,
+                constraint_type=tconstraint.type,
+                constraint_value=tconstraint.value,
+                )
+        for timpact in constrained_request.timeline_impacts:
+            timeline_graph.add_edge(
+                constrained_request,
+                tconstraint.timeline,
+                impact_time=timpact.time,
+                impact_type=timpact.type,
+                impact_value=timpact.value,
+                )
+
+
+    return workflow_graph, timeline_graph
 
 # Idea:
 # Dependency graph: build who depends on whom and ID the roots
@@ -146,12 +340,12 @@ def build_workflow_graph(workflow: list):
 
 def greedy_schedule_workflow(
         workflow_graph: nx.MultiDiGraph,
+        timeline_graph: nx.MultiDiGraph,
         satellites: list,
         feasibility_screener = lambda satellite, observation_pass: True,
         existing_requests: pd.DataFrame= pd.DataFrame(columns=requests_data_frame_columns), current_time: dt.datetime=None,
         verbose: int=99,
         ):
-    
     
     # Build a dependency graph
     # requests_to_skip_data_not_ready = []
@@ -182,6 +376,7 @@ def greedy_schedule_workflow(
     for node_id in workflow_graph.nodes():
         if ((workflow_graph.nodes[node_id]['dispatched'] == False) and (workflow_graph.nodes[node_id]['completed'] == False)):
              workflow_graph.nodes[node_id]['scheduled'] = False
+            #  TODO: remove impacts for this task
 
     # Walk through requests
     # Start with the root nodes
@@ -285,7 +480,7 @@ def greedy_schedule_workflow(
                             max_time = min(max_time, workflow_graph.nodes[child_request]['observation_opportunity'].time)
             else:
                 if verbose>3:
-                    print(f"Skipping constraints for child {child_request}, currently unscheduled")
+                    print(f"Skipping task constraints for child {child_request}, currently unscheduled")
 
         # Check if any constraints are violated.
         # For temporal constraints that is auto-handled below.
@@ -344,7 +539,7 @@ def greedy_schedule_workflow(
                     break
                 else:
                     if verbose>2:
-                        print(f"   [Scheduler] Skipping constraints for parent {parent_request}, currently unscheduled")
+                        print(f"   [Scheduler] Skipping task constraints for parent {parent_request}, currently unscheduled")
         
         if (workflow_graph.nodes[constrained_request]['feasible']==False):
             if verbose>1:
@@ -369,7 +564,7 @@ def greedy_schedule_workflow(
             raise ValueError("Could not schedule {}".format(constrained_request))
         passes = observation_opportunities[trimmed_request]
         if len(passes)==0:
-            # TODO make a note of this in the graph
+            # Make a note of this in the graph
             workflow_graph.nodes[constrained_request]['scheduled']=True
             workflow_graph.nodes[constrained_request]['feasible']=False
             if verbose>0:
@@ -390,6 +585,7 @@ def greedy_schedule_workflow(
                 _best_satellite = satellite
                 _best_pass = satpass
                 break
+            # TODO check timeline constraints here
         # for satellite, satpasses in passes.items():
         #     for satpass in satpasses:
         #         if screen_pass_for_feasibility(existing_requests=None, satellite=satellite, _obs_pass=satpass, screen_against_comm_passes=True):
@@ -411,6 +607,7 @@ def greedy_schedule_workflow(
         workflow_graph.nodes[constrained_request]['observation_opportunity'] = _best_pass.highest
         workflow_graph.nodes[constrained_request]['observation_opportunity_satellite'] = _best_satellite
         workflow_graph.nodes[constrained_request]['scheduled']=True
+        # TODO apply timeline impacts here!
         if verbose>2:
             print(f"   [Scheduler] Scheduled request on {_best_satellite} at {_best_pass.highest}")
 
@@ -420,6 +617,7 @@ def greedy_schedule_workflow(
 
 def ilp_schedule_workflow(
         workflow_graph: nx.MultiDiGraph,
+        timeline_graph: nx.MultiDiGraph,
         satellites: list,
         feasibility_screener = lambda satellite, observation_pass: True,
         existing_requests: pd.DataFrame= pd.DataFrame(columns=requests_data_frame_columns), current_time: dt.datetime=None,
@@ -434,7 +632,7 @@ def ilp_schedule_workflow(
         if ((workflow_graph.nodes[node_id]['dispatched'] == False) and (workflow_graph.nodes[node_id]['completed'] == False)):
              workflow_graph.nodes[node_id]['scheduled'] = False
 
-    # Create the mip solver with the CP-SAT backend.
+    # Create the mip solver with the SCIP backend.
     solver = pywraplp.Solver.CreateSolver("SCIP_MIXED_INTEGER_PROGRAMMING")
     if not solver:
         raise ValueError("Solver SCIP_MIXED_INTEGER_PROGRAMMING not found")
@@ -452,6 +650,7 @@ def ilp_schedule_workflow(
     # set the relevant variable to 1
     # 
     solution_holder = {}
+    solution_holder_by_satellite = {}
     for constrained_request in workflow_graph.nodes():
         solution_holder[constrained_request] = {}
 
@@ -469,23 +668,28 @@ def ilp_schedule_workflow(
                 print("   [Scheduler] Could not schedule {} (no passes)".format(constrained_request))
             continue
         
-        _best_quality = - np.inf
-        _best_satellite = None
-        _best_pass = None
+        _found_a_pass = False
         allsatpasses = [(satellite, satpass, observation_quality(satpass.highest)) for satellite, satpasses in passes.items() for satpass in satpasses]
         allsatpasses.sort(key=lambda x: x[2], reverse=True) # Sort by observation quality
         for (satellite, satpass, _quality) in allsatpasses:
-            # if feasibility_screener(satellite, satpass):
-            _best_quality = _quality
-            _best_satellite = satellite
-            _best_pass = satpass
+            if feasibility_screener(satellite, satpass):
+                _found_a_pass = True
 
-            if satellite not in solution_holder[constrained_request].keys():
-                solution_holder[constrained_request][satellite] = {}
-            solution_holder[constrained_request][satellite][satpass] = solver.BoolVar(f"{constrained_request}_{satellite}_{satpass}")
-            objective.SetCoefficient(solution_holder[constrained_request][satellite][satpass], _quality)
+                if satellite not in solution_holder[constrained_request].keys():
+                    solution_holder[constrained_request][satellite] = {}
+                if satellite not in solution_holder_by_satellite.keys():
+                    solution_holder_by_satellite[satellite] = []
+                solution_holder[constrained_request][satellite][satpass] = solver.BoolVar(f"{constrained_request}_{satellite}_{satpass}")
 
-        if _best_pass is None:
+                solution_holder_by_satellite[satellite].append((satpass, solution_holder[constrained_request][satellite][satpass]))
+                
+                objective.SetCoefficient(solution_holder[constrained_request][satellite][satpass], _quality)
+
+                # TODO for each timeline impacted, add a variable for that timeline value at that time. Add an Impact with that timeline value times "do we do it".
+                # TODO for each constraint, invoke get_value_at on the timeline and constrain the outcome. Except! You need to do this AFTER all the impacts have 
+                #  been tabulated. YOu will need a follow-up pass.
+
+        if _found_a_pass is False:
             workflow_graph.nodes[constrained_request]['scheduled']=True
             workflow_graph.nodes[constrained_request]['feasible']=False
             if verbose>0:
@@ -587,12 +791,48 @@ def ilp_schedule_workflow(
         if workflow_graph.nodes[constrained_request]['is_mandatory'] is True:
             solver.Add(sum([solution_holder[constrained_request][_satellite][_satpass] for _satellite, _satpasses in passes.items() for _satpass in _satpasses]) == 1)
 
+    for constrained_request in workflow_graph.nodes():
+        passes = observation_opportunities[constrained_request.observation_request]
+
+        if len(passes)==0:
+            continue
+        
+        allsatpasses = [(satellite, satpass, observation_quality(satpass.highest)) for satellite, satpasses in passes.items() for satpass in satpasses]
+        allsatpasses.sort(key=lambda x: x[2], reverse=True) # Sort by observation quality
+        for (satellite, satpass, _quality) in allsatpasses:
+            if feasibility_screener(satellite, satpass):
+                # solution_holder[constrained_request][satellite][satpass] = solver.BoolVar(f"{constrained_request}_{satellite}_{satpass}")
+
+                # TODO for each constraint, invoke get_value_at on the timeline and constrain the outcome. You need to do this AFTER all the impacts have 
+                #  been tabulated. This is the follow-up pass
+                pass
+
     # Only one assignment per request: see above
 
     # On the same vehicle, no overlapping requests (not considering comms at this stage)
+    # - Conflicts on the same machine: iterate over sat, iterate over tasks
+    for _sat in solution_holder_by_satellite.keys():
+        solution_holder_by_satellite[_sat].sort(key=lambda x: x[0].highest.time)
+        for _this_opportunity_ix, _opportunity_tuple in enumerate(solution_holder_by_satellite[_sat]):
+            _this_opportunity = _opportunity_tuple[0]
+            _this_decision_variable = _opportunity_tuple[1]
+            for _next_opportunity_tuple in solution_holder_by_satellite[_sat][_this_opportunity_ix+1:]:
+                _next_opportunity = _next_opportunity_tuple[0]
+                _next_decision_variable = _next_opportunity_tuple[1]
+                # If the two overlap
+                if _next_opportunity.highest.time<_this_opportunity.highest.time+_this_opportunity.highest.duration:
+                    solver.Add(_this_decision_variable + _next_decision_variable <= 1)
+                else:
+                    # The opportunities are ordered so, if we are past the conflict, we can move on to the next set of opportunities
+                    break
 
-    # for j in range(data["num_vars"]):
-    #     objective.SetCoefficient(x[j], data["obj_coeffs"][j])
+    # TODO:
+
+    # - Add communication uplinks if ISL is not guaranteed: 
+    #   - Add uplinks for sat i
+    # If no ISL for sat i and we schedule an observation on sat I, we also schedule an uplink on it
+    # Think more about how to represent the MSA workflow accepting that tasks can be scheduled if their parent is not
+
     objective.SetMaximization()
 
     status = solver.Solve()
