@@ -283,7 +283,22 @@ def observation_quality(opportunity: ObservationOpportunity, preferred_zenith_an
     A quality function that specifies how good an opportunity is
     '''
     # TODO if opportunity.instrument == "RGB" add an entry for local time.
-    return abs(90.-opportunity.look_angle_dec_deg)/90. + abs(preferred_zenith_angle_deg-opportunity.sun_zenith_angle_deg)/90 - opportunity.range_km/1000
+    return 10+abs(90.-opportunity.look_angle_dec_deg)/90. + abs(preferred_zenith_angle_deg-opportunity.sun_zenith_angle_deg)/90 - opportunity.range_km/1000
+
+def observation_qualities(opportunity: ObservationOpportunity, preferred_zenith_angle_deg=45):
+    '''
+    A quality function that specifies how good an opportunity is
+    '''
+    # TODO if opportunity.instrument == "RGB" add an entry for local time.
+    static_quality = 0
+    # Vertical-point-satellite
+    look_angle_quality = abs(90.-opportunity.look_angle_dec_deg)/90.
+    # Vertical-point-Sun. 45 degrees is 9 am/9pm
+    zenith_angle_quality = abs(preferred_zenith_angle_deg-opportunity.sun_zenith_angle_deg)/90
+    # Distance
+    range_quality = -opportunity.range_km/1000 
+    
+    return None
 
 def find_observation_opportunities(observation_requests: list, satellites: list, passes_error_s=60):
     """ A function that finds observation opportunities for a tiven observation request

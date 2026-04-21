@@ -248,37 +248,64 @@ class Broker():
     def schedule_workflow(
             self,
             current_time: dt.datetime=dt.datetime.now(dt.timezone.utc),
+            use_ilp: bool=False,
+            update_timelines: bool=True,
+            plot_schedule: bool = False
     ):
         # Come up with a schedule that satisfies the workflow
-        _ = greedy_schedule_workflow(
-            workflow_graph=self._workflow_graph,
-            timeline_graph=self._timeline_graph,
-            satellites=self._known_satellites,
-            feasibility_screener=self._screen_pass_for_feasibility,
-            current_time=current_time,
-            verbose=3
-            )
+        if use_ilp:
+            # TODO:
+            # - Empty the timeline graph
+            # - Pull the starting value and starting rate (from where?). Add a current starting value and starting rate.
+            # - Iterate over in-progress tasks (dispatched not completed)
+            # - For each in-progress task add POST impacts
+            if update_timelines:
+                self.workflow.timeline_updater(self.world.time, self.workflow.constrained_observation_requests, self.workflow.timelines)
+
+            _ = ilp_schedule_workflow(
+                workflow_graph=self._workflow_graph,
+                timeline_graph=self._timeline_graph,
+                satellites=self._known_satellites,
+                feasibility_screener=self._screen_pass_for_feasibility,
+                current_time=current_time,
+                verbose=3
+                )
+        else:
+            _ = greedy_schedule_workflow(
+                workflow_graph=self._workflow_graph,
+                timeline_graph=self._timeline_graph,
+                satellites=self._known_satellites,
+                feasibility_screener=self._screen_pass_for_feasibility,
+                current_time=current_time,
+                verbose=3
+                )
+                
         self._workflow_schedule_epoch += 1
+
+        if plot_schedule:
+            plot_workflow_schedule(workflow_graph=self._workflow_graph, timeline_graph=self._timeline_graph, time=self.world.time)
+            plt.savefig(f"Schedule_epoch{self._workflow_schedule_epoch}.pdf", bbox_inches='tight')
 
         local_workflow_schedule_epoch_when_dispatching_started = self._workflow_schedule_epoch
 
         dispatchable_task_ids = find_dispatchable_tasks(self._workflow_graph)
+        print(f" [Broker] There are {len(dispatchable_task_ids)} dispatchable tasks")
 
-        for dispatchable_task_id in dispatchable_task_ids:
-            # If we rescheduled in the meanwhile, don't keep dispatching stale stuff
+        for dispatchable_task in dispatchable_task_ids:
+            # If we rescheduled in the meanwhile, don't keep dispatching stale stuff.
+            # The test below will fail when _someone else_ called schedule_workflow elsewhere
+            # The end result is that only the last agent to call schedule_workflow gets to dispatch 
             if self._workflow_schedule_epoch != local_workflow_schedule_epoch_when_dispatching_started:
                 break
             
-            dispatchable_task = self._workflow_graph.nodes[dispatchable_task_id]
-            print(f" [Broker]  Attempting to dispatch task {dispatchable_task_id} ({dispatchable_task})")
+            print(f" [Broker]  Attempting to dispatch task {dispatchable_task} ")
 
-            request = dispatchable_task['observation_request']
-            _best_satellite = dispatchable_task['observation_opportunity_satellite']
+            request = dispatchable_task.observation_request
+            _best_satellite = dispatchable_task.observation_opportunity_satellite
             _best_constellation = self._known_satellites_by_constellation[_best_satellite]
-            follow_up_action_failure = dispatchable_task['follow_up_action_failure']
-            follow_up_action_success = dispatchable_task['follow_up_action_success']
-            # TODO this is going to fail, opportunity vs pass
-            _best_pass = dispatchable_task['observation_opportunity_pass']
+            follow_up_action_failure = dispatchable_task.follow_up_action_failure
+            follow_up_action_success = dispatchable_task.follow_up_action_success
+            _best_pass = dispatchable_task.observation_opportunity_pass
 
             # Let's talk about constraints. The scheduler just checks that constraints are in place before something is scheduled.
             # For data constraints, it's start-after-end.
@@ -301,31 +328,32 @@ class Broker():
             # - Update the workflow graph reflecting that the request is done. This won't touch it again in scheduling
             # - Update the parameters for the children that depend on that request's data product!
 
-            def callback_request_scheduled(assigned_pass, _request=request, __best_pass=_best_pass, __best_constellation=_best_constellation, __best_satellite=_best_satellite, _dispatchable_task_id=dispatchable_task_id):
+            def callback_request_scheduled(assigned_pass, _request=request, __best_pass=_best_pass, __best_constellation=_best_constellation, __best_satellite=_best_satellite, _dispatchable_task=dispatchable_task):
                 print(" [{}] confirmed scheduling of request {} from pass {}, constellation {}".format(self.name, _request, __best_pass, __best_constellation.name))
                 self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'assigned_pass'] = assigned_pass
                 self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = ObservationStatus.SCHEDULED
                 self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'constellation'] = __best_constellation
                 self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'satellite'] = __best_satellite
-                self._workflow_graph.nodes[dispatchable_task_id]['scheduled'] = True
-                self._workflow_graph.nodes[_dispatchable_task_id]['dispatched'] = True
-                print(self._workflow_graph.nodes[_dispatchable_task_id])
+                _dispatchable_task.scheduled = True
+                _dispatchable_task.dispatched = True
+                # print(self._workflow_graph.nodes[_dispatchable_task_id])
                 return
             
-            def callback_request_unscheduled(reason, _request=request, __best_pass=_best_pass, __best_constellation=_best_constellation, dispatchable_task_id=dispatchable_task_id):
+            def callback_request_unscheduled(reason, _request=request, __best_pass=_best_pass, __best_constellation=_best_constellation, _dispatchable_task=dispatchable_task):
                 print(" [{}] received UNscheduling of request {}, pass {}, from {}".format(self.name, request, __best_pass, __best_constellation.name))
                 self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'assigned_pass'] = None
                 self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = reason
                 self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'constellation'] = None
                 self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'satellite'] = None
-                self._workflow_graph.nodes[dispatchable_task_id]['scheduled'] = False
-                self._workflow_graph.nodes[dispatchable_task_id]['dispatched'] = False
+                _dispatchable_task.scheduled = False
+                _dispatchable_task.dispatched = False
                 follow_up_action_failure(reason)
-                self.schedule_workflow(current_time=self.world.time)
+                # Recurse
+                self.schedule_workflow(current_time=self.world.time, use_ilp=use_ilp, plot_schedule=plot_schedule)
 
                 return
             
-            def callback_request_ready(data_product,  _request=request, __best_pass=_best_pass, __best_constellation=_best_constellation, dispatchable_task_id=dispatchable_task_id):
+            def callback_request_ready(data_product,  _request=request, __best_pass=_best_pass, __best_constellation=_best_constellation, _dispatchable_task=dispatchable_task):
                 print(" [{}: ] data ready for request {}, pass {}, from {}".format(self.name, _request, __best_pass, __best_constellation.name))
                 self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = ObservationStatus.DATA_RECEIVED
 
@@ -333,9 +361,9 @@ class Broker():
                     self._requests.loc[_ix, 'data_product'] = data_product
                 follow_up_action_success(data_product)
 
-                self._workflow_graph.nodes[dispatchable_task_id]['scheduled'] = True
-                self._workflow_graph.nodes[dispatchable_task_id]['dispatched'] = True
-                self._workflow_graph.nodes[dispatchable_task_id]['completed'] = True
+                _dispatchable_task.scheduled = True
+                _dispatchable_task.dispatched = True
+                _dispatchable_task.completed = True
 
                 
                 
@@ -344,21 +372,21 @@ class Broker():
                 # We also need to compute successful_execution from the data_product
                 # Finally, we need to update children parameters based on the data product
                 # To that end, having a function that ingests the data product and produces an updated ObsRequest would be good
-                self._workflow_graph.nodes[dispatchable_task_id]['successful_execution'] = self._workflow_graph.nodes[dispatchable_task_id]['success_declarer'](data_product)
+                _dispatchable_task.successful_execution = _dispatchable_task.success_declarer(data_product)
                 
                 # print(f" [Broker] Updating task {dispatchable_task_id}: {self._workflow_graph.nodes[dispatchable_task_id]}")
 
-                for child_task_id in self._workflow_graph.successors(dispatchable_task_id):
+                for child_task_id in self._workflow_graph.successors(_dispatchable_task):
                     # If the constraint type is GEOMETRY
                     # Compute the new geometry for the child from the predecessor data_product
                     # Update the successor's geometry in the graph
-                    outedges = self._workflow_graph.get_edge_data(dispatchable_task_id, child_task_id)
+                    outedges = self._workflow_graph.get_edge_data(_dispatchable_task, child_task_id)
                     for constraint_key, constraint in outedges.items():
                         if (constraint['constraint_class'] == ConstraintClass.GEOMETRY):
-                            self._workflow_graph.nodes[child_task_id]['observation_request'] = constraint['parameters']['geometry_generator'](self._workflow_graph.nodes[child_task_id]['observation_request'], data_product)
+                            child_task_id.observation_request = constraint['parameters']['geometry_generator'](child_task_id.observation_request, data_product)
 
-                self.schedule_workflow(current_time=self.world.time)
-                # TODO Attempt to cancel other requests for this observation
+                # Recurse
+                self.schedule_workflow(current_time=self.world.time, use_ilp=use_ilp, plot_schedule=plot_schedule)
                 return
 
             _constellation_request = ObservationRequest(
@@ -397,7 +425,7 @@ class Broker():
                 callback_request_scheduled=callback_request_scheduled,
                 callback_request_unscheduled=callback_request_unscheduled,
                 callback_request_ready=callback_request_ready,
-                phenomenon_processor=dispatchable_task['phenomenon_processor'],
+                phenomenon_processor=dispatchable_task.phenomenon_processor,
             )
             # Note that, if the call above fails, we will immediately receive a reply, via the callback, that will trigger another reschedule - while we are still dispatching things here!
 
