@@ -162,6 +162,8 @@ class World():
                 _ph_obs_angle_rad = np.arccos(np.clip(np.dot(_ph_sc_vector,_obs_sc_vector)/(np.linalg.norm(_ph_sc_vector,2)*np.linalg.norm(_obs_sc_vector,2)),-1,1))
                 # print("Obs angle (rad) {}".format(_ph_obs_angle_rad))
                 # If angle<FOV, return phobservation
+                if observation.instrument not in spacecraft.instruments:
+                    raise ValueError(f"Can't perform observation {observation} on spacecraft {spacecraft} with instruments {spacecraft.instruments} (FOVs: {spacecraft.instrument_fov_rad})")
                 if _ph_obs_angle_rad < spacecraft.instrument_fov_rad[observation.instrument]:
                     # print("Close enough")
                     observed_phenomena.append(_phenomenon)

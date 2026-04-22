@@ -184,11 +184,16 @@ class Pose(Location):
 # Input: a number of satellites, each with instruments. A number of ground locations we would like to image, with time windows.
 # Output: a map from locations to satellite passes.
 
+class InstrumentType(Enum):
+    RGB = 0
+    SAR = 1
+    HYPERSPECTRAL = 2
+
 class ObservationRequest(Location):
     '''
     An observation request asks to observe a given location with a given instrument between a minimum and a maximum time.
     '''
-    def __init__(self, lon_deg, lat_deg, min_time, max_time, alt_km=None, instrument="RGB", request_name="", min_elevation_deg=0):
+    def __init__(self, lon_deg, lat_deg, min_time, max_time, alt_km=None, instrument=InstrumentType.RGB, request_name="", min_elevation_deg=0):
         super().__init__(lon_deg=lon_deg, lat_deg=lat_deg, alt_km=alt_km, name=request_name)
         # self.name = request_name
         # self.lon_deg = lon_deg
@@ -219,7 +224,7 @@ class ObservationOpportunity(Location):
     '''
     An observation opportunity specifies a time instant when an observation request can be fulfilled 
     '''
-    def __init__(self, time, lon_deg, lat_deg, alt_km, look_angle_az_deg, look_angle_dec_deg, sun_zenith_angle_deg, range_km, name="", instrument="RGB", duration: dt.timedelta=dt.timedelta(seconds=60)):
+    def __init__(self, time, lon_deg, lat_deg, alt_km, look_angle_az_deg, look_angle_dec_deg, sun_zenith_angle_deg, range_km, name="", instrument=InstrumentType.RGB, duration: dt.timedelta=dt.timedelta(seconds=60)):
         self.time = time
         super().__init__(lon_deg=lon_deg, lat_deg=lat_deg, alt_km=alt_km, name=name)
         self.instrument = instrument
@@ -261,7 +266,7 @@ class AttitudeController(Enum):
     COMMUNICATION = 2
 
 class Satellite():
-    def __init__(self, name: str,  orbit: Orbital, instruments: list = ["RGB"], instrument_fov_rad: dict = {"RGB": 15.*np.pi/180.}, isl_links: dict={}, has_continuous_isl_to_ground: bool=False):
+    def __init__(self, name: str,  orbit: Orbital, instruments: list = [InstrumentType.RGB], instrument_fov_rad: dict = {InstrumentType.RGB: 15.*np.pi/180.}, isl_links: dict={}, has_continuous_isl_to_ground: bool=False):
         self.name = name
         self.orbit = orbit
         self.instruments = instruments
@@ -282,26 +287,16 @@ def observation_quality(opportunity: ObservationOpportunity, preferred_zenith_an
     '''
     A quality function that specifies how good an opportunity is
     '''
-    # TODO if opportunity.instrument == "RGB" add an entry for local time.
+    # TODO if opportunity.instrument == InstrumentType.RGB add an entry for local time.
+    # First term: static (to make the ILP >0)
+    # Second term: look angle. Nadir-ground point-satellite. 90 is "satellite is overhead"
+    # Third term: zenith angle. Nadir-ground-sun. An indication of local time.
+    # Fourth term: distance.
+
     return 10+abs(90.-opportunity.look_angle_dec_deg)/90. + abs(preferred_zenith_angle_deg-opportunity.sun_zenith_angle_deg)/90 - opportunity.range_km/1000
 
-def observation_qualities(opportunity: ObservationOpportunity, preferred_zenith_angle_deg=45):
-    '''
-    A quality function that specifies how good an opportunity is
-    '''
-    # TODO if opportunity.instrument == "RGB" add an entry for local time.
-    static_quality = 0
-    # Vertical-point-satellite
-    look_angle_quality = abs(90.-opportunity.look_angle_dec_deg)/90.
-    # Vertical-point-Sun. 45 degrees is 9 am/9pm
-    zenith_angle_quality = abs(preferred_zenith_angle_deg-opportunity.sun_zenith_angle_deg)/90
-    # Distance
-    range_quality = -opportunity.range_km/1000 
-    
-    return None
-
 def find_observation_opportunities(observation_requests: list, satellites: list, passes_error_s=60):
-    """ A function that finds observation opportunities for a tiven observation request
+    """ A function that finds observation opportunities for a given observation request
 
     Args:
         observation_requests (list[ObservationRequest]): A list of ObservationRequests
@@ -359,6 +354,7 @@ def find_observation_opportunities(observation_requests: list, satellites: list,
                             look_angle_dec_deg=_look_angle_az_el[1],
                             sun_zenith_angle_deg=_sun_zenith_angle,
                             range_km=_range,
+                            instrument=request.instrument,
                         )
                         _pass_opportunities_.append(_opp)
                     if (len(_pass_opportunities_)==3):
@@ -438,7 +434,7 @@ _land = prep(land_geom)
 def is_land(x, y):
     return _land.contains(sgeom.Point(x, y))
 
-def spacecraft_fov(time: dt.datetime, satellite: Satellite, instrument: str, ground_lla: Location, num_samples: int = 12, USE_SPHERICAL_APPROXIMATION=False):
+def spacecraft_fov(time: dt.datetime, satellite: Satellite, instrument: InstrumentType, ground_lla: Location, num_samples: int = 12, USE_SPHERICAL_APPROXIMATION=False):
     '''
     Input: a Satellite, a list of the instrument/instruments to show, and a LLA that the satellite is pointing to.
     Output: a Polygon showing the extent of the satellite FOV.

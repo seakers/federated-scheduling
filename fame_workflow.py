@@ -13,6 +13,8 @@ from ortools.linear_solver import pywraplp
 
 import bisect
 
+from astral import sun, Observer
+
 # import random
 
 
@@ -71,9 +73,6 @@ class Constraint():
     def __repr__(self):
         return self.__str__()
 
-class ObservationReward():
-    def __init__(self, static_reward=0):
-        self.static_reward = static_reward
 
 class ConstrainedObservationRequest():
     def __init__(
@@ -91,7 +90,7 @@ class ConstrainedObservationRequest():
             phenomenon_processor=lambda o, s, p: p,
             name: str = "",
             max_num_instances: int=1,
-            reward: ObservationReward=ObservationReward()
+            rewarder= lambda _observation: observation_quality(_observation)
             ):
         """_summary_
 
@@ -130,6 +129,8 @@ class ConstrainedObservationRequest():
         self.successful_execution: bool = False
         self.phenomenon_processor = phenomenon_processor
         self.name = name
+        self.max_num_instances = max_num_instances
+        self.rewarder = rewarder
 
     def __str__(self):
         return f"{self.name} with {len(self.task_constraints)} task constraints"
@@ -636,7 +637,7 @@ def greedy_schedule_workflow(
         _best_quality = - np.inf
         _best_satellite = None
         _best_pass = None
-        allsatpasses = [(satellite, satpass, observation_quality(satpass.highest)) for satellite, satpasses in passes.items() for satpass in satpasses]
+        allsatpasses = [(satellite, satpass, constrained_request.rewarder(satpass.highest)) for satellite, satpasses in passes.items() for satpass in satpasses]
         allsatpasses.sort(key=lambda x: x[2], reverse=True) # Sort by observation quality
         for (satellite, satpass, _quality) in allsatpasses:
             # if screen_pass_for_feasibility(existing_requests=existing_requests, satellite=satellite, _obs_pass=satpass, screen_against_comm_passes=True):
@@ -680,9 +681,9 @@ def ilp_schedule_workflow(
         timeline_graph: nx.MultiDiGraph,
         satellites: list,
         feasibility_screener = lambda satellite, observation_pass: True,
-        existing_requests: pd.DataFrame= pd.DataFrame(columns=requests_data_frame_columns),
         current_time: dt.datetime=None,
         verbose: int=99,
+        max_solver_time_s=1e3,
         ):
     
     if verbose>2:
@@ -698,6 +699,7 @@ def ilp_schedule_workflow(
     if not solver:
         raise ValueError("Solver SCIP_MIXED_INTEGER_PROGRAMMING not found")
     
+    solver.set_time_limit(int(max_solver_time_s*1e3))
     objective = solver.Objective()
 
     # for request in graph nodes
@@ -784,7 +786,7 @@ def ilp_schedule_workflow(
         
         # Now go create the decision variables. As you are at it, also add impacts for these decision variables
         _found_a_pass = False
-        allsatpasses = [(satellite, satpass, observation_quality(satpass.highest)) for satellite, satpasses in passes.items() for satpass in satpasses]
+        allsatpasses = [(satellite, satpass, constrained_request.rewarder(satpass.highest)) for satellite, satpasses in passes.items() for satpass in satpasses]
         allsatpasses.sort(key=lambda x: x[2], reverse=True) # Sort by observation quality
         for (satellite, satpass, _quality) in allsatpasses:
             if feasibility_screener(satellite, satpass):
@@ -794,6 +796,7 @@ def ilp_schedule_workflow(
                     solution_holder[constrained_request][satellite] = {}
                 if satellite not in solution_holder_by_satellite.keys():
                     solution_holder_by_satellite[satellite] = []
+
                 solution_holder[constrained_request][satellite][satpass] = solver.BoolVar(f"{constrained_request}_{satellite}_{satpass}")
 
                 solution_holder_by_satellite[satellite].append((satpass, solution_holder[constrained_request][satellite][satpass]))
@@ -839,8 +842,8 @@ def ilp_schedule_workflow(
             if verbose>0:
                 print("   [Scheduler] Could not schedule {} (all conflicts)".format(constrained_request))
 
-        # At most one observation per request is assigned
-        solver.Add(sum([solution_holder[constrained_request][_satellite][_satpass] for _satellite, _satpasses in solution_holder[constrained_request].items() for _satpass in _satpasses.keys()]) <= 1)
+        # At most max_num_instsanves observation per request are assigned
+        solver.Add(sum([solution_holder[constrained_request][_satellite][_satpass] for _satellite, _satpasses in solution_holder[constrained_request].items() for _satpass in _satpasses.keys()]) <= constrained_request.max_num_instances)
 
         if verbose>3:
             print(f"   [Scheduler] This request has {len(list(workflow_graph.predecessors(constrained_request)))} parents: {list(workflow_graph.predecessors(constrained_request))}")
@@ -1073,9 +1076,9 @@ def ilp_schedule_workflow(
 
     status = solver.Solve()
 
-    if status == pywraplp.Solver.OPTIMAL:
+    if status == pywraplp.Solver.OPTIMAL or status == pywraplp.Solver.FEASIBLE:
         if (verbose>0):
-            print("    [Scheduler] Solved to optimality; objective value =", solver.Objective().Value())
+            print(f"    [Scheduler] Solver status {status}; objective value ={solver.Objective().Value()}")
         for constrained_request in workflow_graph.nodes():
             # If we had already sent these out, not much we can do now
             if ((constrained_request.dispatched == True) or (constrained_request.completed == True)):
@@ -1124,7 +1127,7 @@ def ilp_schedule_workflow(
     return workflow_graph
 
 
-def plot_workflow_schedule(workflow_graph: nx.MultiDiGraph, timeline_graph: nx.MultiDiGraph=nx.MultiDiGraph(), axes=None, time: dt.datetime = None):
+def plot_workflow_schedule(workflow_graph: nx.MultiDiGraph, timeline_graph: nx.MultiDiGraph=nx.MultiDiGraph(), axes=None, time: dt.datetime = None, show_night: bool=False, show_night_location: Location= Location(-118,34, 0)):
 
 
     num_requests = len(workflow_graph)
@@ -1239,9 +1242,66 @@ def plot_workflow_schedule(workflow_graph: nx.MultiDiGraph, timeline_graph: nx.M
             ax_timeline.set_ylabel(timeline.name,rotation=0, ha='right', va='center')
             ax_timeline.grid()
 
+    if ax_timelines is not None:
+        ax_timelines[-1].tick_params(axis='x', labelrotation=90)
+    else:
+        ax_tasks.tick_params(axis='x', labelrotation=90)
+
+
     # Show time
     if time is not None:
         ax_tasks.axvline(time, color='k', linewidth=1)
+
+    if show_night:
+        # List the days between all_requests_min_time and all_requests_max_time
+        # Use sunrise to get rise, fall
+        # If both are available
+        # Plot a box from fall of day x to rise of day x+1
+        # Start from min time
+        # If the next object is sunrise, color black
+        # until sunset
+        #
+        initial_date = _all_requests_min_time.date()
+        final_date = _all_requests_max_time.date()
+        all_dates = [initial_date+dt.timedelta(days=i) for i in range((final_date-initial_date).days+1)]
+        
+        _times = [(_all_requests_min_time, "I"), (_all_requests_max_time, "A")]
+        for _date in all_dates:
+            
+            _sunrise_time = sun.sunrise(
+                observer= Observer(latitude=show_night_location.lat_deg, longitude=show_night_location.lon_deg, elevation=show_night_location.alt_km/1e3),
+                date=_date,
+                tzinfo = dt.timezone.utc
+            ).replace(tzinfo=None)
+            _sunset_time = sun.sunset(
+                observer= Observer(latitude=show_night_location.lat_deg, longitude=show_night_location.lon_deg, elevation=show_night_location.alt_km/1e3),
+                date=_date,
+                tzinfo = dt.timezone.utc
+            ).replace(tzinfo=None)
+
+            _times.append((_sunrise_time, "R"))
+            _times.append((_sunset_time, "S"))
+        _times.sort(key=lambda x: x[0])
+
+        for _time_ix, _time in enumerate(_times[:-1]):
+            #if the next time is a "R", then we are at night
+            # Ignore anything before the min time
+            if _time[0]<_all_requests_min_time:
+                continue
+            # If the next step is the max time, stop - that is a special case
+            if _times[_time_ix+1][0]>=_all_requests_max_time:
+                break 
+            if _times[_time_ix+1][1] == "R":
+                #if the next time is a "R", then we are at night
+                # Plot black from _time to _times[_time_ix+1][0]
+                ax_tasks.axvspan(xmin = _time[0], xmax=_times[_time_ix+1][0], color='gray', alpha=0.2)
+        # At this point _time_ix is either len(_times)-2 or the location right before _all_requests_max_time
+        
+        # if the next time is the last one, then, was the time before the last a "S"? If so, we are at night
+        if _times[_time_ix][1] == "S":
+            # Plot black from _times[_time_ix][0] to _times[_time_ix+1][0]
+            ax_tasks.axvspan(xmin = _times[_time_ix][0], xmax=_times[_time_ix+1][0], color='gray', alpha=0.2)
+
 
 def find_dispatchable_tasks(workflow_graph = nx.MultiDiGraph()):
     dispatchable_requests = []

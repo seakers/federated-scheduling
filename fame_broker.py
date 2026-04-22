@@ -250,7 +250,10 @@ class Broker():
             current_time: dt.datetime=dt.datetime.now(dt.timezone.utc),
             use_ilp: bool=False,
             update_timelines: bool=True,
-            plot_schedule: bool = False
+            plot_schedule: bool = False,
+            plot_night_in_schedule: bool=False,
+            plot_location_for_night_in_schedule: Location = Location(0,0, 0),
+            max_solver_time_s: float=60.,
     ):
         # Come up with a schedule that satisfies the workflow
         if use_ilp:
@@ -268,7 +271,8 @@ class Broker():
                 satellites=self._known_satellites,
                 feasibility_screener=self._screen_pass_for_feasibility,
                 current_time=current_time,
-                verbose=3
+                verbose=3,
+                max_solver_time_s=max_solver_time_s,
                 )
         else:
             _ = greedy_schedule_workflow(
@@ -277,13 +281,13 @@ class Broker():
                 satellites=self._known_satellites,
                 feasibility_screener=self._screen_pass_for_feasibility,
                 current_time=current_time,
-                verbose=3
+                verbose=3,
                 )
                 
         self._workflow_schedule_epoch += 1
 
         if plot_schedule:
-            plot_workflow_schedule(workflow_graph=self._workflow_graph, timeline_graph=self._timeline_graph, time=self.world.time)
+            plot_workflow_schedule(workflow_graph=self._workflow_graph, timeline_graph=self._timeline_graph, time=self.world.time, show_night=plot_night_in_schedule, show_night_location=plot_location_for_night_in_schedule)
             plt.savefig(f"Schedule_epoch{self._workflow_schedule_epoch}.pdf", bbox_inches='tight')
 
         local_workflow_schedule_epoch_when_dispatching_started = self._workflow_schedule_epoch
@@ -349,7 +353,7 @@ class Broker():
                 _dispatchable_task.dispatched = False
                 follow_up_action_failure(reason)
                 # Recurse
-                self.schedule_workflow(current_time=self.world.time, use_ilp=use_ilp, plot_schedule=plot_schedule)
+                self.schedule_workflow(current_time=self.world.time, use_ilp=use_ilp, plot_schedule=plot_schedule, plot_night_in_schedule=plot_night_in_schedule, plot_location_for_night_in_schedule=plot_location_for_night_in_schedule)
 
                 return
             
@@ -386,7 +390,7 @@ class Broker():
                             child_task_id.observation_request = constraint['parameters']['geometry_generator'](child_task_id.observation_request, data_product)
 
                 # Recurse
-                self.schedule_workflow(current_time=self.world.time, use_ilp=use_ilp, plot_schedule=plot_schedule)
+                self.schedule_workflow(current_time=self.world.time, use_ilp=use_ilp, plot_schedule=plot_schedule, plot_night_in_schedule=plot_night_in_schedule, plot_location_for_night_in_schedule=plot_location_for_night_in_schedule)
                 return
 
             _constellation_request = ObservationRequest(
