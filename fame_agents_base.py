@@ -137,12 +137,13 @@ class World():
             raise ValueError("Event {} is earlier than sim time {}".format(event, self.time)) 
         bisect.insort(self.events, event, key=lambda x: x.time)
         
-    def do_observation(self, observation: ObservationOpportunity, spacecraft: Satellite, phenomenon_processor=lambda o, s, p: p):
+    def do_observation(self, observation: ObservationOpportunity, phenomenon_processor=lambda o, s, p: p):
         # Find phenomena close to the observation location in space and at the right time
         # Return a data product and a list of event states
         # print("Obs opp {}".format(observation))
         observed_phenomena = []
 
+        spacecraft = observation.satellite
         # Now let's see what we observed
         for _phenomenon in self.phenomena:
             if (_phenomenon.start_time <= observation.time and _phenomenon.end_time > observation.time):

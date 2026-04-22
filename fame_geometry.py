@@ -19,8 +19,6 @@ from shapely.prepared import prep
 import networkx as nx
 import bisect
 
-from fame_geometry import *
-
 import requests
 import urllib
 import json
@@ -189,6 +187,29 @@ class InstrumentType(Enum):
     SAR = 1
     HYPERSPECTRAL = 2
 
+class AttitudeController(Enum):
+    FREE = 0
+    INSTRUMENT = 1
+    COMMUNICATION = 2
+
+class Satellite():
+    def __init__(self, name: str,  orbit: Orbital, instruments: list = [InstrumentType.RGB], instrument_fov_rad: dict = {InstrumentType.RGB: 15.*np.pi/180.}, isl_links: dict={}, has_continuous_isl_to_ground: bool=False):
+        self.name = name
+        self.orbit = orbit
+        self.instruments = instruments
+        self.instrument_fov_rad = instrument_fov_rad
+        self.scheduled_observations = []
+        self.data_products = {}
+        self.known_phenomena = []
+        self.attitude_controller_state = AttitudeController.FREE
+        self.busy_with = None
+        self.isl_links = isl_links # Satellite: range_km
+        self.has_continuous_isl_to_ground = has_continuous_isl_to_ground
+    def __str__(self):
+        return self.name
+    def __repr__(self):
+        return self.__str__()
+
 class ObservationRequest(Location):
     '''
     An observation request asks to observe a given location with a given instrument between a minimum and a maximum time.
@@ -224,19 +245,21 @@ class ObservationOpportunity(Location):
     '''
     An observation opportunity specifies a time instant when an observation request can be fulfilled 
     '''
-    def __init__(self, time, lon_deg, lat_deg, alt_km, look_angle_az_deg, look_angle_dec_deg, sun_zenith_angle_deg, range_km, name="", instrument=InstrumentType.RGB, duration: dt.timedelta=dt.timedelta(seconds=60)):
+    def __init__(self, time, lon_deg, lat_deg, alt_km, look_angle_az_deg, look_angle_dec_deg, sun_zenith_angle_deg, range_km, name="", satellite: Satellite=None, instrument: InstrumentType=InstrumentType.RGB, duration: dt.timedelta=dt.timedelta(seconds=60)):
         self.time = time
         super().__init__(lon_deg=lon_deg, lat_deg=lat_deg, alt_km=alt_km, name=name)
         self.instrument = instrument
+        self.satellite = satellite
         self.look_angle_az_deg = look_angle_az_deg
         self.look_angle_dec_deg = look_angle_dec_deg
         self.sun_zenith_angle_deg = sun_zenith_angle_deg
         self.range_km = range_km
         self.duration = duration
     def __str__(self):
-        return "Observation {} at {} with {}. Look angle {} | {} az/dec deg, zenith angle {} deg, range {} km, duration {}".format(
+        return "Observation {} at {} by {} with {}. Look angle {} | {} az/dec deg, zenith angle {} deg, range {} km, duration {}".format(
             self.name,
             self.time,
+            self.satellite,
             self.instrument,
             self.look_angle_az_deg,
             self.look_angle_dec_deg,
@@ -252,6 +275,10 @@ class ObservationPass:
     We model it as observation opportunities for rise time, fall time, and highest time  
     '''
     def __init__(self, rise: ObservationOpportunity, fall: ObservationOpportunity, highest: ObservationOpportunity):
+        if (rise.satellite != highest.satellite):
+            raise ValueError(f"Satellite should be the same for all instants in an ObservationPass (rise: {rise.satellite}, highest: {highest.satellite})")
+        if (rise.satellite != fall.satellite):
+            raise ValueError(f"Satellite should be the same for all instants in an ObservationPass (rise: {rise.satellite}, fall: {fall.satellite})") 
         self.rise = rise
         self.fall = fall
         self.highest = highest
@@ -260,28 +287,7 @@ class ObservationPass:
     def __repr__(self):
         return self.__str__()
     
-class AttitudeController(Enum):
-    FREE = 0
-    INSTRUMENT = 1
-    COMMUNICATION = 2
 
-class Satellite():
-    def __init__(self, name: str,  orbit: Orbital, instruments: list = [InstrumentType.RGB], instrument_fov_rad: dict = {InstrumentType.RGB: 15.*np.pi/180.}, isl_links: dict={}, has_continuous_isl_to_ground: bool=False):
-        self.name = name
-        self.orbit = orbit
-        self.instruments = instruments
-        self.instrument_fov_rad = instrument_fov_rad
-        self.scheduled_observations = []
-        self.data_products = {}
-        self.known_phenomena = []
-        self.attitude_controller_state = AttitudeController.FREE
-        self.busy_with = None
-        self.isl_links = isl_links # Satellite: range_km
-        self.has_continuous_isl_to_ground = has_continuous_isl_to_ground
-    def __str__(self):
-        return self.name
-    def __repr__(self):
-        return self.__str__()
     
 def observation_quality(opportunity: ObservationOpportunity, preferred_zenith_angle_deg=45):
     '''
@@ -354,6 +360,7 @@ def find_observation_opportunities(observation_requests: list, satellites: list,
                             look_angle_dec_deg=_look_angle_az_el[1],
                             sun_zenith_angle_deg=_sun_zenith_angle,
                             range_km=_range,
+                            satellite=satellite,
                             instrument=request.instrument,
                         )
                         _pass_opportunities_.append(_opp)

@@ -683,7 +683,8 @@ def ilp_schedule_workflow(
         feasibility_screener = lambda satellite, observation_pass: True,
         current_time: dt.datetime=None,
         verbose: int=99,
-        max_solver_time_s=1e3,
+        max_solver_time_s: int=1e3,
+        receding_horizon_duration: dt.timedelta=dt.timedelta(weeks=52)
         ):
     
     if verbose>2:
@@ -754,19 +755,22 @@ def ilp_schedule_workflow(
         solution_holder[constrained_request] = {}
 
         # Do not look for overflights in the past (if you know the time)
+        trimmed_request_min_time = constrained_request.observation_request.min_time
         if current_time is not None and current_time>constrained_request.observation_request.min_time:
-            trimmed_request = ObservationRequest(
-                lon_deg = constrained_request.observation_request.lon_deg,
-                lat_deg = constrained_request.observation_request.lat_deg,
-                min_time = current_time,
-                max_time = constrained_request.observation_request.max_time,
-                alt_km = constrained_request.observation_request.alt_km,
-                instrument = constrained_request.observation_request.instrument,
-                request_name = constrained_request.observation_request.name+"_trimmed",
-                min_elevation_deg = constrained_request.observation_request.min_elevation_deg,
-            )
-        else:
-            trimmed_request = constrained_request.observation_request
+            trimmed_request_min_time = current_time
+        trimmed_request_max_time = min(constrained_request.observation_request.max_time, trimmed_request_min_time+receding_horizon_duration)
+        
+        trimmed_request = ObservationRequest(
+            lon_deg = constrained_request.observation_request.lon_deg,
+            lat_deg = constrained_request.observation_request.lat_deg,
+            min_time = trimmed_request_min_time,
+            max_time = trimmed_request_max_time,
+            alt_km = constrained_request.observation_request.alt_km,
+            instrument = constrained_request.observation_request.instrument,
+            request_name = constrained_request.observation_request.name+"_trimmed",
+            min_elevation_deg = constrained_request.observation_request.min_elevation_deg,
+        )
+
 
         # Find the overflights
         observation_opportunities = find_observation_opportunities([trimmed_request,], satellites)
@@ -1127,7 +1131,16 @@ def ilp_schedule_workflow(
     return workflow_graph
 
 
-def plot_workflow_schedule(workflow_graph: nx.MultiDiGraph, timeline_graph: nx.MultiDiGraph=nx.MultiDiGraph(), axes=None, time: dt.datetime = None, show_night: bool=False, show_night_location: Location= Location(-118,34, 0)):
+def plot_workflow_schedule(
+        workflow_graph: nx.MultiDiGraph,
+        timeline_graph: nx.MultiDiGraph=nx.MultiDiGraph(),
+        axes=None,
+        time: dt.datetime = None,
+        show_night: bool=False,
+        show_night_location: Location= Location(-118,34, 0),
+        save_schedule_plot: bool=True,
+        save_name: str = "Schedule.pdf",
+        ):
 
 
     num_requests = len(workflow_graph)
@@ -1141,7 +1154,7 @@ def plot_workflow_schedule(workflow_graph: nx.MultiDiGraph, timeline_graph: nx.M
     if axes is None:
         height_ratios = [num_requests]
         height_ratios.extend([1,]*num_timelines)
-        fig, axes = plt.subplots(num_timelines+1,1, sharex=True, height_ratios=height_ratios)
+        fig, axes = plt.subplots(num_timelines+1,1, sharex=True, height_ratios=height_ratios, figsize=(12, int(math.ceil(.2*num_requests+num_timelines))))
     else:
         print("We have axes at home")
 
@@ -1301,6 +1314,9 @@ def plot_workflow_schedule(workflow_graph: nx.MultiDiGraph, timeline_graph: nx.M
         if _times[_time_ix][1] == "S":
             # Plot black from _times[_time_ix][0] to _times[_time_ix+1][0]
             ax_tasks.axvspan(xmin = _times[_time_ix][0], xmax=_times[_time_ix+1][0], color='gray', alpha=0.2)
+
+    if save_schedule_plot:
+        plt.savefig(save_name, bbox_inches='tight')
 
 
 def find_dispatchable_tasks(workflow_graph = nx.MultiDiGraph()):

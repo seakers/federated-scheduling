@@ -215,10 +215,12 @@ class ConstellationGroundScheduler():
         #
 
         # If we have ISL, just schedule the observation through the magic comm link 
+        assert _best_sat_object == _best_pass.highest.satellite, "ERROR: something wrong with selecting the best satellite"
+
         if _best_uplink_comm_opportunity == "ISL":
-            schedule_observation(self.world, _best_sat_object, _best_pass.highest, phenomenon_processor=phenomenon_processor)
+            schedule_observation(self.world, _best_pass.highest, phenomenon_processor=phenomenon_processor)
         else:
-            schedule_observation_uplink(self.world, _best_sat_object, _best_uplink_comm_opportunity, _best_pass.highest, _best_uplink_comm_opportunity_station, phenomenon_processor=phenomenon_processor)
+            schedule_observation_uplink(self.world, _best_uplink_comm_opportunity, _best_pass.highest, _best_uplink_comm_opportunity_station, phenomenon_processor=phenomenon_processor)
         
         if _best_downlink_comm_opportunity == "ISL":
             schedule_isl_downlink(_world=self.world, satellite=_best_sat_object, time = _best_pass.highest.time, constellation_scheduler=self)
@@ -294,14 +296,16 @@ class ConstellationGroundScheduler():
     def get_request_status(self, request: ObservationRequest):
         return self._requests[self._requests['request'] == request].status
 
-def schedule_observation(_world, satellite: Satellite, obs_opportunity, phenomenon_processor= lambda o, s, p: p):
+def schedule_observation(_world, obs_opportunity: ObservationOpportunity, phenomenon_processor= lambda o, s, p: p):
     # An observation fires at the time of the observation. It adds known events to the satellite's known_phenomena store.
     # TODO it also adds an observation product to the satellite's 
 
     # This first bit is quite redundant. What you want is to maintain events for individual agents and then a global copy, right?
+
+    satellite = obs_opportunity.satellite
     satellite.scheduled_observations.append(obs_opportunity)
 
-    def unlock_satellite(_satellite):
+    def unlock_satellite(_satellite: Satellite):
         if _satellite.attitude_controller_state == AttitudeController.INSTRUMENT:
             _satellite.attitude_controller_state = AttitudeController.FREE
             _satellite.busy_with = None
@@ -309,7 +313,8 @@ def schedule_observation(_world, satellite: Satellite, obs_opportunity, phenomen
         else:
             return False
 
-    def lock_satellite_and_observe(_satellite, _obs_opportunity, __world):
+    def lock_satellite_and_observe(_obs_opportunity: ObservationOpportunity, __world: World):
+        _satellite = _obs_opportunity.satellite
         if _satellite.attitude_controller_state != AttitudeController.FREE:
             print("Satellite busy ({})! Sat {} attempted observation {}".format(_satellite.attitude_controller_state, _satellite, _obs_opportunity))
             return False
@@ -319,16 +324,16 @@ def schedule_observation(_world, satellite: Satellite, obs_opportunity, phenomen
         _unlock_event = Event(
             name = "Unlock satellite after obs, sat {}".format(_satellite.name),
             time = _obs_opportunity.time+_obs_opportunity.duration,
-            action_callable = lambda _sate=satellite: unlock_satellite(_sate)
+            action_callable = lambda _sate=_satellite: unlock_satellite(_sate)
         )
         _world.add_event(_unlock_event)
-        return __world.do_observation(_obs_opportunity, _satellite, phenomenon_processor=phenomenon_processor)
+        return __world.do_observation(_obs_opportunity, phenomenon_processor=phenomenon_processor)
     
     _event = ObservationEvent(
         name = "Obs, sat {}".format(satellite.name),
         time = obs_opportunity.time,
         # Note the kludge of default inputs to make sure the closure works and we capture the variables at the time of creation
-        action_callable = lambda _opp=obs_opportunity, _sate=satellite, __world=_world: lock_satellite_and_observe(_sate, _opp, __world),
+        action_callable = lambda _opp=obs_opportunity, __world=_world: lock_satellite_and_observe(_opp, __world),
         satellite=satellite,
         opportunity=obs_opportunity
     )
@@ -336,10 +341,15 @@ def schedule_observation(_world, satellite: Satellite, obs_opportunity, phenomen
 
     return 0
 
-def schedule_observation_uplink(_world: World, satellite: Satellite, comm_opportunity: ObservationPass, obs_opportunity: ObservationOpportunity, station: Location, phenomenon_processor=lambda o, s, p: p):
+def schedule_observation_uplink(_world: World, comm_opportunity: ObservationPass, obs_opportunity: ObservationOpportunity, station: Location, phenomenon_processor=lambda o, s, p: p):
     # An observation uplink fires at the time of the uplink. It adds an event that will trigger the observation at the appropriate time. 
+    if comm_opportunity.highest.satellite != obs_opportunity.satellite:
+        raise ValueError(f"Comm opportunity and obs opportunity refer to different satellites! (Comm: {comm_opportunity.highest.satellite}, obs: {obs_opportunity.satellite})")
+
     if (comm_opportunity.highest.time>obs_opportunity.time):
         raise ValueError("Uplink {} is after related observation {}".format(comm_opportunity, obs_opportunity))
+    
+    satellite = obs_opportunity.satellite
     
     def unlock_satellite(_satellite, verbose=False):
         if (_satellite.attitude_controller_state == AttitudeController.COMMUNICATION 
@@ -352,7 +362,8 @@ def schedule_observation_uplink(_world: World, satellite: Satellite, comm_opport
                 print("Could not unlock satellite after ul comm opportunity with station {} at {}!".format(station, comm_opportunity.highest.time))
             return False
         
-    def do_uplink_event(__world: World, __satellite: Satellite, __obsopp: ObservationOpportunity):
+    def do_uplink_event(__world: World, __obsopp: ObservationOpportunity):
+        __satellite = __obsopp.satellite
         if __satellite.attitude_controller_state == AttitudeController.INSTRUMENT:
             print("Satellite busy! Attempted uplink to sat {} from station {}".format(__satellite, station))
             return False
@@ -361,16 +372,16 @@ def schedule_observation_uplink(_world: World, satellite: Satellite, comm_opport
         _unlock_event = Event(
             name = "Unlock uplink, station {} to sat {}".format(station.name, __satellite.name),
             time = comm_opportunity.fall.time,
-            action_callable = lambda _sate=satellite: unlock_satellite(_sate)
+            action_callable = lambda _sate=__satellite: unlock_satellite(_sate)
         )
         __world.add_event(_unlock_event)
-        return schedule_observation(__world, __satellite, __obsopp, phenomenon_processor=phenomenon_processor)
+        return schedule_observation(__world, __obsopp, phenomenon_processor=phenomenon_processor)
 
     _event = CommunicationEvent(
         name="Uplink, station {} to sat {}".format(station.name, satellite.name),
         time = comm_opportunity.highest.time,
         # action_callable = lambda _w=_world, _s=satellite, _o=obs_opportunity: schedule_observation(_w, _s, _o)
-        action_callable = lambda _w=_world, _s=satellite, _o=obs_opportunity: do_uplink_event(_w, _s, _o),
+        action_callable = lambda _w=_world, _o=obs_opportunity: do_uplink_event(_w, _o),
         satellite=satellite,
         station=station,
         comm_pass=comm_opportunity,
