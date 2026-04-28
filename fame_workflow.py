@@ -90,7 +90,8 @@ class ConstrainedObservationRequest():
             phenomenon_processor=lambda o, s, p: p,
             name: str = "",
             max_num_instances: int=1,
-            rewarder= lambda _observation: observation_quality(_observation)
+            rewarder= lambda _observation: observation_quality(_observation),
+            plotting_group: str = None
             ):
         """_summary_
 
@@ -126,14 +127,18 @@ class ConstrainedObservationRequest():
         self.feasible: bool = True
         self.dispatched: bool = False
         self.completed: bool = False
+        self.data_product: list = []
         self.successful_execution: bool = False
         self.phenomenon_processor = phenomenon_processor
         self.name = name
+        if plotting_group is None:
+            plotting_group = self.name
+        self.plotting_group = plotting_group
         self.max_num_instances = max_num_instances
         self.rewarder = rewarder
 
     def __str__(self):
-        return f"{self.name} with {len(self.task_constraints)} task constraints"
+        return f"{self.name}"
     def __repr__(self):
         return self.__str__()
     
@@ -326,18 +331,20 @@ class Workflow():
             constrained_observation_requests: list[ConstrainedObservationRequest],
             timelines: list[Timeline]=[],
             timeline_updater=lambda time, observations, timelines: timelines,
+            request_updater=lambda time, observations, timelines: observations,
     ):
         """_summary_
 
         Args:
             constrained_observation_requests (list[ConstrainedObservationRequest]): a list of ConstrainedObservationRequest
             timelines (list[Timeline], optional): a list of Timelines that the CORs refer to. Defaults to [].
-            timeline_updater (function(dt.datetime, list[ConstrainedObservationRequest], list[Timeline]): bool): a function that takes as inputs the current time, observation requests, and the timelines, and updates the timelines when replanning. Defaults to returning the input.
-        """
-        self.constrained_observation_requests = constrained_observation_requests
-        
+            timeline_updater (function(dt.datetime, list[ConstrainedObservationRequest], list[Timeline]): bool): a function that takes as inputs the current time, observation requests, and the timelines, and updates the timelines when replanning. The change is done in place. Defaults to not touching the timelines.
+            observations_updater (function(dt.datetime, list[ConstrainedObservationRequest], list[Timeline]): bool): a function that takes as inputs the current time, observation requests, and the timelines, and updates the observation requests (e.g., retargeting in response to previous observations) when replanning. The change is done in place. Defaults to not touching the observations.
+            """
+        self.constrained_observation_requests = constrained_observation_requests        
         self.timelines = timelines
         self.timeline_updater = timeline_updater
+        self.request_updater = request_updater
 
 
 def build_workflow_graph(workflow: Workflow):
@@ -406,9 +413,9 @@ def greedy_schedule_workflow(
         timeline_graph: nx.MultiDiGraph,
         satellites: list,
         feasibility_screener = lambda satellite, observation_pass: True,
-        existing_requests: pd.DataFrame= pd.DataFrame(columns=requests_data_frame_columns),
         current_time: dt.datetime=None,
         verbose: int=99,
+        receding_horizon_duration: dt.timedelta=dt.timedelta(weeks=52)
         ):
     
     # Build a dependency graph
@@ -440,6 +447,7 @@ def greedy_schedule_workflow(
     for node_id in workflow_graph.nodes():
         if ((node_id.dispatched == False) and (node_id.completed == False)):
              node_id.scheduled = False
+             node_id.feasible = True
             #  TODO: remove impacts for this task
 
     # Walk through requests
@@ -455,18 +463,18 @@ def greedy_schedule_workflow(
 
         # Add the successors, so we will try to schedule them even if this one fails
         for child_request in workflow_graph.successors(constrained_request):
-            if child_request.scheduled == False:
+            if child_request.scheduled == False and child_request not in nodes_to_visit:
             # assert workflow_graph.nodes[child_request]['scheduled']==False, "ERROR: we are traversing the dependency graph in a strange and incorrect way (children)"
                 nodes_to_visit.append(child_request)
         if verbose>2:
             print(f"   [Scheduler] Current request: {constrained_request}")
         # If the request has gone off, nothing we can do about it
         if ((constrained_request.dispatched == True) or (constrained_request.completed == True)):
-            if verbose>0:
+            if verbose>1:
                 print(f"   [Scheduler] Request {constrained_request} is already dispatched or completed, skipping")
             continue
         else:
-            if verbose>2:
+            if verbose>4:
                 print("   [Scheduler] This request is still in play, let's revisit it")
 
         # Check if constraints are resolvable. For some constraints (bool, geometry) we need the predecessor task
@@ -497,9 +505,11 @@ def greedy_schedule_workflow(
 
         # Now we start with temporal scheduling. We will identify a single interval that works.
         min_time = constrained_request.observation_request.min_time
+        max_time = constrained_request.observation_request.max_time
+
         if (current_time is not None):
             min_time = max(min_time, current_time)
-        max_time = constrained_request.observation_request.max_time
+            max_time = min(max_time, current_time+receding_horizon_duration)
 
         if ((current_time is not None) and (max_time<current_time)):
             if verbose>1:
@@ -586,6 +596,7 @@ def greedy_schedule_workflow(
                                         )
                                     ):
                                 # If incompatible, skip
+                                    print(f"   [Scheduler] This request is infeasible due to parent {parent_request}")
                                     constrained_request.scheduled=True
                                     constrained_request.feasible=False
                                     break
@@ -595,16 +606,18 @@ def greedy_schedule_workflow(
             else:
                 # REVIEW this is where we can exclude a successor if the parent is infeasible. 
                 if (parent_request.feasible==False):
-                    constrained_request.scheduled=True
-                    constrained_request.feasible=False
-                    break
+                    if verbose>3:
+                        print(f"   [Scheduler] Skipping task constraints for parent {parent_request}, currently infeasible")
+                #     constrained_request.scheduled=True
+                #     constrained_request.feasible=False
+                #     break
                 else:
-                    if verbose>2:
+                    if verbose>3:
                         print(f"   [Scheduler] Skipping task constraints for parent {parent_request}, currently unscheduled")
         
         if (constrained_request.feasible==False):
             if verbose>1:
-                print(f"   [Scheduler] This request is infeasible due to parents")
+                print(f"   [Scheduler] Request {constrained_request} is infeasible")
             continue
 
         # Search for opportunities
@@ -620,7 +633,8 @@ def greedy_schedule_workflow(
         )
         observation_opportunities = find_observation_opportunities([trimmed_request,], satellites)
         constrained_request.observation_opportunities = observation_opportunities[trimmed_request]
-        print(f"Found opportunities from time {min_time} to {max_time}: {observation_opportunities}")
+        if verbose>2:
+            print(f"Found opportunities from time {min_time} to {max_time}: {observation_opportunities}")
         if trimmed_request not in observation_opportunities.keys():
             raise ValueError("Could not schedule {}".format(constrained_request))
         passes = observation_opportunities[trimmed_request]
@@ -640,12 +654,34 @@ def greedy_schedule_workflow(
         allsatpasses = [(satellite, satpass, constrained_request.rewarder(satpass.highest)) for satellite, satpasses in passes.items() for satpass in satpasses]
         allsatpasses.sort(key=lambda x: x[2], reverse=True) # Sort by observation quality
         for (satellite, satpass, _quality) in allsatpasses:
-            # if screen_pass_for_feasibility(existing_requests=existing_requests, satellite=satellite, _obs_pass=satpass, screen_against_comm_passes=True):
+            # Use an external check for feasibility
             if feasibility_screener(satellite, satpass):
-                _best_quality = _quality
-                _best_satellite = satellite
-                _best_pass = satpass
-                break
+                # Now also use an INTERNAL check for feasibility: do not try to clobber existing requests
+                there_is_overlap = False
+                for existing_request in workflow_graph:
+                    if ((existing_request.scheduled == True) and (existing_request.feasible == True) and (existing_request.observation_opportunity is not None)):
+                        # If the start time of the other opportunity is before the end of this one
+                        # If the end time of the other opportunity is after the start of this one
+                        # Then we overlap
+                        if verbose>6:
+                            print(f"Checking for overlap between {constrained_request} and {existing_request}")
+                        if (
+                            (existing_request.observation_opportunity.satellite == satellite) and
+                            (existing_request.observation_opportunity.time<=satpass.highest.time+satpass.highest.duration) and 
+                            (existing_request.observation_opportunity.time+existing_request.observation_opportunity.duration>satpass.highest.time)):
+                            # Passes overlap
+                            if verbose>6:
+                                print("Overlap found! Continuing")
+                            there_is_overlap = True
+                            break
+                        else:
+                            if verbose>6:
+                                print(f"Pass {satpass.highest} for {constrained_request} does not overlap with scheduled pass {existing_request.observation_opportunity} for {existing_request} ")
+                if (not there_is_overlap):
+                    _best_quality = _quality
+                    _best_satellite = satellite
+                    _best_pass = satpass
+                    break
             # TODO check timeline constraints here
         # for satellite, satpasses in passes.items():
         #     for satpass in satpasses:
@@ -669,8 +705,8 @@ def greedy_schedule_workflow(
         constrained_request.observation_opportunity_satellite = _best_satellite
         constrained_request.scheduled = True
         # TODO apply timeline impacts here!
-        if verbose>2:
-            print(f"   [Scheduler] Scheduled request on {_best_satellite} at {_best_pass.highest}")
+        if verbose>0:
+            print(f"   [Scheduler] Scheduled request {constrained_request} on {_best_satellite} at {_best_pass.highest}")
 
     return workflow_graph
 
@@ -714,6 +750,7 @@ def ilp_schedule_workflow(
     # set the relevant variable to 1
     # 
     solution_holder = {}
+    flat_boolean_solution_holder = []
     solution_holder_by_satellite = {}
 
     _timeline_holder = {}
@@ -784,7 +821,7 @@ def ilp_schedule_workflow(
         if len(passes)==0:
             constrained_request.scheduled=True
             constrained_request.feasible=False
-            if verbose>0:
+            if verbose>1:
                 print("   [Scheduler] Could not schedule {} (no passes)".format(constrained_request))
             continue
         
@@ -804,6 +841,8 @@ def ilp_schedule_workflow(
                 solution_holder[constrained_request][satellite][satpass] = solver.BoolVar(f"{constrained_request}_{satellite}_{satpass}")
 
                 solution_holder_by_satellite[satellite].append((satpass, solution_holder[constrained_request][satellite][satpass]))
+
+                flat_boolean_solution_holder.append(solution_holder[constrained_request][satellite][satpass])
                 
                 objective.SetCoefficient(solution_holder[constrained_request][satellite][satpass], _quality)
 
@@ -843,10 +882,10 @@ def ilp_schedule_workflow(
         if _found_a_pass is False:
             constrained_request.scheduled=True
             constrained_request.feasible=False
-            if verbose>0:
+            if verbose>1:
                 print("   [Scheduler] Could not schedule {} (all conflicts)".format(constrained_request))
 
-        # At most max_num_instsanves observation per request are assigned
+        # At most max_num_instances observation per request are assigned
         solver.Add(sum([solution_holder[constrained_request][_satellite][_satpass] for _satellite, _satpasses in solution_holder[constrained_request].items() for _satpass in _satpasses.keys()]) <= constrained_request.max_num_instances)
 
         if verbose>3:
@@ -1078,6 +1117,9 @@ def ilp_schedule_workflow(
 
     objective.SetMaximization()
 
+    # Add a hint
+    solver.SetHint(flat_boolean_solution_holder, [0.,]*len(flat_boolean_solution_holder))
+
     status = solver.Solve()
 
     if status == pywraplp.Solver.OPTIMAL or status == pywraplp.Solver.FEASIBLE:
@@ -1125,7 +1167,23 @@ def ilp_schedule_workflow(
             print(f"    [Scheduler] Problem solved in {solver.nodes():d} branch-and-bound nodes")
     else:
         if verbose>0:
-            print("    [Scheduler] The problem does not have an optimal solution.")
+            status_str = ""
+            match status:
+                case pywraplp.Solver.OPTIMAL:
+                    status_str = "OPTIMAL"
+                case pywraplp.Solver.FEASIBLE:
+                    status_str = "FEASIBLE"
+                case pywraplp.Solver.FEASIBLE:
+                    status_str = "FEASIBLE"
+                case pywraplp.Solver.UNBOUNDED:
+                    status_str = "UNBOUNDED"
+                case pywraplp.Solver.ABNORMAL:
+                    status_str = "ABNORMAL"
+                case pywraplp.Solver.MODEL_INVALID:
+                    status_str = "MODEL_INVALID"
+                case pywraplp.Solver.NOT_SOLVED:
+                    status_str = "NOT_SOLVED"
+            print(f"    [Scheduler] We have not found a feasible solution (status {status_str})")
 
 
     return workflow_graph
@@ -1136,27 +1194,38 @@ def plot_workflow_schedule(
         timeline_graph: nx.MultiDiGraph=nx.MultiDiGraph(),
         axes=None,
         time: dt.datetime = None,
+        feasibility_screener = lambda satellite, observation_pass: True,
+        plot_title = "",
         show_night: bool=False,
         show_night_location: Location= Location(-118,34, 0),
-        save_schedule_plot: bool=True,
+        save_schedule_plot: bool=False,
         save_name: str = "Schedule.pdf",
         ):
 
 
-    num_requests = len(workflow_graph)
-    request_names = list(workflow_graph.nodes())
-    request_colors_list = cm.rainbow(np.linspace(0, 1, num_requests))
-    request_colors = {task: request_colors_list[task_ix] for task_ix, task in enumerate(request_names)}
+    # num_requests = len(workflow_graph)
+    # request_names = list(workflow_graph.nodes())
+
+    request_group_names = list(dict.fromkeys([r.plotting_group for r in workflow_graph.nodes()]))
+    num_request_groups = len(request_group_names)
+    request_group_sizes = {g: len([r.plotting_group for r in workflow_graph.nodes() if r.plotting_group==g]) for g in request_group_names}
+
+    # request_colors_list = cm.rainbow(np.linspace(0, 1, num_requests))
+    # request_colors = {task: request_colors_list[task_ix] for task_ix, task in enumerate(request_names)}
+
+    request_group_colors_list = cm.rainbow(np.linspace(0, 1, num_request_groups))
+    request_group_colors = {group: request_group_colors_list[group_ix] for group_ix, group in enumerate(request_group_names)}
 
     num_timelines = len([n for n in timeline_graph.nodes() if type(n) == Timeline])
 
 
     if axes is None:
-        height_ratios = [num_requests]
+        height_ratios = [num_request_groups]
         height_ratios.extend([1,]*num_timelines)
-        fig, axes = plt.subplots(num_timelines+1,1, sharex=True, height_ratios=height_ratios, figsize=(12, int(math.ceil(.2*num_requests+num_timelines))))
+        fig, axes = plt.subplots(num_timelines+1,1, sharex=True, height_ratios=height_ratios, figsize=(12, int(math.ceil(.2*num_request_groups+num_timelines))))
     else:
-        print("We have axes at home")
+        for ax in axes:
+            ax.clear()
 
     if num_timelines>0:
         ax_tasks = axes[0]
@@ -1164,16 +1233,18 @@ def plot_workflow_schedule(
     else:
         ax_tasks = axes
         ax_timelines = None
-    
+
+    ax_tasks.set_title(plot_title)
+
     line_height = .8
 
+    # Find max and min plotting time
     _all_requests_min_time = None 
     _all_requests_max_time = None
     for request in workflow_graph.nodes():
-        request_data = request
-        # Plot other times where it could have been scheduled.
-        if (request_data.scheduled and request_data.feasible):        # if 'observation_opportunities' in request_data.keys():
-            for _sat, _opportunities in request_data.observation_opportunities.items():
+        
+        if (request.scheduled and request.feasible):        # if 'observation_opportunities' in request.keys():
+            for _sat, _opportunities in request.observation_opportunities.items():
                 for _opportunity in _opportunities:
                     if _all_requests_min_time is None:
                         _all_requests_min_time = _opportunity.rise.time
@@ -1184,10 +1255,15 @@ def plot_workflow_schedule(
                     else:
                         _all_requests_max_time = max(_all_requests_max_time, _opportunity.fall.time)
 
-    # Annotete the plot
-    ax_tasks.set_yticks(np.array(range(num_requests))+0.5, request_names)
+    # Annotete the plot with constraints: 
+    ax_tasks.set_yticks(np.array(range(num_request_groups))+0.5, request_group_names)
     for request_ix, request in enumerate(workflow_graph.nodes()):
-        request_data = request
+        # y_coordinate = request_ix
+        y_coordinate = request_group_names.index(request.plotting_group)
+        # Show the request intervals
+        min_time = request.observation_request.min_time
+        max_time = request.observation_request.max_time
+        ax_tasks.add_patch(plt.Rectangle((min_time, y_coordinate), max_time-min_time, line_height, color=request_group_colors[request.plotting_group], alpha=.03/request_group_sizes[request.plotting_group]))
         # SHow the constraint intervals
         # For each constraint
         for parent_request in workflow_graph.predecessors(request):
@@ -1218,28 +1294,35 @@ def plot_workflow_schedule(
                             min_time = max(min_time, parent_request.observation_opportunity.time)
                         case ConstraintClass.GEOMETRY:
                             min_time = max(min_time, parent_request.observation_opportunity.time)
-                ax_tasks.add_patch(plt.Rectangle((min_time, request_ix), max_time-min_time, line_height, color=request_colors[parent_request], alpha=.1))
+                ax_tasks.add_patch(plt.Rectangle((min_time, y_coordinate), max_time-min_time, line_height, color=request_group_colors[parent_request.plotting_group], alpha=.1/request_group_sizes[request.plotting_group]))
         
         # Show where we actually ended up
-        if (request_data.scheduled and request_data.feasible):
-            if request_data.completed:
+        if (request.scheduled and request.feasible):
+            if request.completed:
                 _task_color = 'k'
                 _task_width = 9
-            elif request_data.dispatched:
+            elif request.dispatched:
                 _task_color = 'm'
                 _task_width = 6
             else:
-                _task_color = request_colors[request]
+                _task_color = request_group_colors[request.plotting_group]
                 _task_width = 3
             # Plot the time where the request was scheduled.
-            ax_tasks.vlines(request_data.observation_opportunity.time, request_ix, request_ix+line_height, color=_task_color, linewidth=_task_width)
-            # Plot other times where it could have been scheduled.
-        # if 'observation_opportunities' in request_data.keys():
-        for _sat, _opportunities in request_data.observation_opportunities.items():
+            ax_tasks.vlines(request.observation_opportunity.time, y_coordinate, y_coordinate+line_height, color=_task_color, linewidth=_task_width)
+        # Plot other times where it could have been scheduled.
+        for _sat, _opportunities in request.observation_opportunities.items():
             for _opportunity in _opportunities:
+                _pass_is_feasible = feasibility_screener(_sat, _opportunity)
                 _min_time = _opportunity.rise.time
                 _max_time = _opportunity.fall.time
-                ax_tasks.add_patch(plt.Rectangle((_min_time, request_ix), _max_time-_min_time, line_height, color=request_colors[request], alpha=.1))
+                 
+                pass_color = request_group_colors[request.plotting_group]
+                pass_alpha = 0.1/request_group_sizes[request.plotting_group]
+                if not _pass_is_feasible:
+                    pass_color = 'red'
+                    pass_alpha = 0.8/request_group_sizes[request.plotting_group]
+
+                ax_tasks.add_patch(plt.Rectangle((_min_time, y_coordinate), _max_time-_min_time, line_height, color=pass_color, alpha=pass_alpha))
 
     timeline_ix = 0
     for timeline in timeline_graph.nodes():
@@ -1259,7 +1342,7 @@ def plot_workflow_schedule(
         ax_timelines[-1].tick_params(axis='x', labelrotation=90)
     else:
         ax_tasks.tick_params(axis='x', labelrotation=90)
-
+    # ax_tasks.set_xlim(_all_requests_min_time, _all_requests_max_time)
 
     # Show time
     if time is not None:
@@ -1319,35 +1402,90 @@ def plot_workflow_schedule(
         plt.savefig(save_name, bbox_inches='tight')
 
 
-def find_dispatchable_tasks(workflow_graph = nx.MultiDiGraph()):
+def find_dispatchable_tasks(workflow_graph = nx.MultiDiGraph(), timeline_graph: nx.MultiDiGraph=nx.MultiDiGraph(), verbose: int=1):
     dispatchable_requests = []
     for request in workflow_graph.nodes():
         _dispatchable = True
-        request_data = request
-        if ((request_data.scheduled == False) or (request_data.feasible == False) or (request_data.dispatched == True) or (request_data.completed == True)):
-             print(f"     [Dispatcher] Request {request} not dispatchable (scheduled: {request_data.scheduled}, feasible: {request_data.feasible}, dispatched {request_data.dispatched}, completed {request_data.completed})")
+        if ((request.scheduled == False) or (request.feasible == False) or (request.dispatched == True) or (request.completed == True)):
+             if verbose>1:
+                print(f"     [Dispatcher] Request {request} not dispatchable (scheduled: {request.scheduled}, feasible: {request.feasible}, dispatched {request.dispatched}, completed {request.completed})")
              _dispatchable = False
              continue
         for parent_request in workflow_graph.predecessors(request):
-            parent_request_data = parent_request
             constraint_edges = workflow_graph.get_edge_data(parent_request, request)
             for constraint_key, constraint in constraint_edges.items():
                 # If we need to check this type of constraint
-                if request_data.dispatch_policy[constraint['constraint_class']] is False:
+                if request.dispatch_policy[constraint['constraint_class']] is False:
                     # Add a special case where
                     # If a task is infeasible
                     # and the constraint is specifically "START_IF_FAILED"
                     # then oh yeah we are ready to dispatch
-                    if ((parent_request_data.scheduled is False or (parent_request_data.scheduled is True and parent_request_data.feasible is False)) and constraint['constraint_class']==ConstraintClass.SUCCESS and (constraint['constraint_type']==SuccessConstraintType.START_IF_FAILED or constraint['constraint_type']==SuccessConstraintType.WAIT_FOR_COMPLETION_IF_FEASIBLE)):
-                        print(f"     [Dispatcher] Special case for request {request}: parent {parent_request} is infeasible and constraint is {constraint['constraint_type']}, unscheduled/infeasible counts toward this.")
+                    if ((parent_request.scheduled is False or (parent_request.scheduled is True and parent_request.feasible is False)) and constraint['constraint_class']==ConstraintClass.SUCCESS and (constraint['constraint_type']==SuccessConstraintType.START_IF_FAILED or constraint['constraint_type']==SuccessConstraintType.WAIT_FOR_COMPLETION_IF_FEASIBLE)):
+                        if verbose>2:
+                            print(f"     [Dispatcher] Special case for request {request}: parent {parent_request} is infeasible and constraint is {constraint['constraint_type']}, unscheduled/infeasible counts toward this.")
                         continue
-                    elif (parent_request_data.scheduled is False or parent_request_data.dispatched is False or parent_request_data.completed is False):
-                        print(f"     [Dispatcher] Request {request} not dispatchable (parent {parent_request} scheduled {parent_request_data.scheduled}, dispatched {parent_request_data.dispatched}, completed {parent_request_data.completed}). Constraint: {constraint['constraint_class']} {constraint['constraint_type']}")
+                    elif (parent_request.scheduled is False or parent_request.dispatched is False or parent_request.completed is False):
+                        if verbose>1:
+                            print(f"     [Dispatcher] Request {request} not dispatchable (parent {parent_request} scheduled {parent_request.scheduled}, dispatched {parent_request.dispatched}, completed {parent_request.completed}). Constraint: {constraint['constraint_class']} {constraint['constraint_type']}")
                         _dispatchable = False
                         break
             if _dispatchable == False:
                 break
+        
+        # This is kind of a hack.
+        # If a task has all constraints satisfied, _but_ is rejected because of a timeline, 
+        # we will mark the task as infeasible. This is because the planner is very aggressive
+        # and (improperly?) relies on the dispatcher to mark tasks as not feasible close
+        # to dispatch time.
+        # But if a task is infeasible that changes the dependencies that rely on WAIT_FOR_COMPLETION_IF_FEASIBLE
+        # So, if we mark a task as infeasible, we will invoke the dispatcher again
+        should_rerun_dispatcher_again_due_to_infeasible_tasks = False
+
+        if _dispatchable is True:
+            # Now check the timeline
+            if request in timeline_graph.nodes():
+                for _timeline in timeline_graph.successors(request):
+                    tl_edges = timeline_graph.get_edge_data(request, _timeline)
+                    for _constraint_key, _constraint in tl_edges.items():
+                        if _constraint['edge_type'] == TaskTimelineConstraint:
+                            _time = request.observation_opportunity.time
+                            if _constraint['constraint_time'] == TaskImpactTime.POST:
+                                _time = request.observation_opportunity.time + request.observation_opportunity.duration
+                            # Check that the constraint is verified 
+                            _tl_value_at_time = _timeline.get_value_at(_time)
+                            match _constraint['constraint_type']:
+                                case TimelineConstraintType.GREATER_OR_EQUAL:
+                                    if not (_tl_value_at_time >= _constraint['constraint_value']):
+                                        if verbose:
+                                            print(f"     [Dispatcher] Request {request} not dispatchable: constraint {_constraint} on timeline {_timeline} at {_time} violated (timeline value is {_tl_value_at_time})")
+                                        _dispatchable = False
+                                        request.feasible = False
+                                        should_rerun_dispatcher_again_due_to_infeasible_tasks = True
+                                        break
+                                case TimelineConstraintType.LESSER_OR_EQUAL:
+                                    if not (_tl_value_at_time <= _constraint['constraint_value']):
+                                        if verbose:
+                                            print(f"     [Dispatcher] Request {request} not dispatchable: constraint {_constraint} on timeline {_timeline} at {_time} violated (timeline value is {_tl_value_at_time})")
+                                        _dispatchable = False
+                                        request.feasible = False
+                                        should_rerun_dispatcher_again_due_to_infeasible_tasks = True
+                                        break
+                                case TimelineConstraintType.EQUAL:
+                                    if not (_tl_value_at_time == _constraint['constraint_value']):
+                                        if verbose:
+                                            print(f"     [Dispatcher] Request {request} not dispatchable: constraint {_constraint} on timeline {_timeline} at {_time} violated (timeline value is {_tl_value_at_time})")
+                                        _dispatchable = False
+                                        request.feasible = False
+                                        should_rerun_dispatcher_again_due_to_infeasible_tasks = True
+                                        break
+                    if _dispatchable is False:
+                        break
+
         if _dispatchable is True:
             dispatchable_requests.append(request)
+        if should_rerun_dispatcher_again_due_to_infeasible_tasks:
+            if verbose>0:
+                print(f"     [Dispatcher] We marked some tasks as infeasible. Rerunning the dispatcher")
+            return find_dispatchable_tasks(workflow_graph = workflow_graph, timeline_graph=timeline_graph, verbose=verbose)
     return dispatchable_requests
 

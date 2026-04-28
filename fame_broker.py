@@ -27,7 +27,8 @@ class Broker():
     def __init__(
             self,
             constellations: list[ConstellationGroundScheduler],
-            world: World, name="Broker",
+            world: World,
+            name="Broker",
             ):
         self.name = name
         self.constellations = constellations
@@ -250,7 +251,9 @@ class Broker():
             current_time: dt.datetime=dt.datetime.now(dt.timezone.utc),
             use_ilp: bool=False,
             update_timelines: bool=True,
+            update_requests: bool=True,
             plot_schedule: bool = False,
+            plot_axes: plt.axes = None,
             plot_night_in_schedule: bool=False,
             plot_location_for_night_in_schedule: Location = Location(0,0, 0),
             max_solver_time_s: float=60.,
@@ -258,15 +261,12 @@ class Broker():
             save_schedule_plot: bool=False
     ):
         # Come up with a schedule that satisfies the workflow
-        if use_ilp:
-            # TODO:
-            # - Empty the timeline graph
-            # - Pull the starting value and starting rate (from where?). Add a current starting value and starting rate.
-            # - Iterate over in-progress tasks (dispatched not completed)
-            # - For each in-progress task add POST impacts
-            if update_timelines:
-                self.workflow.timeline_updater(self.world.time, self.workflow.constrained_observation_requests, self.workflow.timelines)
+        if update_timelines:
+            self.workflow.timeline_updater(self.world.time, self.workflow.constrained_observation_requests, self.workflow.timelines)
+        if update_requests:
+            self.workflow.request_updater(self.world.time, self.workflow.constrained_observation_requests, self.workflow.timelines)
 
+        if use_ilp:
             _ = ilp_schedule_workflow(
                 workflow_graph=self._workflow_graph,
                 timeline_graph=self._timeline_graph,
@@ -284,7 +284,7 @@ class Broker():
                 satellites=self._known_satellites,
                 feasibility_screener=self._screen_pass_for_feasibility,
                 current_time=current_time,
-                verbose=3,
+                verbose=1,
                 )
                 
         self._workflow_schedule_epoch += 1
@@ -293,18 +293,25 @@ class Broker():
             plot_workflow_schedule(
                 workflow_graph=self._workflow_graph,
                 timeline_graph=self._timeline_graph,
+                axes=plot_axes,
                 time=self.world.time,
+                feasibility_screener=self._screen_pass_for_feasibility,
+                plot_title=f"{self.name} at {self.world.time} (epoch {self._workflow_schedule_epoch})",
                 show_night=plot_night_in_schedule,
                 show_night_location=plot_location_for_night_in_schedule,
                 # save_schedule_plot=save_schedule_plot,
                 # save_name = "Schedule_e{}_{}.pdf".format(self._workflow_schedule_epoch, self.world.time)
                 )
-            plt.savefig("Schedule_e{:05d}_{}.pdf".format(self._workflow_schedule_epoch, self.world.time), bbox_inches='tight')
+            figure_name = "media/Schedule_{}_e{:05d}_{}.pdf".format(self.world.time, self._workflow_schedule_epoch, self.name)
+            if plot_axes is None:
+                plt.savefig(figure_name, bbox_inches='tight')
+            else:
+                plot_axes[0].get_figure().savefig(figure_name, bbox_inches='tight')
 
         local_workflow_schedule_epoch_when_dispatching_started = self._workflow_schedule_epoch
 
-        dispatchable_task_ids = find_dispatchable_tasks(self._workflow_graph)
-        print(f" [Broker] There are {len(dispatchable_task_ids)} dispatchable tasks")
+        dispatchable_task_ids = find_dispatchable_tasks(self._workflow_graph, self._timeline_graph, verbose=1)
+        print(f" [{self.name}] There are {len(dispatchable_task_ids)} dispatchable tasks")
 
         for dispatchable_task in dispatchable_task_ids:
             # If we rescheduled in the meanwhile, don't keep dispatching stale stuff.
@@ -313,7 +320,7 @@ class Broker():
             if self._workflow_schedule_epoch != local_workflow_schedule_epoch_when_dispatching_started:
                 break
             
-            print(f" [Broker]  Attempting to dispatch task {dispatchable_task} ")
+            print(f" [{self.name}]  Attempting to dispatch task {dispatchable_task} ")
 
             request = dispatchable_task.observation_request
             _best_satellite = dispatchable_task.observation_opportunity_satellite
@@ -368,6 +375,7 @@ class Broker():
                     current_time=self.world.time,
                     use_ilp=use_ilp,
                     plot_schedule=plot_schedule,
+                    plot_axes=plot_axes,
                     plot_night_in_schedule=plot_night_in_schedule,
                     plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
                     max_solver_time_s=max_solver_time_s,
@@ -388,7 +396,7 @@ class Broker():
                 _dispatchable_task.scheduled = True
                 _dispatchable_task.dispatched = True
                 _dispatchable_task.completed = True
-
+                _dispatchable_task.data_product = data_product
                 
                 
                 # Update parameters. Phenomenon_processor is called on the observed events to write something to DataProducts
@@ -414,6 +422,7 @@ class Broker():
                     current_time=self.world.time,
                     use_ilp=use_ilp,
                     plot_schedule=plot_schedule,
+                    plot_axes=plot_axes,
                     plot_night_in_schedule=plot_night_in_schedule,
                     plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
                     max_solver_time_s=max_solver_time_s,
@@ -463,7 +472,7 @@ class Broker():
             # Note that, if the call above fails, we will immediately receive a reply, via the callback, that will trigger another reschedule - while we are still dispatching things here!
 
 
-def request_statistics(requests_pd):
+def request_statistics(requests_pd, display_unique_requests: bool=True):
     total_requests_no = len(requests_pd)
     all_statuses = set(requests_pd.status.values)    
     for s in all_statuses:
@@ -472,28 +481,116 @@ def request_statistics(requests_pd):
         print("{}/{} ({}%) of requests are in status {}".format(matching_statuses,total_requests_no, matching_statuses/total_requests_no*100, s))
     # X/Y requests have >1 successful observation
     
+    total_requests_with_data_received = len(requests_pd[requests_pd.status==ObservationStatus.DATA_RECEIVED])
+
     requests_with_detections = requests_pd.apply(lambda x: x['data_product'] is not None and len(x['data_product'])>0, axis=1)
 
-    if len(requests_pd[requests_pd.status=="OK! Data received"])>0:
-        print("{}/{} ({}%) successful requests have a phenomenon detection".format(sum(requests_with_detections), len(requests_pd[requests_pd.status=="OK! Data received"]),sum(requests_with_detections)/len(requests_pd[requests_pd.status=="OK! Data received"])*100))
+    if len(requests_pd[requests_pd.status==ObservationStatus.DATA_RECEIVED])>0:
+        print("{}/{} ({}%) successful requests have a phenomenon detection".format(sum(requests_with_detections), len(requests_pd[requests_pd.status==ObservationStatus.DATA_RECEIVED]),sum(requests_with_detections)/len(requests_pd[requests_pd.status==ObservationStatus.DATA_RECEIVED])*100))
     
-    unique_requests = set(requests_pd.request)
-    unique_requests_no = len(unique_requests)
-    fulfilled_unique_requests_no = 0
-    fulfilled_unique_requests_events_found_no = 0
-    for ur in unique_requests:
-        matching_observation_statuses = requests_pd[(requests_pd['request']==ur) & (requests_pd['status']==ObservationStatus.DATA_RECEIVED)]
-        if len(matching_observation_statuses):
-            fulfilled_unique_requests_no += 1
-        for _dp in matching_observation_statuses['data_product']:
-            if _dp is not None and len(_dp):
-                fulfilled_unique_requests_events_found_no += 1
-                break
-    print(" {}/{} ({}%) unique requests have at least one successful observation".format(fulfilled_unique_requests_no, unique_requests_no, fulfilled_unique_requests_no/unique_requests_no*100))
-    # for _ix, _dp in requests_pd:
-    # print(" of all requests have a phenomenon detection")
-    # print(" of all _successful_ requests have a phenomenon detection")
+    print("")
 
-    # print(" of all unique requests have a phenomenon detection")
-    if fulfilled_unique_requests_no>0:
-        print("{}/{} ({}%) of all successful unique requests have a phenomenon detection".format(fulfilled_unique_requests_events_found_no, fulfilled_unique_requests_no, fulfilled_unique_requests_events_found_no/fulfilled_unique_requests_no*100))
+    all_constellations = set(requests_pd.requested_constellation.values)
+
+    # Submitted requests by fraction
+    for constellation in all_constellations:
+        matching_requests = requests_pd[requests_pd.requested_constellation==constellation]
+        print(f"{len(matching_requests)}/{total_requests_no} requests ({len(matching_requests)/total_requests_no*100:.2f}%) submitted to constellation {constellation.name}")
+        
+        matching_successful_requests = requests_pd[(requests_pd.requested_constellation==constellation) & (requests_pd.status==ObservationStatus.DATA_RECEIVED)]
+        print(f"{len(matching_successful_requests)}/{total_requests_with_data_received} successful requests ({len(matching_successful_requests)/total_requests_with_data_received*100:.2f}%) submitted to constellation {constellation.name}")
+        print(f"{constellation.name} submission success rate: {len(matching_successful_requests)/len(matching_requests)*100:.2f}%")
+    # Successful requests by fraction and acceptance rate
+
+    if display_unique_requests:
+        unique_requests = set(requests_pd.request)
+        unique_requests_no = len(unique_requests)
+        fulfilled_unique_requests_no = 0
+        fulfilled_unique_requests_events_found_no = 0
+        for ur in unique_requests:
+            matching_observation_statuses = requests_pd[(requests_pd['request']==ur) & (requests_pd['status']==ObservationStatus.DATA_RECEIVED)]
+            if len(matching_observation_statuses):
+                fulfilled_unique_requests_no += 1
+            for _dp in matching_observation_statuses['data_product']:
+                if _dp is not None and len(_dp):
+                    fulfilled_unique_requests_events_found_no += 1
+                    break
+        print(" {}/{} ({}%) unique requests have at least one successful observation".format(fulfilled_unique_requests_no, unique_requests_no, fulfilled_unique_requests_no/unique_requests_no*100))
+        # for _ix, _dp in requests_pd:
+        # print(" of all requests have a phenomenon detection")
+        # print(" of all _successful_ requests have a phenomenon detection")
+
+        # print(" of all unique requests have a phenomenon detection")
+        if fulfilled_unique_requests_no>0:
+            print("{}/{} ({}%) of all successful unique requests have a phenomenon detection".format(fulfilled_unique_requests_events_found_no, fulfilled_unique_requests_no, fulfilled_unique_requests_events_found_no/fulfilled_unique_requests_no*100))
+
+
+def plot_request_statistics(
+        requests_pd,
+        broker_name: str="",
+        min_time: dt.datetime=None,
+        max_time: dt.datetime=None,
+        constellation_colorer=None,
+        MAX_RADIUS: float=50,
+        save_histogram_all: bool = True,
+        save_pie_all: bool = True,
+        save_histogram_successful: bool = True,
+        save_pie_successful: bool = True,
+        save_prefix: str = "media/Statistics_",
+        save_suffix: str = ".png",
+        ):
+
+    if min_time is None:
+        min_time = min(requests_pd['requested_pass'].apply(lambda x: x.highest.time if x is not None else None))
+    if max_time is None:
+        max_time = max(requests_pd['requested_pass'].apply(lambda x: x.highest.time if x is not None else None))
+
+
+    sliced_requests_by_time_mask = requests_pd.apply(lambda row: ((row['requested_pass'].highest.time>=min_time) and (row['requested_pass'].highest.time<=max_time)), axis=1)
+
+    sliced_requests_by_time = requests_pd[sliced_requests_by_time_mask]
+
+    all_constellations = sliced_requests_by_time.requested_constellation.unique()
+    # A cumulative chart with requests by constellation vs. time
+    request_times_by_constellation = [
+        sliced_requests_by_time[sliced_requests_by_time['requested_constellation']==_constellation]['requested_pass'].apply(lambda x: x.highest.time)
+        for _constellation in all_constellations
+    ]
+
+
+    plt.figure()
+    plt.hist(request_times_by_constellation, bins=10, stacked=True, label=[c.name for c in all_constellations], color=[constellation_colorer(c.name) for c in all_constellations])
+    
+    plt.title(f"Requests by constellation for broker {broker_name}")
+    plt.xlabel('Date')
+    plt.ylabel('Frequency')
+    plt.legend()
+    plt.tight_layout()
+    if save_histogram_all:
+        plt.savefig(save_prefix+"_hist_all"+save_suffix, bbox_inches='tight')
+
+    plt.pie([len(rs) for rs in request_times_by_constellation], radius=sum([len(rs) for rs in request_times_by_constellation])/MAX_RADIUS, labels=[c.name for c in all_constellations], colors=[constellation_colorer(c.name) for c in all_constellations], autopct='%1.1f%%')
+    if save_pie_all:
+        plt.savefig(save_prefix+"_pie_all"+save_suffix, bbox_inches='tight')
+
+    # A cumulative chart with successful requests by constellation vs. time
+    successful_request_times_by_constellation = [
+        sliced_requests_by_time[(sliced_requests_by_time['requested_constellation']==_constellation) & (sliced_requests_by_time['status']==ObservationStatus.DATA_RECEIVED)]['requested_pass'].apply(lambda x: x.highest.time)
+        for _constellation in all_constellations
+    ]
+
+
+    plt.figure()
+    plt.hist(successful_request_times_by_constellation, bins=10, stacked=True, label=[c.name for c in all_constellations], color=[constellation_colorer(c.name) for c in all_constellations])
+    
+    plt.title(f"Successful request by constellation for broker {broker_name}")
+    plt.xlabel('Date')
+    plt.ylabel('Frequency')
+    plt.legend()
+    plt.tight_layout()
+    if save_histogram_successful:
+        plt.savefig(save_prefix+"_hist_successful"+save_suffix, bbox_inches='tight')
+
+    plt.pie([len(rs) for rs in successful_request_times_by_constellation], radius=sum([len(rs) for rs in successful_request_times_by_constellation])/MAX_RADIUS, labels=[c.name for c in all_constellations], colors=[constellation_colorer(c.name) for c in all_constellations], autopct='%1.1f%%')
+    if save_pie_successful:
+        plt.savefig(save_prefix+"_pie_successful"+save_suffix, bbox_inches='tight')

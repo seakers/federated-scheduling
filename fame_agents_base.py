@@ -1,5 +1,4 @@
 import pyorbital
-from pyorbital.orbital import Orbital
 import datetime as dt
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
@@ -12,10 +11,10 @@ from enum import Enum
 
 from fame_geometry import *
 import copy
+from shapely.geometry import Polygon
+from shapely.plotting import patch_from_polygon
 
-import requests
-import urllib
-import json
+from matplotlib import colormaps as cmap
 
 MIN_HORIZON_ANGLE_FOR_PASS_DEG = 15
 
@@ -381,8 +380,12 @@ def plot_history(
         plot_observation_footprint: bool=True,
         plot_comm_gaze: bool=True,
         plot_comm_station: bool=True,
+        save_figure: bool=True,
+        save_prefix: str="History_",
+        use_sequential_index: bool=True
         ):
     artists = []
+    plot_ix = -1
     for _chronicle_ix, _chronicle in enumerate(world.history):
         if type(_chronicle['event']) in events_to_show:
             figglobal = plt.figure(figsize=(10,5))
@@ -391,8 +394,6 @@ def plot_history(
                 ax.set_global()
             
             else:
-                # _plot_offset_deg = 4
-                # axes_extents = (float(Rotterdam.lon_deg)-_plot_offset_deg, float(Rotterdam.lon_deg)+_plot_offset_deg, float(Rotterdam.lat_deg)-_plot_offset_deg, float(Rotterdam.lat_deg)+_plot_offset_deg)
                 ax.set_extent(axes_extents, crs=ccrs.PlateCarree())
             
             ax.coastlines()
@@ -415,7 +416,12 @@ def plot_history(
                 plot_comm_gaze=plot_comm_gaze,
                 plot_comm_station=plot_comm_station,
                 )
-            plt.savefig("History_{:05d}.png".format(_chronicle_ix))
+            if use_sequential_index:
+                plot_ix+=1
+            else:
+                plot_ix = _chronicle_ix
+            if save_figure:
+                plt.savefig("{}{:05d}.png".format(save_prefix, plot_ix), bbox_inches='tight')
             # artists.append(_ax)
         
     # plt.show()

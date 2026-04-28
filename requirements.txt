@@ -5,3 +5,4 @@ pandas~=2.3.3
 networkx~=3.6.1
 ortools~=9.15
 astral~=3.2
+tesspy~=0.2
