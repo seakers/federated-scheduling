@@ -110,9 +110,9 @@ class World():
                 'phenomena': [copy.deepcopy(p) for p in self.phenomena],
                 'states': {
                     'satellites': [copy.deepcopy(s) for s in self.satellites],
-                    # Constellations and brokers have a pointer to World, which has a pointer to constellations, which...recursion!
-                    # 'constellations': [copy.deepcopy(c) for c in self.constellations],
-                    # 'brokers': [copy.deepcopy(b) for b in self.brokers],
+                    # Constellations and brokers have a pointer to World, which has a pointer to constellations, which...recursion! This should be fixed with new, custom deepcopy classes
+                    'constellations': [copy.deepcopy(c) for c in self.constellations],
+                    'brokers': [copy.deepcopy(b) for b in self.brokers],
                 }
             })
             
@@ -140,32 +140,38 @@ class World():
         # Find phenomena close to the observation location in space and at the right time
         # Return a data product and a list of event states
         # print("Obs opp {}".format(observation))
+
+
+
         observed_phenomena = []
 
         spacecraft = observation.satellite
+
+        if observation.instrument not in spacecraft.instruments:
+            raise ValueError(f"Can't perform observation {observation} on spacecraft {spacecraft} with instruments {spacecraft.instruments} (FOVs: {spacecraft.instrument_fov_rad})")
+
+
         # Now let's see what we observed
         for _phenomenon in self.phenomena:
             if (_phenomenon.start_time <= observation.time and _phenomenon.end_time > observation.time):
-                
-                # Compute phenomenon location on the planet
-                _ph_location_ecf = np.array(pyorbital.astronomy.observer_position(observation.time, _phenomenon.lon_deg, _phenomenon.lat_deg, _phenomenon.alt_km)[0][:3])
-                # Compute observation location on the planet
-                _obs_location_ecf = np.array(pyorbital.astronomy.observer_position(observation.time, observation.lon_deg, observation.lat_deg, observation.alt_km)[0][:3])
-                # Compute SC location
-                _sc_location_ecf = np.array(spacecraft.orbit.get_position(observation.time, normalize=False)[0][:3])
-                # Compute angle between sc-observation and sc-phenomenon
-                _ph_sc_vector = _ph_location_ecf-_sc_location_ecf
-                _obs_sc_vector = _obs_location_ecf - _sc_location_ecf
-                # print("PhSc {} || ObsSc {}".format(_ph_sc_vector, _obs_sc_vector))
-                # print("Dot: {} || N1: {} N2: {}".format(np.dot(_ph_sc_vector,_obs_sc_vector),np.linalg.norm(_ph_sc_vector,2), np.linalg.norm(_obs_sc_vector,2))) 
-                # print("Acos: {}, angle: {}".format(np.dot(_ph_sc_vector,_obs_sc_vector)/(np.linalg.norm(_ph_sc_vector,2)*np.linalg.norm(_obs_sc_vector,2)), np.arccos(np.dot(_ph_sc_vector,_obs_sc_vector)/(np.linalg.norm(_ph_sc_vector,2)*np.linalg.norm(_obs_sc_vector,2)))))
-                _ph_obs_angle_rad = np.arccos(np.clip(np.dot(_ph_sc_vector,_obs_sc_vector)/(np.linalg.norm(_ph_sc_vector,2)*np.linalg.norm(_obs_sc_vector,2)),-1,1))
-                # print("Obs angle (rad) {}".format(_ph_obs_angle_rad))
-                # If angle<FOV, return phobservation
-                if observation.instrument not in spacecraft.instruments:
-                    raise ValueError(f"Can't perform observation {observation} on spacecraft {spacecraft} with instruments {spacecraft.instruments} (FOVs: {spacecraft.instrument_fov_rad})")
-                if _ph_obs_angle_rad < spacecraft.instrument_fov_rad[observation.instrument]:
-                    # print("Close enough")
+                # # Compute phenomenon location on the planet
+                # _ph_location_ecf = np.array(pyorbital.astronomy.observer_position(observation.time, _phenomenon.lon_deg, _phenomenon.lat_deg, _phenomenon.alt_km)[0][:3])
+                # # Compute observation location on the planet
+                # _obs_location_ecf = np.array(pyorbital.astronomy.observer_position(observation.time, observation.lon_deg, observation.lat_deg, observation.alt_km)[0][:3])
+                # # Compute SC location
+                # _sc_location_ecf = np.array(spacecraft.orbit.get_position(observation.time, normalize=False)[0][:3])
+                # # Compute angle between sc-observation and sc-phenomenon
+                # _ph_sc_vector = _ph_location_ecf-_sc_location_ecf
+                # _obs_sc_vector = _obs_location_ecf - _sc_location_ecf
+                # # print("PhSc {} || ObsSc {}".format(_ph_sc_vector, _obs_sc_vector))
+                # # print("Dot: {} || N1: {} N2: {}".format(np.dot(_ph_sc_vector,_obs_sc_vector),np.linalg.norm(_ph_sc_vector,2), np.linalg.norm(_obs_sc_vector,2))) 
+                # # print("Acos: {}, angle: {}".format(np.dot(_ph_sc_vector,_obs_sc_vector)/(np.linalg.norm(_ph_sc_vector,2)*np.linalg.norm(_obs_sc_vector,2)), np.arccos(np.dot(_ph_sc_vector,_obs_sc_vector)/(np.linalg.norm(_ph_sc_vector,2)*np.linalg.norm(_obs_sc_vector,2)))))
+                # _ph_obs_angle_rad = np.arccos(np.clip(np.dot(_ph_sc_vector,_obs_sc_vector)/(np.linalg.norm(_ph_sc_vector,2)*np.linalg.norm(_obs_sc_vector,2)),-1,1))
+                # # print("Obs angle (rad) {}".format(_ph_obs_angle_rad))
+                # # If angle<FOV, return phobservation
+                # if _ph_obs_angle_rad < spacecraft.instrument_fov_rad[observation.instrument]:
+                if is_lla_in_satellite_fov(observation=observation, location=_phenomenon): # Note that Phenomenon inherits from Pose, which inherits from Location
+                #     # print("Close enough")
                     observed_phenomena.append(_phenomenon)
                 else:
                     # print("Too far")
@@ -178,6 +184,8 @@ class World():
         
         return True
     
+
+
 def do_downlink(spacecraft: Satellite, scheduler, comm_pass: ObservationPass): # scheduler is a ConstellationGroundScheduler,defined next 
     # Simple: downlink all. Future: downlink up to x.
     
@@ -235,6 +243,7 @@ def plot_event(
         constellation_colors: dict={},
         plot_time: bool=True,
         plot_phenomena: bool=True,
+        plot_phenomena_alpha: float=1.,
         plot_ground_stations: bool=True,
         plot_satellites: bool=True,
         plot_satellite_tracks: bool=True,
@@ -263,7 +272,7 @@ def plot_event(
     if plot_phenomena:
         for phenomenon in _chronicle['phenomena']:
             if (phenomenon.start_time<_chronicle['time'] and phenomenon.end_time>_chronicle['time']): 
-                ax.plot(phenomenon.lon_deg, phenomenon.lat_deg, 'D', transform=ccrs.PlateCarree(), color='m')
+                ax.plot(phenomenon.lon_deg, phenomenon.lat_deg, 'D', transform=ccrs.PlateCarree(), color='m', alpha=plot_phenomena_alpha)
 
     for constellation_ix, constellation in enumerate(world.constellations):
         constellation_color = constellation_colors.get(constellation.name, constellation_palette(constellation_ix/len(world.constellations)))
@@ -332,22 +341,23 @@ def plot_event(
 
     elif type(_chronicle['event'])==CommunicationEvent:
         # The line from the GS to the satellite
-        if plot_comm_gaze:
-            ax.plot(
-                [_chronicle['event'].station.lon_deg, _chronicle['event'].satellite.orbit.get_lonlatalt(_chronicle['time'])[0]],
-                [_chronicle['event'].station.lat_deg, _chronicle['event'].satellite.orbit.get_lonlatalt(_chronicle['time'])[1]],
-                '-.k',
-                transform=ccrs.Geodetic()
-            )
-        # The station
-        if plot_comm_station:
-            ax.plot(
-                _chronicle['event'].station.lon_deg,
-                _chronicle['event'].station.lat_deg,
-                '*',
-                markersize=10,
-                transform=ccrs.Geodetic()
-            )
+        if _chronicle['event'].station != "ISL":
+            if plot_comm_gaze:
+                ax.plot(
+                    [_chronicle['event'].station.lon_deg, _chronicle['event'].satellite.orbit.get_lonlatalt(_chronicle['time'])[0]],
+                    [_chronicle['event'].station.lat_deg, _chronicle['event'].satellite.orbit.get_lonlatalt(_chronicle['time'])[1]],
+                    '-.k',
+                    transform=ccrs.Geodetic()
+                )
+            # The station
+            if plot_comm_station:
+                ax.plot(
+                    _chronicle['event'].station.lon_deg,
+                    _chronicle['event'].station.lat_deg,
+                    '*',
+                    markersize=10,
+                    transform=ccrs.Geodetic()
+                )
         # And the satellite
         if plot_satellites:
             satellite_color  = satellite_colors.get(_chronicle['event'].satellite.name, 'b')
@@ -382,13 +392,14 @@ def plot_history(
         plot_comm_station: bool=True,
         save_figure: bool=True,
         save_prefix: str="History_",
-        use_sequential_index: bool=True
+        use_sequential_index: bool=True,
+        position_filter_parameters: dict={},
         ):
     artists = []
     plot_ix = -1
     for _chronicle_ix, _chronicle in enumerate(world.history):
         if type(_chronicle['event']) in events_to_show:
-            figglobal = plt.figure(figsize=(10,5))
+            figglobal = plt.figure(figsize=(20,10))
             ax = figglobal.add_subplot(1,1,1, projection=ccrs.Robinson())
             if axes_extents is None:
                 ax.set_global()
@@ -416,6 +427,7 @@ def plot_history(
                 plot_comm_gaze=plot_comm_gaze,
                 plot_comm_station=plot_comm_station,
                 )
+            
             if use_sequential_index:
                 plot_ix+=1
             else:

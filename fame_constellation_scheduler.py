@@ -19,12 +19,8 @@ import json
 
 from fame_agents_base import *
 
-
-
-
-
 class ConstellationGroundScheduler():
-    def __init__(self, satellites: list, ground_stations: list, world: World, name="Constellation"):
+    def __init__(self, satellites: list, ground_stations: list, world, name="Constellation"):
         self.name = name
         self.satellites = satellites
         self.ground_stations = ground_stations
@@ -36,6 +32,12 @@ class ConstellationGroundScheduler():
         return f"Constellation scheduler {self.name} with {len(self.satellites)} satellites"
     def __repr__(self):
         return self.__str__()
+    
+    def __deepcopy__(self, memo):
+        new_constellation = ConstellationGroundScheduler(satellites=self.satellites, ground_stations=self.ground_stations, world=self.world, name=self.name)
+        new_constellation._requests = copy.deepcopy(self._requests, memo)
+        return new_constellation
+
 
     def screen_opportunity_for_feasibility(self, satellite: Satellite, _request: ObservationRequest, screen_against_comm_passes:bool=True):
         return screen_opportunity_for_feasibility(existing_requests=self._requests, satellite=satellite, _request=_request, screen_against_comm_passes=screen_against_comm_passes, log_prefix=self.name)

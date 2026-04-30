@@ -529,7 +529,7 @@ def spacecraft_fov(time: dt.datetime, satellite: Satellite, instrument: Instrume
             try:
                 # gaze_vector_lambda = scipy_bisect(radius_error_with_oblateness,0.5, 1.2)
                 gaze_vector_lambda = scipy_newton(radius_error_with_oblateness,1.0)
-            except ValueError as e:
+            except (ValueError, RuntimeError) as e:
                 print(e)
                 # Just skip the sample
                 continue
@@ -554,6 +554,25 @@ def spacecraft_fov(time: dt.datetime, satellite: Satellite, instrument: Instrume
         # ground_footprint_poly = Polygon([(_lla[0], _lla[1]) for _lla in ground_footprint_llas])
     return llas
         
+def is_lla_in_satellite_fov(observation: ObservationOpportunity, location: Location):
+        # Compute phenomenon location on the planet
+    _ph_location_ecf = np.array(pyorbital.astronomy.observer_position(observation.time, location.lon_deg, location.lat_deg, location.alt_km)[0][:3])
+    # Compute observation location on the planet. This is where we are looking.
+    _obs_location_ecf = np.array(pyorbital.astronomy.observer_position(observation.time, observation.lon_deg, observation.lat_deg, observation.alt_km)[0][:3])
+    # Compute spacecraft location
+    _sc_location_ecf = np.array(observation.satellite.orbit.get_position(observation.time, normalize=False)[0][:3])
+    # Compute angle between sc-observation and sc-phenomenon
+    _ph_sc_vector = _ph_location_ecf-_sc_location_ecf
+    _obs_sc_vector = _obs_location_ecf - _sc_location_ecf
+    # print("PhSc {} || ObsSc {}".format(_ph_sc_vector, _obs_sc_vector))
+    # print("Dot: {} || N1: {} N2: {}".format(np.dot(_ph_sc_vector,_obs_sc_vector),np.linalg.norm(_ph_sc_vector,2), np.linalg.norm(_obs_sc_vector,2))) 
+    # print("Acos: {}, angle: {}".format(np.dot(_ph_sc_vector,_obs_sc_vector)/(np.linalg.norm(_ph_sc_vector,2)*np.linalg.norm(_obs_sc_vector,2)), np.arccos(np.dot(_ph_sc_vector,_obs_sc_vector)/(np.linalg.norm(_ph_sc_vector,2)*np.linalg.norm(_obs_sc_vector,2)))))
+    _ph_obs_angle_rad = np.arccos(np.clip(np.dot(_ph_sc_vector,_obs_sc_vector)/(np.linalg.norm(_ph_sc_vector,2)*np.linalg.norm(_obs_sc_vector,2)),-1,1))
+    # print("Obs angle (rad) {}".format(_ph_obs_angle_rad))
+    if _ph_obs_angle_rad < observation.satellite.instrument_fov_rad[observation.instrument]:
+        return True
+    else:
+        return False
 
 class ISLLink():
     def __init__(self, source: Satellite, destination: Satellite, time: dt.datetime):

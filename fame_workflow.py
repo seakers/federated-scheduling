@@ -8,6 +8,7 @@ from enum import Enum
 from fame_agents_base import *
 
 from matplotlib.pyplot import cm
+import matplotlib.dates as mdates
 
 from ortools.linear_solver import pywraplp
 
@@ -1224,14 +1225,28 @@ def plot_workflow_schedule(
         height_ratios.extend([1,]*num_timelines)
         fig, axes = plt.subplots(num_timelines+1,1, sharex=True, height_ratios=height_ratios, figsize=(12, int(math.ceil(.2*num_request_groups+num_timelines))))
     else:
-        for ax in axes:
-            ax.clear()
+        if type(axes)==plt.axes:
+            axes.clear()
+        else:
+            for ax in axes:
+                ax.clear()
 
     if num_timelines>0:
-        ax_tasks = axes[0]
-        ax_timelines = axes[1:]
+        if type(axes)==plt.axes:
+            ax_tasks = axes
+            ax_timelines = None
+        else: # Some iterable
+            ax_tasks = axes[0]
+            if len(axes)>1:
+                ax_timelines = axes[1:]
+            else:
+                ax_timelines = None
+
     else:
-        ax_tasks = axes
+        if type(axes)==plt.axes:
+            ax_tasks = axes
+        else:
+            ax_tasks = axes[0]
         ax_timelines = None
 
     ax_tasks.set_title(plot_title)
@@ -1324,23 +1339,26 @@ def plot_workflow_schedule(
 
                 ax_tasks.add_patch(plt.Rectangle((_min_time, y_coordinate), _max_time-_min_time, line_height, color=pass_color, alpha=pass_alpha))
 
-    timeline_ix = 0
-    for timeline in timeline_graph.nodes():
-        if type(timeline) == Timeline:
-            ax_timeline = ax_timelines[timeline_ix]
-            _tl_times = []
-            _tl_values = []
-            for impact in timeline.impact_container:
-                _tl_times.append(impact.time)
-                _tl_values.append(timeline.get_value_at(impact.time))
-            ax_timeline.plot(_tl_times, _tl_values, '-')
-            timeline_ix += 1
-            ax_timeline.set_ylabel(timeline.name,rotation=0, ha='right', va='center')
-            ax_timeline.grid()
+    if ax_timelines is not None:
+        timeline_ix = 0
+        for timeline in timeline_graph.nodes():
+            if type(timeline) == Timeline:
+                ax_timeline = ax_timelines[timeline_ix]
+                _tl_times = []
+                _tl_values = []
+                for impact in timeline.impact_container:
+                    _tl_times.append(impact.time)
+                    _tl_values.append(timeline.get_value_at(impact.time))
+                ax_timeline.plot(_tl_times, _tl_values, '-')
+                timeline_ix += 1
+                ax_timeline.set_ylabel(timeline.name,rotation=0, ha='right', va='center')
+                ax_timeline.grid()
 
     if ax_timelines is not None:
+        # ax_timelines.set_major_formatter(mdates.DateFormatter())
         ax_timelines[-1].tick_params(axis='x', labelrotation=90)
     else:
+        # ax_tasks.set_major_formatter(mdates.DateFormatter())
         ax_tasks.tick_params(axis='x', labelrotation=90)
     # ax_tasks.set_xlim(_all_requests_min_time, _all_requests_max_time)
 

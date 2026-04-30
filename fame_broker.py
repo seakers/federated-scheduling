@@ -44,6 +44,22 @@ class Broker():
                 _known_satellites_by_constellation[_sat] = constellation
         self._known_satellites = _known_satellites
         self._known_satellites_by_constellation = _known_satellites_by_constellation
+        self.workflow = None
+        self._workflow_graph = None
+        self._timeline_graph = None
+        self._workflow_schedule_epoch = 0
+
+    def __deepcopy__(self, memo):
+        new_broker = Broker(constellations=self.constellations, world=self.world, name=self.name)
+        memo[id(self)] = new_broker
+        # Manually deep copy 'data'
+        new_broker._requests = copy.deepcopy(self._requests, memo)
+        new_broker.workflow = copy.deepcopy(self.workflow, memo)
+        new_broker._workflow_graph = copy.deepcopy(self._workflow_graph, memo)
+        new_broker._timeline_graph = copy.deepcopy(self._timeline_graph, memo)
+        new_broker._workflow_schedule_epoch = copy.deepcopy(self._workflow_schedule_epoch, memo)
+
+        return new_broker
 
     def _screen_pass_for_feasibility(self, satellite: Satellite, _obs_pass: ObservationPass):
         # Check if a given pass conflicts with existing requests.
@@ -525,21 +541,22 @@ def request_statistics(requests_pd, display_unique_requests: bool=True):
             print("{}/{} ({}%) of all successful unique requests have a phenomenon detection".format(fulfilled_unique_requests_events_found_no, fulfilled_unique_requests_no, fulfilled_unique_requests_events_found_no/fulfilled_unique_requests_no*100))
 
 
+
 def plot_request_statistics(
         requests_pd,
+        axes: plt.axes = None,
         broker_name: str="",
         min_time: dt.datetime=None,
         max_time: dt.datetime=None,
-        constellation_colorer=None,
+        constellation_colors: dict={},
         MAX_RADIUS: float=50,
-        save_histogram_all: bool = True,
-        save_pie_all: bool = True,
-        save_histogram_successful: bool = True,
-        save_pie_successful: bool = True,
+        save_plots: bool = True,
         save_prefix: str = "media/Statistics_",
         save_suffix: str = ".png",
         ):
 
+    if len(requests_pd) == 0:
+        return
     if min_time is None:
         min_time = min(requests_pd['requested_pass'].apply(lambda x: x.highest.time if x is not None else None))
     if max_time is None:
@@ -557,21 +574,25 @@ def plot_request_statistics(
         for _constellation in all_constellations
     ]
 
+    if axes is None:
+        fig, axes = plt.subplots(2,2)
 
-    plt.figure()
-    plt.hist(request_times_by_constellation, bins=10, stacked=True, label=[c.name for c in all_constellations], color=[constellation_colorer(c.name) for c in all_constellations])
-    
-    plt.title(f"Requests by constellation for broker {broker_name}")
-    plt.xlabel('Date')
-    plt.ylabel('Frequency')
-    plt.legend()
-    plt.tight_layout()
-    if save_histogram_all:
-        plt.savefig(save_prefix+"_hist_all"+save_suffix, bbox_inches='tight')
+    # plt.figure()
+    if axes[0] is not None:
+        axes[0].hist(request_times_by_constellation, bins=10, stacked=True, label=[c.name for c in all_constellations], color=[constellation_colors.get(c.name, 'r') for c in all_constellations])
+        
+        axes[0].set_title(f"Requests")
+        axes[0].set_xlabel('Date')
+        axes[0].set_ylabel('Frequency')
+        axes[0].legend()
+        # axes[0].tight_layout()
 
-    plt.pie([len(rs) for rs in request_times_by_constellation], radius=sum([len(rs) for rs in request_times_by_constellation])/MAX_RADIUS, labels=[c.name for c in all_constellations], colors=[constellation_colorer(c.name) for c in all_constellations], autopct='%1.1f%%')
-    if save_pie_all:
-        plt.savefig(save_prefix+"_pie_all"+save_suffix, bbox_inches='tight')
+    if axes[1] is not None:
+        num_requests = sum([len(rs) for rs in request_times_by_constellation])
+        if num_requests>0:
+            axes[1].pie([len(rs) for rs in request_times_by_constellation], radius=sum([len(rs) for rs in request_times_by_constellation])/MAX_RADIUS, labels=[c.name for c in all_constellations], colors=[constellation_colors.get(c.name, 'r') for c in all_constellations], autopct='%1.1f%%')
+        else:
+            axes[1].set_axis_off        
 
     # A cumulative chart with successful requests by constellation vs. time
     successful_request_times_by_constellation = [
@@ -579,18 +600,92 @@ def plot_request_statistics(
         for _constellation in all_constellations
     ]
 
+    if axes[2] is not None:
+        axes[2].hist(successful_request_times_by_constellation, bins=10, stacked=True, label=[c.name for c in all_constellations], color=[constellation_colors.get(c.name, 'r') for c in all_constellations])
+        
+        axes[2].set_title(f"Successful request")
+        axes[2].set_xlabel('Date')
+        axes[2].set_ylabel('Frequency')
+        axes[2].legend()
+        # axes[2].tight_layout()
 
-    plt.figure()
-    plt.hist(successful_request_times_by_constellation, bins=10, stacked=True, label=[c.name for c in all_constellations], color=[constellation_colorer(c.name) for c in all_constellations])
+    if axes[3] is not None:
+        num_successful_requests = sum([len(rs) for rs in successful_request_times_by_constellation])
+        if num_successful_requests>0:
+            axes[3].pie([len(rs) for rs in successful_request_times_by_constellation], radius=num_successful_requests/MAX_RADIUS, labels=[c.name for c in all_constellations], colors=[constellation_colors.get(c.name, 'r') for c in all_constellations], autopct='%1.1f%%')
+        else:
+            axes[3].set_axis_off    
+
+    if save_plots:
+        plt.savefig(save_prefix+save_suffix, bbox_inches='tight')
+
     
-    plt.title(f"Successful request by constellation for broker {broker_name}")
-    plt.xlabel('Date')
-    plt.ylabel('Frequency')
-    plt.legend()
-    plt.tight_layout()
-    if save_histogram_successful:
-        plt.savefig(save_prefix+"_hist_successful"+save_suffix, bbox_inches='tight')
+# def plot_chronicle(
+#         chronicle: dict,
+#         constellation_colorer=lambda constellation: 'r',
+#         satellite_colors: dict={},
+#         satellite_markers: dict={},
+#         constellation_colors: dict={},
+#         plot_time: bool=True,
+#         plot_phenomena: bool=True,
+#         plot_ground_stations: bool=True,
+#         plot_satellites: bool=True,
+#         plot_satellite_tracks: bool=True,
+#         plot_observation_gaze: bool=True,
+#         plot_observation_target: bool=True,
+#         plot_observation_footprint: bool=True,
+#         plot_comm_gaze: bool=True,
+#         plot_comm_station: bool=True,
+#         show_night: bool=False,
+#         show_night_location: Location= Location(-118,34, 0),
+#         ):
 
-    plt.pie([len(rs) for rs in successful_request_times_by_constellation], radius=sum([len(rs) for rs in successful_request_times_by_constellation])/MAX_RADIUS, labels=[c.name for c in all_constellations], colors=[constellation_colorer(c.name) for c in all_constellations], autopct='%1.1f%%')
-    if save_pie_successful:
-        plt.savefig(save_prefix+"_pie_successful"+save_suffix, bbox_inches='tight')
+#     num_brokers = len(chronicle['brokers'])
+#     top_mosaic_row = ["Event"]
+#     top_mosaic_row.extend([f"Broker {i} events" for i in range(num_brokers)])
+#     mid_mosaic_row = ["Event"]
+#     mid_mosaic_row.extend([f"Broker {i} timeline" for i in range(num_brokers)])
+#     bottom_mosaic_row = ["."]
+#     bottom_mosaic_row.extend([f"Broker {i} stats" for i in range(num_brokers)])
+#     mosaic_rows = [top_mosaic_row, mid_mosaic_row, bottom_mosaic_row]
+#     fig, axes = plt.subplot_mosaic(mosaic_rows)
+    
+#     # Plot the event: satellites overhead, observations
+#     plot_event(
+#         _chronicle=chronicle,
+#         world=World,
+#         ax=axes['Event'],
+#         satellite_colors=satellite_colors,
+#         satellite_markers=satellite_markers,
+#         constellation_colors=constellation_colors,
+#         plot_time=plot_time,
+#         plot_phenomena=plot_phenomena,
+#         plot_satellite_tracks=plot_satellite_tracks,
+#         plot_ground_stations=plot_ground_stations,
+#         plot_observation_gaze=plot_observation_gaze,
+#         plot_observation_target=plot_observation_target,
+#         plot_satellites=plot_satellites,
+#         plot_observation_footprint=plot_observation_footprint,
+#         plot_comm_gaze=plot_comm_gaze,
+#         plot_comm_station=plot_comm_station,
+#         )
+#     # For each broker, plot the schedule, at the current time
+#     for broker_ix, broker in enumerate(chronicle['brokers']):
+#         plot_workflow_schedule(
+#             workflow_graph=broker._workflow_graph,
+#             timeline_graph=broker._timeline_graph,
+#             axes=[axes[f"Broker {broker_ix} events"], axes[f"Broker {broker_ix} timeline"]],
+#             time=chronicle['time'],
+#             feasibility_screener=broker._screen_pass_for_feasibility,
+#             plot_title=f"{broker.name} (epoch {broker._workflow_schedule_epoch})",
+#             show_night=show_night,
+#             show_night_location=show_night_location,
+#             save_schedule_plot=False,
+#             # save_name = "Schedule_e{}_{}.pdf".format(self._workflow_schedule_epoch, self.world.time)
+#             )
+#         # Plot the statistics, histograms
+#         dump_fig, dump_axes = plt.subplots(3,1)
+#         stats_axes = [axes[[f"Broker {broker_ix} stats"]], dump_axes[0], dump_axes[1], dump_axes[2]]
+#         plot_request_statistics(broker._requests, axes=stats_axes, constellation_colorer=constellation_colorer)
+
+#     # Plot the tracker distributions
