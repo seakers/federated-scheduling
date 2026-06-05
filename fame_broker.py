@@ -9,6 +9,7 @@ import pandas as pd
 import bisect
 import uuid
 from enum import Enum
+from collections.abc import Callable
 
 from fame_geometry import *
 import copy
@@ -23,6 +24,43 @@ from fame_constellation_scheduler import ConstellationGroundScheduler, Observati
 
 from fame_workflow import *
 
+import copy
+import pickle
+
+def find_unpicklable(obj, path="root"):
+    """
+    Recursively traverses an object to find exactly what cannot be pickled/deepcopied.
+    """
+    try:
+        # Try to pickle the current object
+        print(f"Path: {path}")
+        copy.deepcopy(obj)
+    except (pickle.PicklingError, TypeError) as e:
+        # If it's a container, dig deeper to find the exact culprit
+        
+        # 1. If it's a dictionary
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                find_unpicklable(value, f"{path}['{key}']")
+            return
+            
+        # 2. If it's a list, tuple, or set
+        if isinstance(obj, (list, tuple, set)):
+            for i, item in enumerate(obj):
+                find_unpicklable(item, f"{path}[{i}]")
+            return
+            
+        # 3. If it's a standard object with attributes
+        if hasattr(obj, '__dict__'):
+            for attr, value in obj.__dict__.items():
+                find_unpicklable(value, f"{path}.{attr}")
+            return
+            
+        # If it has no children but still failed, this is the leaf node causing the issue!
+        print(f"❌ Unpicklable object found at: {path}")
+        print(f"   Type: {type(obj)}")
+        print(f"   Error: {e}\n")
+
 class Broker():
     def __init__(
             self,
@@ -35,6 +73,7 @@ class Broker():
         # self.known_satellites = known_satellites
         self.world = world
         self._requests = pd.DataFrame(columns=['request', 'requested_pass', 'requested_constellation', 'requested_satellite', 'constellation', 'satellite', 'assigned_pass', 'assigned_downlink', 'status', 'data_product', 'scheduled_callback', 'unscheduled_callback', 'ready_callback'])
+        
 
         _known_satellites = []
         _known_satellites_by_constellation = {}
@@ -42,8 +81,12 @@ class Broker():
             _known_satellites += constellation.satellites
             for _sat in constellation.satellites:
                 _known_satellites_by_constellation[_sat] = constellation
-        self._known_satellites = _known_satellites
+
+                self._known_satellites = _known_satellites
         self._known_satellites_by_constellation = _known_satellites_by_constellation
+
+        self._satellite_busy_timelines = {ks: AssignmentTimeline(name=ks.name, initial_time=world.time, initial_value=False) for ks in self._known_satellites}
+
         self.workflow = None
         self._workflow_graph = None
         self._timeline_graph = None
@@ -54,31 +97,54 @@ class Broker():
         memo[id(self)] = new_broker
         # Manually deep copy 'data'
         new_broker._requests = copy.deepcopy(self._requests, memo)
+        new_broker._satellite_busy_timelines = copy.deepcopy(self._satellite_busy_timelines, memo)
+
         new_broker.workflow = copy.deepcopy(self.workflow, memo)
         new_broker._workflow_graph = copy.deepcopy(self._workflow_graph, memo)
-        new_broker._timeline_graph = copy.deepcopy(self._timeline_graph, memo)
+        # try:
+        # new_broker._timeline_graph = copy.deepcopy(self._timeline_graph, memo)
+        new_broker._timeline_graph = nx.create_empty_copy(self._timeline_graph, with_data=False)
+        try:
+            new_broker._timeline_graph.add_nodes_from(copy.deepcopy([n for n in self._timeline_graph.nodes()]))
+        except Exception as e:
+            print("Error! Could not deepcopy timeline graph.")
+            # find_unpicklable(self._timeline_graph)
+            import pdb; pdb.set_trace()
         new_broker._workflow_schedule_epoch = copy.deepcopy(self._workflow_schedule_epoch, memo)
 
         return new_broker
 
     def _screen_pass_for_feasibility(self, satellite: Satellite, _obs_pass: ObservationPass):
         # Check if a given pass conflicts with existing requests.
-        # TODO this is horrifyingly expensive because we do not exploit the fact that
-        #  requests are sorted. We should improve this, ideally without rebuilding a full on timeline library.
-        if len(self._requests):
-            conflicting_requests = self._requests.loc[
-                self._requests.apply(
-                lambda x: 
-                    (x['status'] != ObservationStatus.DATA_RECEIVED) and # We have submitted this, or it's scheduled, OR IT FAILED TO SCHEDULE (which suggests this is a bad time)
-                    (x['requested_pass'] is not None) and
-                    (x['requested_satellite'] is not None) and
-                    (x['requested_pass'].highest.time+x['requested_pass'].highest.duration > _obs_pass.rise.time) and # The end of the other observation is after we start
-                    (x['requested_pass'].highest.time < _obs_pass.fall.time) and # The start of the other observation is before we end
-                    (x['requested_satellite'] == satellite) # This request is on the same satellite. Note that we check these are the same OBJECT, not just the same name.
-                , axis=1)]
-            if len(conflicting_requests):
-                return False
+
+        # Check that:
+        # - The satellite is free at the beginning of the pass
+        # - There is nothing between the beginning and the end of the pass
+        if (self._satellite_busy_timelines[satellite].get_value_at(_obs_pass.rise.time) == True):
+            return False
+        start_time_index = bisect.bisect(self._satellite_busy_timelines[satellite].impact_container, _obs_pass.rise.time, key=lambda x: x.time)
+        end_time_index = bisect.bisect(self._satellite_busy_timelines[satellite].impact_container, _obs_pass.fall.time, key=lambda x: x.time)
+        if (start_time_index != end_time_index): # Something is happening
+            return False
         return True
+
+        # # TODO this is horrifyingly expensive because we do not exploit the fact that
+        # #  requests are sorted. We should improve this, ideally without rebuilding a full on timeline library.
+        # if len(self._requests):
+        #     conflicting_requests = self._requests.loc[
+        #         self._requests.apply(
+        #         lambda x: 
+        #             (x['status'] != ObservationStatus.DATA_RECEIVED) and # We have submitted this, or it's scheduled, OR IT FAILED TO SCHEDULE (which suggests this is a bad time)
+        #             (x['requested_pass'] is not None) and
+        #             (x['requested_satellite'] is not None) and
+        #             (x['requested_pass'].highest.time+x['requested_pass'].highest.duration > _obs_pass.rise.time) and # The end of the other observation is after we start
+        #             (x['requested_pass'].highest.time < _obs_pass.fall.time) and # The start of the other observation is before we end
+        #             (x['requested_satellite'] == satellite) # This request is on the same satellite. Note that we check these are the same OBJECT, not just the same name.
+        #         , axis=1)]
+        #     if len(conflicting_requests):
+        #         return False
+        # return True
+
 
     # Broadly, look at the ephemerides, find the best option, find the corresponding constellation, give them a window around that.
     def schedule_request(
@@ -111,11 +177,6 @@ class Broker():
             sorted_passes = [(satellite, satpass) for satellite, satpasses in passes.items() for satpass in satpasses if len(satpasses)]
             # Sort by quality
             sorted_passes.sort(key=lambda x: observation_quality(x[1].highest), reverse=True)
-            
-            # Something strange here. Can passes be of length>0 but sorted_passes be empty?
-            _best_satellite = sorted_passes[0][0]
-
-            _best_pass = sorted_passes[0][1]
 
             print("Best request: {} with {}".format(_best_pass, _best_satellite))
         else:
@@ -139,7 +200,6 @@ class Broker():
             _pdrequest = pd.DataFrame([_request_dict])
             self._requests = pd.concat([self._requests, _pdrequest], ignore_index=True)
 
-            # self._requests.loc[self._requests['request']==request, 'status'] = "No observation opportunities"
             return -1
 
         successful_submissions_for_this_request = 0
@@ -226,6 +286,9 @@ class Broker():
                 }
                 _pdrequest = pd.DataFrame([_request_dict])
                 self._requests = pd.concat([self._requests, _pdrequest], ignore_index=True)
+
+                self._satellite_busy_timelines[_best_satellite].add_impact(Impact(time=_best_pass.highest.time, type=ImpactType.ASSIGNMENT, value=True))
+                self._satellite_busy_timelines[_best_satellite].add_impact(Impact(time=_best_pass.highest.time+_best_pass.highest.duration, type=ImpactType.ASSIGNMENT, value=False))
 
                 # Submit the request to the relevant constellation
                 _best_constellation.schedule_request(
@@ -401,6 +464,33 @@ class Broker():
 
                 return
             
+            def callback_request_timed_out(_request=request, __best_pass=_best_pass, __best_constellation=_best_constellation, _dispatchable_task=dispatchable_task):
+                
+                requests_still_awaiting_data = self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass) & ((self._requests['status']==ObservationStatus.SUBMITTED) | (self._requests['status']==ObservationStatus.SCHEDULED)))]
+                if len(requests_still_awaiting_data):
+                    print(" [{}] timeout for request {}, pass {}, from {}".format(self.name, request, __best_pass, __best_constellation.name))
+                    requests_still_awaiting_data['assigned_pass'] = None
+                    requests_still_awaiting_data['status'] = ObservationStatus.TIMEOUT
+                    requests_still_awaiting_data['constellation'] = None
+                    requests_still_awaiting_data['satellite'] = None
+                    _dispatchable_task.scheduled = False
+                    _dispatchable_task.dispatched = False
+                    follow_up_action_failure(ObservationStatus.TIMEOUT)
+                    # Recurse
+                    self.schedule_workflow(
+                        current_time=self.world.time,
+                        use_ilp=use_ilp,
+                        plot_schedule=plot_schedule,
+                        plot_axes=plot_axes,
+                        plot_night_in_schedule=plot_night_in_schedule,
+                        plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
+                        max_solver_time_s=max_solver_time_s,
+                        receding_horizon_duration=receding_horizon_duration,
+                        save_schedule_plot=save_schedule_plot,
+                    )
+
+                return
+            
             def callback_request_ready(data_product,  _request=request, __best_pass=_best_pass, __best_constellation=_best_constellation, _dispatchable_task=dispatchable_task):
                 print(" [{}: ] data ready for request {}, pass {}, from {}".format(self.name, _request, __best_pass, __best_constellation.name))
                 self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = ObservationStatus.DATA_RECEIVED
@@ -476,7 +566,14 @@ class Broker():
             _pdrequest = pd.DataFrame([_request_dict])
             self._requests = pd.concat([self._requests, _pdrequest], ignore_index=True)
 
+            self._satellite_busy_timelines[_best_satellite].add_impact(Impact(time=_best_pass.highest.time, type=ImpactType.ASSIGNMENT, value=True))
+            self._satellite_busy_timelines[_best_satellite].add_impact(Impact(time=_best_pass.highest.time+_best_pass.highest.duration, type=ImpactType.ASSIGNMENT, value=False))
+
             # Submit the request to the relevant constellation
+            #  Mark the task as dispatched. This will prevent re-scheduling even if we do not get an ack right away
+            dispatchable_task.scheduled = True
+            dispatchable_task.dispatched = True
+
             _best_constellation.schedule_request(
                 request=_constellation_request,
                 current_time=current_time,
@@ -485,8 +582,20 @@ class Broker():
                 callback_request_ready=callback_request_ready,
                 phenomenon_processor=dispatchable_task.phenomenon_processor,
             )
-            # Note that, if the call above fails, we will immediately receive a reply, via the callback, that will trigger another reschedule - while we are still dispatching things here!
 
+            # Note that, if the call above fails, we will immediately receive a reply, via the callback, that will trigger another reschedule - while we are still dispatching things here!
+            
+            # Set up a callback where, if the request is not acknowledged, we give it up as a bad job.
+            
+            timeout_time = _best_pass.fall.time + dt.timedelta(minutes=1)
+            if dispatchable_task.downlink_pass is not None:
+                timeout_time = dispatchable_task.downlink_pass.fall.time + dt.timedelta(minutes=1)
+            event_check_dispatch_timeout = Event(
+                time=timeout_time,
+                action_callable=callback_request_timed_out,
+                name=f"Check timeout {request.name}"
+            )
+            self.world.add_event(event_check_dispatch_timeout)
 
 def request_statistics(requests_pd, display_unique_requests: bool=True):
     total_requests_no = len(requests_pd)
@@ -540,12 +649,11 @@ def request_statistics(requests_pd, display_unique_requests: bool=True):
         if fulfilled_unique_requests_no>0:
             print("{}/{} ({}%) of all successful unique requests have a phenomenon detection".format(fulfilled_unique_requests_events_found_no, fulfilled_unique_requests_no, fulfilled_unique_requests_events_found_no/fulfilled_unique_requests_no*100))
 
-
-
 def plot_request_statistics(
         requests_pd,
         axes: plt.axes = None,
         broker_name: str="",
+        bin_dt_width: dt.timedelta=dt.timedelta(hours=1),
         min_time: dt.datetime=None,
         max_time: dt.datetime=None,
         constellation_colors: dict={},
@@ -553,6 +661,8 @@ def plot_request_statistics(
         save_plots: bool = True,
         save_prefix: str = "media/Statistics_",
         save_suffix: str = ".png",
+        show_titles: bool = True,
+        show_percentages: bool = True,
         ):
 
     if len(requests_pd) == 0:
@@ -562,6 +672,7 @@ def plot_request_statistics(
     if max_time is None:
         max_time = max(requests_pd['requested_pass'].apply(lambda x: x.highest.time if x is not None else None))
 
+    histogram_bins = mdates.drange(min_time, max_time+bin_dt_width, bin_dt_width)
 
     sliced_requests_by_time_mask = requests_pd.apply(lambda row: ((row['requested_pass'].highest.time>=min_time) and (row['requested_pass'].highest.time<=max_time)), axis=1)
 
@@ -577,22 +688,43 @@ def plot_request_statistics(
     if axes is None:
         fig, axes = plt.subplots(2,2)
 
-    # plt.figure()
     if axes[0] is not None:
-        axes[0].hist(request_times_by_constellation, bins=10, stacked=True, label=[c.name for c in all_constellations], color=[constellation_colors.get(c.name, 'r') for c in all_constellations])
+        axes[0].hist(
+            request_times_by_constellation,
+            bins=histogram_bins,
+            stacked=True,
+            label=[c.name for c in all_constellations],
+            color=[constellation_colors.get(c.name, 'r') for c in all_constellations]
+        )
         
-        axes[0].set_title(f"Requests")
-        axes[0].set_xlabel('Date')
-        axes[0].set_ylabel('Frequency')
+        if show_titles:
+            axes[0].set_title(f"Requests for broker {broker_name}")
+            axes[0].set_xlabel('Date')
+            axes[0].set_ylabel('Frequency')
         axes[0].legend()
+        axes[0].tick_params(axis='x', labelrotation=45)
         # axes[0].tight_layout()
+
+    pie_autopct_str = ''
+    pie_labeldistance=None
+    if show_percentages:
+        pie_autopct_str = '%1.1f%%'
+        pie_labeldistance=1.1
+
 
     if axes[1] is not None:
         num_requests = sum([len(rs) for rs in request_times_by_constellation])
         if num_requests>0:
-            axes[1].pie([len(rs) for rs in request_times_by_constellation], radius=sum([len(rs) for rs in request_times_by_constellation])/MAX_RADIUS, labels=[c.name for c in all_constellations], colors=[constellation_colors.get(c.name, 'r') for c in all_constellations], autopct='%1.1f%%')
+            axes[1].pie(
+                [len(rs) for rs in request_times_by_constellation],
+                radius=sum([len(rs) for rs in request_times_by_constellation])/MAX_RADIUS,
+                labels=[c.name for c in all_constellations],
+                colors=[constellation_colors.get(c.name, 'r') for c in all_constellations],
+                autopct=pie_autopct_str,
+                labeldistance=pie_labeldistance,
+                )
         else:
-            axes[1].set_axis_off        
+            axes[1].set_axis_off()
 
     # A cumulative chart with successful requests by constellation vs. time
     successful_request_times_by_constellation = [
@@ -601,24 +733,40 @@ def plot_request_statistics(
     ]
 
     if axes[2] is not None:
-        axes[2].hist(successful_request_times_by_constellation, bins=10, stacked=True, label=[c.name for c in all_constellations], color=[constellation_colors.get(c.name, 'r') for c in all_constellations])
+        axes[2].hist(
+            successful_request_times_by_constellation,
+            bins=histogram_bins,
+            stacked=True,
+            label=[c.name for c in all_constellations],
+            color=[constellation_colors.get(c.name, 'r') for c in all_constellations]
+        )
         
-        axes[2].set_title(f"Successful request")
-        axes[2].set_xlabel('Date')
-        axes[2].set_ylabel('Frequency')
+        if show_titles:
+            axes[2].set_title(f"Successful request for broker {broker_name}")
+            axes[2].set_xlabel('Date')
+            axes[2].set_ylabel('Frequency')
         axes[2].legend()
+        axes[2].tick_params(axis='x', labelrotation=45)
         # axes[2].tight_layout()
 
     if axes[3] is not None:
         num_successful_requests = sum([len(rs) for rs in successful_request_times_by_constellation])
         if num_successful_requests>0:
-            axes[3].pie([len(rs) for rs in successful_request_times_by_constellation], radius=num_successful_requests/MAX_RADIUS, labels=[c.name for c in all_constellations], colors=[constellation_colors.get(c.name, 'r') for c in all_constellations], autopct='%1.1f%%')
+            axes[3].pie(
+                [len(rs) for rs in successful_request_times_by_constellation],
+                radius=num_successful_requests/MAX_RADIUS,
+                labels=[c.name for c in all_constellations],
+                colors=[constellation_colors.get(c.name, 'r') for c in all_constellations],
+                autopct=pie_autopct_str,
+                labeldistance=pie_labeldistance,
+                )
         else:
-            axes[3].set_axis_off    
+            axes[3].set_axis_off() 
 
     if save_plots:
         plt.savefig(save_prefix+save_suffix, bbox_inches='tight')
 
+    
     
 # def plot_chronicle(
 #         chronicle: dict,

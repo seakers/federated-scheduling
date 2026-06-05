@@ -9,6 +9,7 @@ import pandas as pd
 import bisect
 import uuid
 from enum import Enum
+import random
 
 from fame_geometry import *
 import copy
@@ -17,16 +18,22 @@ import requests
 import urllib
 import json
 
+from fame_workflow import AssignmentTimeline, Impact, ImpactType
+
 from fame_agents_base import *
 
 class ConstellationGroundScheduler():
-    def __init__(self, satellites: list, ground_stations: list, world, name="Constellation"):
+    def __init__(self, satellites: list, ground_stations: list, world, name="Constellation", ack_probability_if_scheduled: float=1., ack_probability_if_unscheduled: float=1.,):
         self.name = name
         self.satellites = satellites
         self.ground_stations = ground_stations
         self.world = world
         # self.requests = {}
         self._requests = pd.DataFrame(columns=requests_data_frame_columns)
+        self.ack_probability_if_scheduled = ack_probability_if_scheduled
+        self.ack_probability_if_unscheduled = ack_probability_if_unscheduled
+        self._satellite_busy_timelines_obs  = {ks: AssignmentTimeline(name=ks.name, initial_time=world.time, initial_value=False) for ks in self.satellites}
+        self._satellite_busy_timelines_comm = {ks: AssignmentTimeline(name=ks.name, initial_time=world.time, initial_value=False) for ks in self.satellites}
 
     def __str__(self):
         return f"Constellation scheduler {self.name} with {len(self.satellites)} satellites"
@@ -34,16 +41,55 @@ class ConstellationGroundScheduler():
         return self.__str__()
     
     def __deepcopy__(self, memo):
-        new_constellation = ConstellationGroundScheduler(satellites=self.satellites, ground_stations=self.ground_stations, world=self.world, name=self.name)
+        new_constellation = ConstellationGroundScheduler(satellites=self.satellites, ground_stations=self.ground_stations, world=self.world, name=self.name, ack_probability_if_scheduled=self.ack_probability_if_scheduled, ack_probability_if_unscheduled=self.ack_probability_if_unscheduled)
         new_constellation._requests = copy.deepcopy(self._requests, memo)
+        new_constellation._satellite_busy_timelines_obs = copy.deepcopy(self._satellite_busy_timelines_obs, memo)
+        new_constellation._satellite_busy_timelines_comm = copy.deepcopy(self._satellite_busy_timelines_comm, memo)
+
         return new_constellation
 
-
     def screen_opportunity_for_feasibility(self, satellite: Satellite, _request: ObservationRequest, screen_against_comm_passes:bool=True):
-        return screen_opportunity_for_feasibility(existing_requests=self._requests, satellite=satellite, _request=_request, screen_against_comm_passes=screen_against_comm_passes, log_prefix=self.name)
+        # Check that:
+        # - The satellite is free at the beginning of the pass
+        # - There is nothing between the beginning and the end of the pass
+        if (self._satellite_busy_timelines_obs[satellite].get_value_at(_request.time) == True):
+            return False
+        start_time_index = bisect.bisect(self._satellite_busy_timelines_obs[satellite].impact_container, _request.time, key=lambda x: x.time)
+        end_time_index = bisect.bisect(self._satellite_busy_timelines_obs[satellite].impact_container, _request.time+_request.duration, key=lambda x: x.time)
+        if (start_time_index != end_time_index): # Something is happening
+            return False
+        if screen_against_comm_passes:
+            if (self._satellite_busy_timelines_comm[satellite].get_value_at(_request.time) == True):
+                return False
+            start_time_index = bisect.bisect(self._satellite_busy_timelines_comm[satellite].impact_container, _request.time, key=lambda x: x.time)
+            end_time_index = bisect.bisect(self._satellite_busy_timelines_comm[satellite].impact_container, _request.time+_request.duration, key=lambda x: x.time)
+            if (start_time_index != end_time_index): # Something is happening
+                return False
+        return True
+        
+        # return screen_opportunity_for_feasibility(existing_requests=self._requests, satellite=satellite, _request=_request, screen_against_comm_passes=screen_against_comm_passes, log_prefix=self.name)
     
     def screen_pass_for_feasibility(self, satellite: Satellite,  _obs_pass: ObservationPass, screen_against_comm_passes:bool=False):
-        return screen_pass_for_feasibility(existing_requests=self._requests, satellite=satellite, _obs_pass=_obs_pass, screen_against_comm_passes=screen_against_comm_passes, log_prefix=self.name)
+
+        # Check that:
+        # - The satellite is free at the beginning of the pass
+        # - There is nothing between the beginning and the end of the pass
+        if (self._satellite_busy_timelines_obs[satellite].get_value_at(_obs_pass.rise.time) == True):
+            return False
+        start_time_index = bisect.bisect(self._satellite_busy_timelines_obs[satellite].impact_container, _obs_pass.rise.time, key=lambda x: x.time)
+        end_time_index = bisect.bisect(self._satellite_busy_timelines_obs[satellite].impact_container,   _obs_pass.fall.time, key=lambda x: x.time)
+        if (start_time_index != end_time_index): # Something is happening
+            return False
+        if screen_against_comm_passes:
+            if (self._satellite_busy_timelines_comm[satellite].get_value_at(_obs_pass.rise.time) == True):
+                return False
+            start_time_index = bisect.bisect(self._satellite_busy_timelines_comm[satellite].impact_container, _obs_pass.rise.time, key=lambda x: x.time)
+            end_time_index = bisect.bisect(self._satellite_busy_timelines_comm[satellite].impact_container,   _obs_pass.fall.time, key=lambda x: x.time)
+            if (start_time_index != end_time_index): # Something is happening
+                return False
+        return True
+
+        # return screen_pass_for_feasibility(existing_requests=self._requests, satellite=satellite, _obs_pass=_obs_pass, screen_against_comm_passes=screen_against_comm_passes, log_prefix=self.name)
 
     def schedule_request(
             self,
@@ -70,10 +116,8 @@ class ConstellationGroundScheduler():
             'ready_callback': callback_request_ready,
         }
 
-        try:
-            _pdrequest = pd.DataFrame([_request_dict])
-        except Exception as e:
-            import pdb; pdb.set_trace()
+        _pdrequest = pd.DataFrame([_request_dict])
+
 
         self._requests = pd.concat([self._requests, _pdrequest], ignore_index=True)
               
@@ -97,12 +141,15 @@ class ConstellationGroundScheduler():
                 _best_downlink_comm_opportunity = None
                 _best_downlink_comm_opportunity_station = None
 
-                # TODO this O(n) search is ridiculous. We should:
+                # To find the best pass, we:
                 # - Sort by quality
                 # - Check feasibility going down the list
                 # - Return the first feasible entry 
-                for satellite, satpasses in passes.items():
-                    for satpass in satpasses:
+
+                sorted_passes = [(satellite, satpass) for satellite, satpasses in passes.items() for satpass in satpasses if len(satpasses)]
+                sorted_passes.sort(key=lambda x: observation_quality(x[1].highest), reverse=True)
+
+                for satellite, satpass in sorted_passes:
                         # Check if the satellite is free at this time.
                         # Query the table of observations for 1. planned, 2. on the satellite we are examining.
                         # Check by time if there is something nearby.
@@ -113,7 +160,7 @@ class ConstellationGroundScheduler():
 
                         _quality = observation_quality(satpass.highest)
 
-                        # TODO if satellite has continuous ISL, skip the uplink and downlink search
+                        # If satellite has continuous ISL, skip the uplink and downlink search
                         
                         if (satellite.has_continuous_isl_to_ground == True):
                             earliest_ul_opportunity = "ISL"
@@ -180,26 +227,29 @@ class ConstellationGroundScheduler():
                                 print("Could not find a suitable unconflicted downlink")
                                 continue
 
-                        if _quality >= _best_quality:
-                            _best_quality = _quality
-                            _best_satellite = satellite
-                            _best_pass = satpass
-                            _best_uplink_comm_opportunity = earliest_ul_opportunity
-                            _best_uplink_comm_opportunity_station = earliest_ul_opportunity_station
-                            _best_downlink_comm_opportunity = dl_pass
-                            _best_downlink_comm_opportunity_station = dl_station
-                        # print("{}: quality {}".format(satpass.highest, observation_quality(satpass.highest)))
+                        # if _quality >= _best_quality:
+                        _best_quality = _quality
+                        _best_satellite = satellite
+                        _best_pass = satpass
+                        _best_uplink_comm_opportunity = earliest_ul_opportunity
+                        _best_uplink_comm_opportunity_station = earliest_ul_opportunity_station
+                        _best_downlink_comm_opportunity = dl_pass
+                        _best_downlink_comm_opportunity_station = dl_station
+                        # If we get here, then we have a complete solution. Since we sorted by quality, we can just stop.
+                        break 
 
                 print(" [{}] Best request: {} with {}".format(self.name, _best_pass, _best_satellite))
                 if (_best_pass is None):
                     print("   All observation opportunities are conflicting")
                     self._requests.loc[self._requests['request']==request, 'status'] = ObservationStatus.ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING
-                    callback_request_unscheduled(ObservationStatus.ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING)
+                    if (random.random()<self.ack_probability_if_unscheduled):
+                        callback_request_unscheduled(ObservationStatus.ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING)
                     return -5
             else:
                 print("No observation opportunities here")
                 self._requests.loc[self._requests['request']==request, 'status'] = ObservationStatus.NO_OBSERVATION_OPPORTUNITIES
-                callback_request_unscheduled(ObservationStatus.NO_OBSERVATION_OPPORTUNITIES)
+                if (random.random()<self.ack_probability_if_unscheduled):
+                    callback_request_unscheduled(ObservationStatus.NO_OBSERVATION_OPPORTUNITIES)
                 return -1
         else:
             print("Something wrong with requests list, did you pass a request?")
@@ -211,8 +261,8 @@ class ConstellationGroundScheduler():
         if (_best_sat_object is None):
             print("ERROR! Something wrong with finding the satellite")
             self._requests.loc[self._requests['request']==request, 'status'] = ObservationStatus.COULD_NOT_FIND_BEST_SATELLITE
-
-            callback_request_unscheduled(ObservationStatus.COULD_NOT_FIND_BEST_SATELLITE)
+            if (random.random()<self.ack_probability_if_unscheduled):
+                callback_request_unscheduled(ObservationStatus.COULD_NOT_FIND_BEST_SATELLITE)
             return -3
         #
 
@@ -240,7 +290,22 @@ class ConstellationGroundScheduler():
         self._requests.loc[self._requests['request']==request, 'downlink'] = _best_downlink_comm_opportunity
         self._requests.loc[self._requests['request']==request, 'status'] = ObservationStatus.SCHEDULED
 
-        callback_request_scheduled(_best_pass.highest)
+        # Change sat busy timeline accordingly. Add busy around:
+        # - Observation
+        # - Uplink
+        # - Downlink
+
+        self._satellite_busy_timelines_obs[_best_sat_object].add_impact(Impact(time=_best_pass.highest.time, type=ImpactType.ASSIGNMENT, value=True))
+        self._satellite_busy_timelines_obs[_best_sat_object].add_impact(Impact(time=_best_pass.highest.time+_best_pass.highest.duration, type=ImpactType.ASSIGNMENT, value=False))
+        if type(_best_uplink_comm_opportunity) == ObservationPass:
+            self._satellite_busy_timelines_comm[_best_sat_object].add_impact(Impact(time=_best_uplink_comm_opportunity.rise.time, type=ImpactType.ASSIGNMENT, value=True))
+            self._satellite_busy_timelines_comm[_best_sat_object].add_impact(Impact(time=_best_uplink_comm_opportunity.fall.time, type=ImpactType.ASSIGNMENT, value=False))
+        if type(_best_downlink_comm_opportunity) == ObservationPass:
+            self._satellite_busy_timelines_comm[_best_sat_object].add_impact(Impact(time=_best_downlink_comm_opportunity.rise.time, type=ImpactType.ASSIGNMENT, value=True))
+            self._satellite_busy_timelines_comm[_best_sat_object].add_impact(Impact(time=_best_downlink_comm_opportunity.fall.time, type=ImpactType.ASSIGNMENT, value=False))
+
+        if (random.random()<self.ack_probability_if_scheduled):
+            callback_request_scheduled(_best_pass.highest)
         return 0
 
     def unschedule_request(

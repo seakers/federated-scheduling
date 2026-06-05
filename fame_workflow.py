@@ -92,7 +92,7 @@ class ConstrainedObservationRequest():
             name: str = "",
             max_num_instances: int=1,
             rewarder= lambda _observation: observation_quality(_observation),
-            plotting_group: str = None
+            request_group: str = None
             ):
         """_summary_
 
@@ -123,6 +123,8 @@ class ConstrainedObservationRequest():
         self.observation_opportunity: ObservationOpportunity = None
         self.observation_opportunity_pass: ObservationPass = None
         self.observation_opportunity_satellite: Satellite = None
+        self.uplink_pass: ObservationPass = None
+        self.downlink_pass: ObservationPass = None
         self.observation_opportunities = {}
         self.scheduled: bool = False
         self.feasible: bool = True
@@ -132,9 +134,9 @@ class ConstrainedObservationRequest():
         self.successful_execution: bool = False
         self.phenomenon_processor = phenomenon_processor
         self.name = name
-        if plotting_group is None:
-            plotting_group = self.name
-        self.plotting_group = plotting_group
+        if request_group is None:
+            request_group = self.name
+        self.request_group = request_group
         self.max_num_instances = max_num_instances
         self.rewarder = rewarder
 
@@ -268,21 +270,27 @@ class Timeline():
             Impact(new_initial_time, ImpactType.RATE_ADDITION, new_initial_rate)
         ]
 
-# class AssignmentTimeline(Timeline):
-#     def __init__(self, name: str, initial_time: dt.datetime, initial_value: bool):
-#         super().__init__(name, initial_time=initial_time, initial_value=initial_value)
+class AssignmentTimeline(Timeline):
+    def __init__(self, name: str, initial_time: dt.datetime, initial_value: bool):
+        super().__init__(name, initial_time=initial_time, initial_value=initial_value, initial_rate=0.)
 
-#     def add_impact(self, impact: Impact):
-#         assert (impact.type == ImpactType.ASSIGNMENT), "ERROR: non-assignment impact on assignment timeline"
-#         bisect.insort(self.impact_container, impact, key=lambda x: x.time)
+    def add_impact(self, impact: Impact):
+        assert (impact.type == ImpactType.ASSIGNMENT), "ERROR: non-assignment impact on assignment timeline"
+        bisect.insort(self.impact_container, impact, key=lambda x: x.time)
     
-#     def consolidate_impacts(self, time: dt.datetime):
-#         closest_index = bisect.bisect(self.impact_container, time, key=lambda x: x.time)
-#         self.impact_container= self.impact_container[closest_index:]
+    def consolidate_impacts(self, time: dt.datetime):
+        closest_index = bisect.bisect(self.impact_container, time, key=lambda x: x.time)
+        if closest_index == 0:
+            # Attempting to read at time {time} which is before timeline start
+            return
+        self.add_impact(Impact(time=time, type=ImpactType.ASSIGNMENT, value=self.impact_container[closest_index-1].value))
+        self.impact_container= self.impact_container[closest_index:]
     
-#     def get_value_at(self, time: dt.datetime):
-#         closest_index = bisect.bisect(self.impact_container, time, key=lambda x: x.time)
-#         return self.impact_container[closest_index].value
+    def get_value_at(self, time: dt.datetime):
+        closest_index = bisect.bisect(self.impact_container, time, key=lambda x: x.time)
+        if closest_index == 0:
+            raise ValueError(f"Attempting to read at time {time} which is before timeline start at {self.impact_container[0].time}")
+        return self.impact_container[closest_index-1].value
     
 # class AdditiveTimeline(Timeline):
 #     def __init__(self, name: str, initial_time: dt.datetime, initial_value: float):
@@ -733,9 +741,12 @@ def ilp_schedule_workflow(
              node.scheduled = False
 
     # Create the mip solver with the SCIP backend.
-    solver = pywraplp.Solver.CreateSolver("SCIP_MIXED_INTEGER_PROGRAMMING")
+    solver = pywraplp.Solver.CreateSolver('CPLEX_MIXED_INTEGER_PROGRAMMING')
     if not solver:
-        raise ValueError("Solver SCIP_MIXED_INTEGER_PROGRAMMING not found")
+        print("CPLEX not found, trying SCIP")
+        solver = pywraplp.Solver.CreateSolver("SCIP_MIXED_INTEGER_PROGRAMMING")
+        if not solver:
+            raise ValueError("Solver SCIP_MIXED_INTEGER_PROGRAMMING not found")
     
     solver.set_time_limit(int(max_solver_time_s*1e3))
     objective = solver.Objective()
@@ -754,7 +765,7 @@ def ilp_schedule_workflow(
     flat_boolean_solution_holder = []
     solution_holder_by_satellite = {}
 
-    _timeline_holder = {}
+    # _timeline_holder = {}
 
     # Go find the overflights and create variables for them
     for constrained_request in workflow_graph.nodes():
@@ -783,7 +794,7 @@ def ilp_schedule_workflow(
                                     owner=constrained_request,
                                     )
 
-                                print(f"   [Scheduler]: In-progress task {constrained_request} applies impact {tl_impact} to timeline {_timeline}")
+                                # print(f"   [Scheduler]: In-progress task {constrained_request} applies impact {tl_impact} to timeline {_timeline}")
 
                                 _timeline.add_impact(impact=tl_impact)
                                 # if verbose>5:
@@ -1037,7 +1048,6 @@ def ilp_schedule_workflow(
             for satpass in solution_holder[constrained_request][satellite].keys():
                 this_decision_variable = solution_holder[constrained_request][satellite][satpass]
                 if feasibility_screener(satellite, satpass):
-                    # solution_holder[constrained_request][satellite][satpass] = solver.BoolVar(f"{constrained_request}_{satellite}_{satpass}")
 
                     # For each constraint, invoke get_value_at on the timeline and constrain the outcome. You need to do this AFTER all the impacts have 
                     #  been tabulated. This is the follow-up pass
@@ -1058,14 +1068,14 @@ def ilp_schedule_workflow(
 
                                     __name = f"{_timeline}_{_time}_{constrained_request}_{satellite}_{satpass}"
 
-                                    if _timeline not in _timeline_holder.keys():
-                                        _timeline_holder[_timeline] = {}
-                                    if _time not in _timeline_holder[_timeline].keys():
-                                        _timeline_holder[_timeline][_time] = {}
+                                    # if _timeline not in _timeline_holder.keys():
+                                    #     _timeline_holder[_timeline] = {}
+                                    # if _time not in _timeline_holder[_timeline].keys():
+                                    #     _timeline_holder[_timeline][_time] = {}
 
-                                    _timeline_holder[_timeline][_time][constrained_request] = solver.NumVar(name=__name, lb=_timeline.min_value, ub=_timeline.max_value)
+                                    # _timeline_holder[_timeline][_time][constrained_request] = solver.NumVar(name=__name, lb=_timeline.min_value, ub=_timeline.max_value)
 
-                                    solver.Add(timeline_value_at == _timeline_holder[_timeline][_time][constrained_request])
+                                    # solver.Add(timeline_value_at == _timeline_holder[_timeline][_time][constrained_request])
 
                                     match _constraint['constraint_type']:
                                         case TimelineConstraintType.GREATER_OR_EQUAL:
@@ -1143,22 +1153,52 @@ def ilp_schedule_workflow(
                             constrained_request.observation_opportunity = this_pass.highest
                             constrained_request.observation_opportunity_satellite = this_satellite
                             # workflow_graph.nodes[constrained_request]['scheduled']=True
+
+                            # Now apply the relevant impacts
+                            if constrained_request in timeline_graph.nodes():
+                                for _timeline in timeline_graph.successors(constrained_request):
+                                    tl_edges = timeline_graph.get_edge_data(constrained_request, _timeline)
+                                    for impact_key, impact in tl_edges.items():
+                                        if impact['edge_type'] == TaskTimelineImpact:
+                                            _time = this_pass.highest.time
+                                            if impact['impact_time'] == TaskImpactTime.POST:
+                                                _time = this_pass.highest.time + this_pass.highest.duration
+                                            tl_impact = Impact(
+                                                time=_time,
+                                                type=impact['impact_type'],
+                                                value=impact['impact_value']*this_decision_variable.solution_value(), #Now we replace the impact with the actual value
+                                                owner=constrained_request,
+                                                )
+                                            _timeline.add_impact(impact=tl_impact)
+
                 constrained_request.feasible=_feasible
 
-        for timeline, _timeval in _timeline_holder.items():
+        for timeline in timeline_graph.nodes():
+            if type(timeline) == Timeline:
+                _new_impact_container = []
+                for impact in timeline.impact_container:
+                    impact_module = getattr(impact.value, '__module__', None)
+                    if (not (impact_module is not None and impact_module.startswith('ortools'))): # If this is not a decision variable
+                        _new_impact_container.append(impact)
+                timeline.impact_container = _new_impact_container
+        # import pdb; pdb.set_trace()
+
+        # for timeline, _timeval in _timeline_holder.items():
                         
-            for time, reqandvariable in _timeval.items():
-                for constrained_request, this_tl_variable in reqandvariable.items():
-                    # print(f"    [Scheduler] Timeline {timeline} at {time} = {this_tl_variable.solution_value()}")
-                    timeline.add_impact(Impact(time=time, type=ImpactType.ASSIGNMENT, value=this_tl_variable.solution_value(), owner=constrained_request))
+        #     for time, reqandvariable in _timeval.items():
+        #         for constrained_request, this_tl_variable in reqandvariable.items():
+        #             # print(f"    [Scheduler] Timeline {timeline} at {time} = {this_tl_variable.solution_value()}")
+        #             timeline.add_impact(Impact(time=time, type=ImpactType.ASSIGNMENT, value=this_tl_variable.solution_value(), owner=constrained_request))
             
-            # Remove all the impacts that contain symbolic variables, i.e., everything after the initial time.
-            _new_impact_container = []
-            for impact in timeline.impact_container:
-                impact_module = getattr(impact.value, '__module__', None)
-                if (not (impact_module is not None and impact_module.startswith('ortools'))): # If this is not a decision variable
-                    _new_impact_container.append(impact)
-            timeline.impact_container = _new_impact_container
+        #     # Remove all the impacts that contain symbolic variables, i.e., everything after the initial time.
+        #     _new_impact_container = []
+        #     for impact in timeline.impact_container:
+        #         impact_module = getattr(impact.value, '__module__', None)
+        #         if (not (impact_module is not None and impact_module.startswith('ortools'))): # If this is not a decision variable
+        #             _new_impact_container.append(impact)
+        #     timeline.impact_container = _new_impact_container
+
+        # 
 
 
         if (verbose>2):
@@ -1190,6 +1230,7 @@ def ilp_schedule_workflow(
     return workflow_graph
 
 
+
 def plot_workflow_schedule(
         workflow_graph: nx.MultiDiGraph,
         timeline_graph: nx.MultiDiGraph=nx.MultiDiGraph(),
@@ -1207,9 +1248,9 @@ def plot_workflow_schedule(
     # num_requests = len(workflow_graph)
     # request_names = list(workflow_graph.nodes())
 
-    request_group_names = list(dict.fromkeys([r.plotting_group for r in workflow_graph.nodes()]))
+    request_group_names = list(dict.fromkeys([r.request_group for r in workflow_graph.nodes()]))
     num_request_groups = len(request_group_names)
-    request_group_sizes = {g: len([r.plotting_group for r in workflow_graph.nodes() if r.plotting_group==g]) for g in request_group_names}
+    request_group_sizes = {g: len([r.request_group for r in workflow_graph.nodes() if r.request_group==g]) for g in request_group_names}
 
     # request_colors_list = cm.rainbow(np.linspace(0, 1, num_requests))
     # request_colors = {task: request_colors_list[task_ix] for task_ix, task in enumerate(request_names)}
@@ -1225,28 +1266,29 @@ def plot_workflow_schedule(
         height_ratios.extend([1,]*num_timelines)
         fig, axes = plt.subplots(num_timelines+1,1, sharex=True, height_ratios=height_ratios, figsize=(12, int(math.ceil(.2*num_request_groups+num_timelines))))
     else:
-        if type(axes)==plt.axes:
-            axes.clear()
-        else:
+        if ((type(axes)==list) or (type(axes) == np.ndarray)):
             for ax in axes:
                 ax.clear()
+        else:
+            axes.clear()
+
 
     if num_timelines>0:
-        if type(axes)==plt.axes:
-            ax_tasks = axes
-            ax_timelines = None
-        else: # Some iterable
+        if ((type(axes)==list) or (type(axes) == np.ndarray)):
             ax_tasks = axes[0]
             if len(axes)>1:
                 ax_timelines = axes[1:]
             else:
                 ax_timelines = None
+        else:
+            ax_tasks = axes
+            ax_timelines = None
 
     else:
-        if type(axes)==plt.axes:
-            ax_tasks = axes
-        else:
+        if ((type(axes)==list) or (type(axes) == np.ndarray)):
             ax_tasks = axes[0]
+        else:
+            ax_tasks = axes
         ax_timelines = None
 
     ax_tasks.set_title(plot_title)
@@ -1274,11 +1316,11 @@ def plot_workflow_schedule(
     ax_tasks.set_yticks(np.array(range(num_request_groups))+0.5, request_group_names)
     for request_ix, request in enumerate(workflow_graph.nodes()):
         # y_coordinate = request_ix
-        y_coordinate = request_group_names.index(request.plotting_group)
+        y_coordinate = request_group_names.index(request.request_group)
         # Show the request intervals
         min_time = request.observation_request.min_time
         max_time = request.observation_request.max_time
-        ax_tasks.add_patch(plt.Rectangle((min_time, y_coordinate), max_time-min_time, line_height, color=request_group_colors[request.plotting_group], alpha=.03/request_group_sizes[request.plotting_group]))
+        ax_tasks.add_patch(plt.Rectangle((min_time, y_coordinate), max_time-min_time, line_height, color=request_group_colors[request.request_group], alpha=.03/request_group_sizes[request.request_group]))
         # SHow the constraint intervals
         # For each constraint
         for parent_request in workflow_graph.predecessors(request):
@@ -1309,7 +1351,7 @@ def plot_workflow_schedule(
                             min_time = max(min_time, parent_request.observation_opportunity.time)
                         case ConstraintClass.GEOMETRY:
                             min_time = max(min_time, parent_request.observation_opportunity.time)
-                ax_tasks.add_patch(plt.Rectangle((min_time, y_coordinate), max_time-min_time, line_height, color=request_group_colors[parent_request.plotting_group], alpha=.1/request_group_sizes[request.plotting_group]))
+                ax_tasks.add_patch(plt.Rectangle((min_time, y_coordinate), max_time-min_time, line_height, color=request_group_colors[parent_request.request_group], alpha=.1/request_group_sizes[request.request_group]))
         
         # Show where we actually ended up
         if (request.scheduled and request.feasible):
@@ -1320,7 +1362,7 @@ def plot_workflow_schedule(
                 _task_color = 'm'
                 _task_width = 6
             else:
-                _task_color = request_group_colors[request.plotting_group]
+                _task_color = request_group_colors[request.request_group]
                 _task_width = 3
             # Plot the time where the request was scheduled.
             ax_tasks.vlines(request.observation_opportunity.time, y_coordinate, y_coordinate+line_height, color=_task_color, linewidth=_task_width)
@@ -1331,11 +1373,11 @@ def plot_workflow_schedule(
                 _min_time = _opportunity.rise.time
                 _max_time = _opportunity.fall.time
                  
-                pass_color = request_group_colors[request.plotting_group]
-                pass_alpha = 0.1/request_group_sizes[request.plotting_group]
+                pass_color = request_group_colors[request.request_group]
+                pass_alpha = 0.1/request_group_sizes[request.request_group]
                 if not _pass_is_feasible:
                     pass_color = 'red'
-                    pass_alpha = 0.8/request_group_sizes[request.plotting_group]
+                    pass_alpha = 0.8/request_group_sizes[request.request_group]
 
                 ax_tasks.add_patch(plt.Rectangle((_min_time, y_coordinate), _max_time-_min_time, line_height, color=pass_color, alpha=pass_alpha))
 
@@ -1346,20 +1388,27 @@ def plot_workflow_schedule(
                 ax_timeline = ax_timelines[timeline_ix]
                 _tl_times = []
                 _tl_values = []
+                if len(timeline.impact_container):
+                    _min_time = timeline.impact_container[0].time
                 for impact in timeline.impact_container:
+                    if impact.time-dt.timedelta(seconds=1)>_min_time: #Skip the first two impacts
+                        _just_before_the_impact = impact.time-dt.timedelta(seconds=1)
+                        _tl_times.append(_just_before_the_impact)
+                        _tl_values.append(timeline.get_value_at(_just_before_the_impact))
                     _tl_times.append(impact.time)
                     _tl_values.append(timeline.get_value_at(impact.time))
-                ax_timeline.plot(_tl_times, _tl_values, '-')
+
+                ax_timeline.plot(_tl_times, _tl_values, '-o')
                 timeline_ix += 1
                 ax_timeline.set_ylabel(timeline.name,rotation=0, ha='right', va='center')
                 ax_timeline.grid()
 
     if ax_timelines is not None:
-        # ax_timelines.set_major_formatter(mdates.DateFormatter())
-        ax_timelines[-1].tick_params(axis='x', labelrotation=90)
+        ax_timelines[-1].xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H'))
+        ax_timelines[-1].tick_params(axis='x', labelrotation=45)
     else:
-        # ax_tasks.set_major_formatter(mdates.DateFormatter())
-        ax_tasks.tick_params(axis='x', labelrotation=90)
+        ax_tasks.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H'))
+        ax_tasks.tick_params(axis='x', labelrotation=45)
     # ax_tasks.set_xlim(_all_requests_min_time, _all_requests_max_time)
 
     # Show time

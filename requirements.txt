@@ -7,3 +7,5 @@ ortools~=9.15
 astral~=3.2
 tesspy~=0.2
 dill~=0.4.1
+openpyxl
+xlrd

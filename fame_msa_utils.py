@@ -163,6 +163,7 @@ def h3_to_polygon(h3_id):
     # Return as a Shapely Polygon
     return Polygon(boundary_lng_lat)
 
+
 def propagate_distribution_from_observations(
         query_times: list[dt.datetime],
         initial_pose: Pose,
@@ -177,7 +178,7 @@ def propagate_distribution_from_observations(
         ):
 
     query_times.sort()
-    completed_requests = [r for r in observation_requests if r.completed == True and r.feasible == True]
+    completed_requests = [r for r in observation_requests if r.completed == True]
     # Walk from most recent backward to find the most recent time we saw the ship
     completed_requests.sort(key=lambda x: x.observation_opportunity.time, reverse=True)
     found_latest_request = False
@@ -210,11 +211,11 @@ def propagate_distribution_from_observations(
                 # This is a completed request AFTER the latest successful one. So it is a negative result.
                 _observation = completed_request.observation_opportunity
                 if _observation.time > query_times[0]:
-                    raise ValueError(f"We have a successful observation in the future, that should never happen. Observation {_observation}, query times {query_times}")
+                    raise ValueError("We have a successful observation in the past, that should never happen")
                 if len(completed_request.data_product):
                     for ship_location_phenomenon in completed_request.data_product:
                         if ((len(target_name)==0) or (target_name in ship_location_phenomenon.name)):
-                            raise ValueError(f"Found successful observation {_observation} after the supposedly last successful observation")
+                            raise ValueError("Found successful observation {} after the supposedly last successful observation")
                 
                 ship_tracker.propagate_locations(_observation.time, samples=samples_propagation, max_dt=dt.timedelta(hours=3))
                 _particles_out_of_fov = [p for p in ship_tracker.estimated_locations if (not is_lla_in_satellite_fov(observation=_observation, location=p))]

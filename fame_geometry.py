@@ -186,6 +186,7 @@ class InstrumentType(Enum):
     RGB = 0
     SAR = 1
     HYPERSPECTRAL = 2
+    TIR = 3
 
 class AttitudeController(Enum):
     FREE = 0
