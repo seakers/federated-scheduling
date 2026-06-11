@@ -178,7 +178,7 @@ class Broker():
             # Sort by quality
             sorted_passes.sort(key=lambda x: observation_quality(x[1].highest), reverse=True)
 
-            print("Best request: {} with {}".format(_best_pass, _best_satellite))
+            # print("Best request: {} with {}".format(_best_pass, _best_satellite))
         else:
             print("No observation opportunities here")
             # self.requests[request]['status'] = "No observation opportunities";
@@ -514,14 +514,19 @@ class Broker():
                 
                 # print(f" [Broker] Updating task {dispatchable_task_id}: {self._workflow_graph.nodes[dispatchable_task_id]}")
 
-                for child_task_id in self._workflow_graph.successors(_dispatchable_task):
-                    # If the constraint type is GEOMETRY
-                    # Compute the new geometry for the child from the predecessor data_product
-                    # Update the successor's geometry in the graph
-                    outedges = self._workflow_graph.get_edge_data(_dispatchable_task, child_task_id)
-                    for constraint_key, constraint in outedges.items():
-                        if (constraint['constraint_class'] == ConstraintClass.GEOMETRY):
-                            child_task_id.observation_request = constraint['parameters']['geometry_generator'](child_task_id.observation_request, data_product)
+                try:
+                    for child_task_id in self._workflow_graph.successors(_dispatchable_task):
+                        # If the constraint type is GEOMETRY
+                        # Compute the new geometry for the child from the predecessor data_product
+                        # Update the successor's geometry in the graph
+                        outedges = self._workflow_graph.get_edge_data(_dispatchable_task, child_task_id)
+                        for constraint_key, constraint in outedges.items():
+                            if (constraint['constraint_class'] == ConstraintClass.GEOMETRY):
+                                child_task_id.observation_request = constraint['parameters']['geometry_generator'](child_task_id.observation_request, data_product)
+                except Exception as e:
+                    print(e)
+                    import pdb; pdb.set_trace()
+
 
                 # Recurse
                 self.schedule_workflow(

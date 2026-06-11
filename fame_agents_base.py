@@ -253,6 +253,7 @@ def plot_event(
         plot_observation_footprint: bool=True,
         plot_comm_gaze: bool=True,
         plot_comm_station: bool=True,
+        phenomena_colors: dict = {},
         ):
     if ax is None:
         figglobal = plt.figure(figsize=(10,5))
@@ -273,7 +274,7 @@ def plot_event(
     if plot_phenomena:
         for phenomenon in _chronicle['phenomena']:
             if (phenomenon.start_time<_chronicle['time'] and phenomenon.end_time>_chronicle['time']): 
-                ax.plot(phenomenon.lon_deg, phenomenon.lat_deg, 'D', transform=ccrs.PlateCarree(), color='m', alpha=plot_phenomena_alpha)
+                ax.plot(phenomenon.lon_deg, phenomenon.lat_deg, 'D', transform=ccrs.PlateCarree(), color=phenomena_colors.get(phenomenon.name,'m'))
 
     for constellation_ix, constellation in enumerate(world.constellations):
         constellation_color = constellation_colors.get(constellation.name, constellation_palette(constellation_ix/len(world.constellations)))

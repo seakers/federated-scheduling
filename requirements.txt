@@ -9,3 +9,6 @@ tesspy~=0.2
 dill~=0.4.1
 openpyxl
 xlrd
+xarray
+netCDF4~=1.7.4
+cdsapi>=0.7.7

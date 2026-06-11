@@ -483,6 +483,10 @@ def greedy_schedule_workflow(
                 print(f"   [Scheduler] Request {constrained_request} is already dispatched or completed, skipping")
             continue
         else:
+            # Let's flush the impacts for this request.
+            if constrained_request in timeline_graph.nodes():
+                for _timeline in timeline_graph.successors(constrained_request):
+                    _timeline.remove_impacts_from_owner(constrained_request)
             if verbose>4:
                 print("   [Scheduler] This request is still in play, let's revisit it")
 
@@ -713,7 +717,24 @@ def greedy_schedule_workflow(
         constrained_request.observation_opportunity = _best_pass.highest
         constrained_request.observation_opportunity_satellite = _best_satellite
         constrained_request.scheduled = True
-        # TODO apply timeline impacts here!
+        # Apply timeline impacts
+        if constrained_request in timeline_graph.nodes():
+            for _timeline in timeline_graph.successors(constrained_request):
+                tl_edges = timeline_graph.get_edge_data(constrained_request, _timeline)
+                for impact_key, impact in tl_edges.items():
+                    if impact['edge_type'] == TaskTimelineImpact:
+                        _time = _best_pass.highest.time
+                        if impact['impact_time'] == TaskImpactTime.POST:
+                            _time = _best_pass.highest.time + _best_pass.highest.duration
+                        tl_impact = Impact(
+                            time=_time,
+                            type=impact['impact_type'],
+                            value=impact['impact_value'], #Now we replace the impact with the actual value
+                            owner=constrained_request,
+                            )
+                        _timeline.add_impact(impact=tl_impact)
+
+
         if verbose>0:
             print(f"   [Scheduler] Scheduled request {constrained_request} on {_best_satellite} at {_best_pass.highest}")
 
@@ -1134,6 +1155,7 @@ def ilp_schedule_workflow(
     status = solver.Solve()
 
     if status == pywraplp.Solver.OPTIMAL or status == pywraplp.Solver.FEASIBLE:
+        # Reconstruct the solution
         if (verbose>0):
             print(f"    [Scheduler] Solver status {status}; objective value ={solver.Objective().Value()}")
         for constrained_request in workflow_graph.nodes():
