@@ -329,15 +329,16 @@ class Broker():
             self,
             current_time: dt.datetime=dt.datetime.now(dt.timezone.utc),
             use_ilp: bool=False,
-            update_timelines: bool=True,
-            update_requests: bool=True,
+            update_timelines: bool=True, #This is only updated if the target is dynamic
+            update_requests: bool=True, #This is only updated if the target is dynamic
             plot_schedule: bool = False,
             plot_axes: plt.axes = None,
             plot_night_in_schedule: bool=False,
             plot_location_for_night_in_schedule: Location = Location(0,0, 0),
             max_solver_time_s: float=60.,
             receding_horizon_duration: dt.timedelta= dt.timedelta(hours=12),
-            save_schedule_plot: bool=False
+            save_schedule_plot: bool=False,
+            solver_engine: str = "GUROBI" 
     ):
         # Come up with a schedule that satisfies the workflow
         if update_timelines:
@@ -355,6 +356,7 @@ class Broker():
                 verbose=3,
                 max_solver_time_s=max_solver_time_s,
                 receding_horizon_duration=receding_horizon_duration,
+                solver_engine=solver_engine
                 )
         else:
             _ = greedy_schedule_workflow(
@@ -381,10 +383,26 @@ class Broker():
                 # save_schedule_plot=save_schedule_plot,
                 # save_name = "Schedule_e{}_{}.pdf".format(self._workflow_schedule_epoch, self.world.time)
                 )
-            figure_name = "media/Schedule_{}_e{:05d}_{}.pdf".format(self.world.time, self._workflow_schedule_epoch, self.name)
-            if plot_axes is None:
+            #TODO: Some changes to the saving path
+            #figure_name = "media/Schedule_{}_e{:05d}_{}.pdf".format(self.world.time, self._workflow_schedule_epoch, self.name)
+            # print(f"fig name before: {figure_name}")
+            # figure_name = str(figure_name).replace(':', '-')
+            # print(f"fig name after{figure_name}")
+            # if plot_axes is None:
+            #     plt.savefig(figure_name, bbox_inches='tight')
+            # else:
+            #     plot_axes[0].get_figure().savefig(figure_name, bbox_inches='tight')
+            # 1. Clean the time string at the very beginning of the block
+            safe_time_str = str(self.world.time).replace(':', '-')
+
+           # 2. Use the safe_time_str to build the filename
+            figure_name = "media/Schedule_{}_e{:05d}_{}.pdf".format(safe_time_str, self._workflow_schedule_epoch, self.name)
+
+# 3. Now the filename is clean for both branches!
+            if save_schedule_plot:
                 plt.savefig(figure_name, bbox_inches='tight')
             else:
+    # Line 388 will now safely use your sanitized hyphenated string
                 plot_axes[0].get_figure().savefig(figure_name, bbox_inches='tight')
 
         local_workflow_schedule_epoch_when_dispatching_started = self._workflow_schedule_epoch
@@ -460,6 +478,8 @@ class Broker():
                     max_solver_time_s=max_solver_time_s,
                     receding_horizon_duration=receding_horizon_duration,
                     save_schedule_plot=save_schedule_plot,
+                    solver_engine=solver_engine
+
                 )
 
                 return
@@ -487,6 +507,8 @@ class Broker():
                         max_solver_time_s=max_solver_time_s,
                         receding_horizon_duration=receding_horizon_duration,
                         save_schedule_plot=save_schedule_plot,
+                        solver_engine=solver_engine
+
                     )
 
                 return
@@ -539,6 +561,8 @@ class Broker():
                     max_solver_time_s=max_solver_time_s,
                     receding_horizon_duration=receding_horizon_duration,
                     save_schedule_plot=save_schedule_plot,
+                    solver_engine=solver_engine
+
                     )
                 return
 

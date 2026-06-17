@@ -13,7 +13,8 @@ import matplotlib.dates as mdates
 from ortools.linear_solver import pywraplp
 
 import bisect
-
+import gurobipy as gp
+import os
 from astral import sun, Observer
 
 # import random
@@ -152,17 +153,20 @@ class ImpactType(Enum):
     RATE_ADDITION = 2 # Add this to the rate at this time
 
 class Impact():
+    #Impact: It changes the rate of change or produces a suden change in the value of a variable. For example, the rate of change in the battery is different when
+    #we are facing the sun and when we are in Eclipse, or when we turn on a transmitter/sensor. We have RATE_ADDITION and ADDITION/ASSIGNMENT
     def __init__(self, time: dt.datetime, type: ImpactType, value, owner: ConstrainedObservationRequest=None):
-        self.time = time
-        self.type = type
-        self.value = value
-        self.owner = owner
+        self.time = time #When does this imapct happen?
+        self.type = type #Is it a rate change, addition or assignment?
+        self.value = value #Value of the rate change, addition or assignment
+        self.owner = owner #This is the ConstrainedObservationRequest that caused this impact to happen in the first place
     def __str__(self):
         return f"Impact (type {self.type}) at {self.time} with value {self.value} owned by {self.owner}"
     def __repr__(self):
         return self.__str__()
 
 class Timeline():
+    #Timeline: It is a function that computes a value for a certain time given its last state and the series of imapcts.
     def __init__(self, name: str, initial_time: dt.datetime, initial_value: float, initial_rate: float, min_value: float=-np.inf, max_value: float=np.inf):
         self.name = name
         self.impact_container = [Impact(initial_time, ImpactType.ASSIGNMENT, initial_value), Impact(initial_time, ImpactType.RATE_ADDITION, initial_rate)]
@@ -750,8 +754,10 @@ def ilp_schedule_workflow(
         current_time: dt.datetime=None,
         verbose: int=99,
         max_solver_time_s: int=1e3,
-        receding_horizon_duration: dt.timedelta=dt.timedelta(weeks=52)
-        ):
+        receding_horizon_duration: dt.timedelta=dt.timedelta(weeks=52),
+        solver_engine: str = "GUROBI"  # <-- ADD THIS (Options: "SCIP" or "GUROBI")        ):
+):
+    print(f"Function ILP scheduler, the solver engine is {solver_engine}")
     
     if verbose>2:
         print(f"   [Scheduler] WG: {workflow_graph}")
@@ -840,8 +846,6 @@ def ilp_schedule_workflow(
             request_name = constrained_request.observation_request.name+"_trimmed",
             min_elevation_deg = constrained_request.observation_request.min_elevation_deg,
         )
-
-
         # Find the overflights
         observation_opportunities = find_observation_opportunities([trimmed_request,], satellites)
         
@@ -1152,14 +1156,109 @@ def ilp_schedule_workflow(
     # Add a hint
     solver.SetHint(flat_boolean_solution_holder, [0.,]*len(flat_boolean_solution_holder))
 
-    status = solver.Solve()
+# ==========================================
+    # THE SOLVER SWITCH (MPS TRICK)
+    # ==========================================
+    if solver_engine == "GUROBI":
 
+        if solver.NumVariables() == 0:
+            if verbose > 0:
+                print("    [Scheduler] No pending tasks to schedule. Skipping Gurobi.")
+            # Mimic SCIP returning optimal for an empty problem
+            status = pywraplp.Solver.OPTIMAL 
+            m = None # Dummy object just in case
+            gurobi_var_map = {}
+        else:
+            if verbose > 0:
+                print("    [Scheduler] Exporting to MPS and solving with Native Gurobi...")
+            mps_path = "temp_workflow.mps"
+            # mps_text = solver.ExportModelAsMpsFormat(False, False)
+            # with open(mps_path, "w") as f:
+            #     f.write(mps_text)
+            solver.WriteModelToMpsFile(mps_path, False, False)
+            # --- THE FIX: Wait for Windows to actually finish writing ENDATA ---
+            import time
+            print("    [Scheduler] Waiting for OS I/O to finish writing file...")
+            for _ in range(20): # Try for up to 10 seconds
+                try:
+                    with open(mps_path, 'rb') as f:
+                        f.seek(-30, os.SEEK_END) # Jump to the last 30 bytes of the file
+                        tail = f.read().decode('utf-8', errors='ignore')
+                        if "ENDATA" in tail:
+                            break # File is complete!
+                except Exception:
+                    pass
+                time.sleep(0.5) # Wait half a second and check again
+            print("    [Scheduler] MPS file flush confirmed!")
+            
+            # --- THE FIX: Explicitly authenticate with your WLS credentials ---
+            env = gp.Env(empty=True)
+            # Suppress Gurobi's standard console output to keep your logs clean
+            env.setParam('OutputFlag', 0) 
+            env.setParam('MIPGap', 0.01)  # 0.02 = 2% gap limit
+            
+            if os.environ.get("WLSACCESSID"):
+                env.setParam("WLSACCESSID", os.environ.get("WLSACCESSID"))
+                env.setParam("WLSSECRET", os.environ.get("WLSSECRET"))
+                env.setParam("LICENSEID", int(os.environ.get("LICENSEID", 0)))
+            env.start()
+            
+            # Pass the authenticated environment into the reader
+            m = gp.read(mps_path, env=env)
+            # ------------------------------------------------------------------
+            
+            m.optimize()
+        if m is not None:
+            # Map Gurobi status back to OR-Tools format
+            if m.Status == gp.GRB.OPTIMAL:
+                status = pywraplp.Solver.OPTIMAL
+            elif m.Status == gp.GRB.FEASIBLE:
+                status = pywraplp.Solver.FEASIBLE
+            else:
+                status = pywraplp.Solver.NOT_SOLVED
+        else:
+             status = pywraplp.Solver.OPTIMAL
+
+            
+        # Create a dictionary of Gurobi variable results for quick lookup
+       # --- THE FIX: Map variables by sequential index instead of mangled strings ---
+        gurobi_var_map = {}
+        if status in [pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE]:
+            ort_vars = solver.variables()
+            
+            # --- THE FIX: Only ask Gurobi for variables if Gurobi actually ran ---
+            if m is not None:
+                grb_vars = m.getVars()
+                
+                # Zip them together so we perfectly link the OR-Tools name to the Gurobi value
+                if len(ort_vars) == len(grb_vars):
+                    gurobi_var_map = {ort_vars[i].name(): grb_vars[i].X for i in range(len(ort_vars))}
+                else:
+                    print("    [Scheduler] WARNING: Variable counts do not match between OR-Tools and Gurobi!")
+            else:
+                # m is None (empty problem), so there's nothing to map. 
+                # gurobi_var_map safely remains an empty dictionary {}.
+                pass
+    else:
+        solver.WriteModelToMpsFile("isolated_benchmark_problem.mps", False, False) #This basically saves the optimization problem for further isloated study
+        print(" Isolated problem snapshot saved to file!")
+        # Standard OR-Tools SCIP Solve
+        if verbose > 0:
+            print("    [Scheduler] Solving with standard OR-Tools SCIP...")
+        status = solver.Solve()
+
+    # ==========================================
+    # RECONSTRUCT THE SOLUTION
+    # ==========================================
     if status == pywraplp.Solver.OPTIMAL or status == pywraplp.Solver.FEASIBLE:
-        # Reconstruct the solution
         if (verbose>0):
-            print(f"    [Scheduler] Solver status {status}; objective value ={solver.Objective().Value()}")
+                if solver_engine == "GUROBI":
+                    # Safe check: if m is None (empty problem), objective is 0.0
+                    obj_val = m.ObjVal if m is not None else 0.0
+                else:
+                    obj_val = solver.Objective().Value()
+                    
         for constrained_request in workflow_graph.nodes():
-            # If we had already sent these out, not much we can do now
             if ((constrained_request.dispatched == True) or (constrained_request.completed == True)):
                 continue
             else:
@@ -1167,14 +1266,23 @@ def ilp_schedule_workflow(
                 _feasible = False
                 for this_satellite in solution_holder[constrained_request].keys():
                     for this_pass, this_decision_variable in solution_holder[constrained_request][this_satellite].items():
-                        if this_decision_variable.solution_value()>0:
+                        
+                        # --- THE VALUE LOOKUP SWITCH ---
+                        if solver_engine == "GUROBI":
+                            # Look up the value from the Gurobi map we made
+                            var_value = gurobi_var_map.get(this_decision_variable.name(), 0.0)
+                        else:
+                            # Use normal OR-Tools method
+                            var_value = this_decision_variable.solution_value()
+                        # -------------------------------
+                            
+                        if var_value > 0.5: # Use 0.5 to be safe with float rounding
                             if verbose>1:
-                                print("    [Scheduler] ", this_decision_variable.name(), " = ", this_decision_variable.solution_value())
+                                print("    [Scheduler] ", this_decision_variable.name(), " = ", var_value)
                             _feasible = True
                             constrained_request.observation_opportunity_pass = this_pass
                             constrained_request.observation_opportunity = this_pass.highest
                             constrained_request.observation_opportunity_satellite = this_satellite
-                            # workflow_graph.nodes[constrained_request]['scheduled']=True
 
                             # Now apply the relevant impacts
                             if constrained_request in timeline_graph.nodes():
@@ -1188,66 +1296,37 @@ def ilp_schedule_workflow(
                                             tl_impact = Impact(
                                                 time=_time,
                                                 type=impact['impact_type'],
-                                                value=impact['impact_value']*this_decision_variable.solution_value(), #Now we replace the impact with the actual value
+                                                value=impact['impact_value']*var_value, # Use the dynamic var_value
                                                 owner=constrained_request,
                                                 )
                                             _timeline.add_impact(impact=tl_impact)
 
                 constrained_request.feasible=_feasible
 
+        # Clean up timeline impacts (same as your original code)
         for timeline in timeline_graph.nodes():
             if type(timeline) == Timeline:
                 _new_impact_container = []
                 for impact in timeline.impact_container:
                     impact_module = getattr(impact.value, '__module__', None)
-                    if (not (impact_module is not None and impact_module.startswith('ortools'))): # If this is not a decision variable
+                    if (not (impact_module is not None and impact_module.startswith('ortools'))): 
                         _new_impact_container.append(impact)
                 timeline.impact_container = _new_impact_container
-        # import pdb; pdb.set_trace()
-
-        # for timeline, _timeval in _timeline_holder.items():
-                        
-        #     for time, reqandvariable in _timeval.items():
-        #         for constrained_request, this_tl_variable in reqandvariable.items():
-        #             # print(f"    [Scheduler] Timeline {timeline} at {time} = {this_tl_variable.solution_value()}")
-        #             timeline.add_impact(Impact(time=time, type=ImpactType.ASSIGNMENT, value=this_tl_variable.solution_value(), owner=constrained_request))
-            
-        #     # Remove all the impacts that contain symbolic variables, i.e., everything after the initial time.
-        #     _new_impact_container = []
-        #     for impact in timeline.impact_container:
-        #         impact_module = getattr(impact.value, '__module__', None)
-        #         if (not (impact_module is not None and impact_module.startswith('ortools'))): # If this is not a decision variable
-        #             _new_impact_container.append(impact)
-        #     timeline.impact_container = _new_impact_container
-
-        # 
-
 
         if (verbose>2):
             print()
-            print(f"    [Scheduler] Problem solved in {solver.wall_time():d} milliseconds")
-            print(f"    [Scheduler] Problem solved in {solver.iterations():d} iterations")
-            print(f"    [Scheduler] Problem solved in {solver.nodes():d} branch-and-bound nodes")
+            if solver_engine == "SCIP":
+                print(f"    [Scheduler] Problem solved in {solver.wall_time():d} milliseconds")
+                print(f"    [Scheduler] Problem solved in {solver.iterations():d} iterations")
+                print(f"    [Scheduler] Problem solved in {solver.nodes():d} branch-and-bound nodes")
+            else:
+                # Safe check: if m is None, it took 0.0 seconds
+                gurobi_time = m.Runtime if m is not None else 0.0
+                print(f"    [Scheduler] Problem solved with Native Gurobi (RunTime: {gurobi_time:.2f}s)")
     else:
+        # (Keep your existing 'else' print block here for NOT_SOLVED statuses)
         if verbose>0:
-            status_str = ""
-            match status:
-                case pywraplp.Solver.OPTIMAL:
-                    status_str = "OPTIMAL"
-                case pywraplp.Solver.FEASIBLE:
-                    status_str = "FEASIBLE"
-                case pywraplp.Solver.FEASIBLE:
-                    status_str = "FEASIBLE"
-                case pywraplp.Solver.UNBOUNDED:
-                    status_str = "UNBOUNDED"
-                case pywraplp.Solver.ABNORMAL:
-                    status_str = "ABNORMAL"
-                case pywraplp.Solver.MODEL_INVALID:
-                    status_str = "MODEL_INVALID"
-                case pywraplp.Solver.NOT_SOLVED:
-                    status_str = "NOT_SOLVED"
-            print(f"    [Scheduler] We have not found a feasible solution (status {status_str})")
-
+            print(f"    [Scheduler] We have not found a feasible solution.")
 
     return workflow_graph
 
