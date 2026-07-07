@@ -752,10 +752,11 @@ def ilp_schedule_workflow(
         satellites: list,
         feasibility_screener = lambda satellite, observation_pass: True,
         current_time: dt.datetime=None,
-        verbose: int=99,
+        verbose: int=0,
         max_solver_time_s: int=1e3,
         receding_horizon_duration: dt.timedelta=dt.timedelta(weeks=52),
-        solver_engine: str = "GUROBI"  # <-- ADD THIS (Options: "SCIP" or "GUROBI")        ):
+        solver_engine: str = "GUROBI",  # <-- ADD THIS (Options: "SCIP" or "GUROBI")
+        tax_rate: float = 0.0  # Cost per scheduled obs as fraction of max quality. Set to 0 to disable.
 ):
     print(f"Function ILP scheduler, the solver engine is {solver_engine}")
     
@@ -866,6 +867,11 @@ def ilp_schedule_workflow(
         _found_a_pass = False
         allsatpasses = [(satellite, satpass, constrained_request.rewarder(satpass.highest)) for satellite, satpasses in passes.items() for satpass in satpasses]
         allsatpasses.sort(key=lambda x: x[2], reverse=True) # Sort by observation quality
+
+        # Compute max quality across all feasible passes for this request, used to compute tax
+        _max_quality_for_request = max([q for (_, _, q) in allsatpasses]) if len(allsatpasses) > 0 else 0.0
+        _tax = tax_rate * _max_quality_for_request
+
         for (satellite, satpass, _quality) in allsatpasses:
             if feasibility_screener(satellite, satpass):
                 _found_a_pass = True
@@ -880,8 +886,9 @@ def ilp_schedule_workflow(
                 solution_holder_by_satellite[satellite].append((satpass, solution_holder[constrained_request][satellite][satpass]))
 
                 flat_boolean_solution_holder.append(solution_holder[constrained_request][satellite][satpass])
-                
-                objective.SetCoefficient(solution_holder[constrained_request][satellite][satpass], _quality)
+
+                # Net coefficient = quality - tax (tax=0 disables the cost penalty)
+                objective.SetCoefficient(solution_holder[constrained_request][satellite][satpass], _quality - _tax)
 
                 # TODO for each timeline impacted, add a variable for that timeline value at that time. Add an Impact with that timeline value times "do we do it".
                 if constrained_request in timeline_graph.nodes():
@@ -1210,11 +1217,23 @@ def ilp_schedule_workflow(
             m.optimize()
         if m is not None:
             # Map Gurobi status back to OR-Tools format
+            # Gurobi status codes: OPTIMAL=2, INFEASIBLE=3, INF_OR_UNBD=4, TIME_LIMIT=9, etc.
             if m.Status == gp.GRB.OPTIMAL:
                 status = pywraplp.Solver.OPTIMAL
-            elif m.Status == gp.GRB.FEASIBLE:
+            elif m.Status in [gp.GRB.TIME_LIMIT, gp.GRB.SOLUTION_LIMIT, gp.GRB.INTERRUPTED]:
+                # Found a feasible solution but not proven optimal
                 status = pywraplp.Solver.FEASIBLE
+            elif m.Status == gp.GRB.INFEASIBLE:
+                if verbose > 0:
+                    print(f"    [Scheduler] Model is INFEASIBLE (no valid schedule found)")
+                status = pywraplp.Solver.INFEASIBLE
+            elif m.Status == gp.GRB.INF_OR_UNBD:
+                if verbose > 0:
+                    print(f"    [Scheduler] Model is INFEASIBLE or UNBOUNDED")
+                status = pywraplp.Solver.ABNORMAL
             else:
+                if verbose > 0:
+                    print(f"    [Scheduler] Gurobi status: {m.Status}")
                 status = pywraplp.Solver.NOT_SOLVED
         else:
              status = pywraplp.Solver.OPTIMAL
@@ -1303,13 +1322,14 @@ def ilp_schedule_workflow(
 
                 constrained_request.feasible=_feasible
 
-        # Clean up timeline impacts (same as your original code)
+        # Clean up timeline impacts - remove unpicklable solver objects (OR-Tools and Gurobi)
         for timeline in timeline_graph.nodes():
             if type(timeline) == Timeline:
                 _new_impact_container = []
                 for impact in timeline.impact_container:
                     impact_module = getattr(impact.value, '__module__', None)
-                    if (not (impact_module is not None and impact_module.startswith('ortools'))): 
+                    # Remove both OR-Tools and Gurobi objects (they can't be pickled/deepcopied)
+                    if (not (impact_module is not None and (impact_module.startswith('ortools') or impact_module.startswith('gurobipy')))):
                         _new_impact_container.append(impact)
                 timeline.impact_container = _new_impact_container
 

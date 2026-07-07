@@ -342,6 +342,7 @@ class Broker():
             solver_engine: str = "GUROBI",
             use_stochastic: bool = False,
             stochastic_formulation: str = "log_linearized",
+            execution_cost_rate: float = 0.0,
             success_probability_function = None,  # DEPRECATED: use acceptance + execution functions
             acceptance_probability_function = None,  # p_acc: prob constellation accepts booking
             execution_probability_function = None,   # p_exec: prob accepted booking executes successfully
@@ -390,7 +391,7 @@ class Broker():
                     solver_engine=solver_engine,
                     tax_rate=tax_rate,
                     submission_cost_rate=submission_cost_rate,
-                    cancellation_cost_rate=cancellation_cost_rate
+                    execution_cost_rate=execution_cost_rate
                 )
             else:
                 # Use existing deterministic ILP scheduler
