@@ -10,16 +10,17 @@ from pathlib import Path
 load_dotenv()
 
 # Problem definitions
-# PROBLEMS = [
-#     {"name": "Ship Tracking", "file": "problems/isolated_benchmark_problem.mps", "size": "small"},
-#     {"name": "Volcano Scheduling", "file": "problems/isolated_benchmark_problem_large.mps", "size": "large"}
-# ]
 PROBLEMS = [
+    {"name": "Ship Tracking", "file": "problems/isolated_benchmark_problem.mps", "size": "small"},
     {"name": "Volcano Scheduling", "file": "problems/isolated_benchmark_problem_large.mps", "size": "large"}
 ]
+# PROBLEMS = [
+#     {"name": "Volcano Scheduling", "file": "problems/isolated_benchmark_problem_large.mps", "size": "large"}
+# ]
 
-GAP_TESTS = [0.0, 0.01, 0.02, 0.05]
-NUM_RUNS = 2  # Number of runs per problem/solver combo
+GAP_TESTS = [0.0, 0.01, 0.02, 0.05, 0.1, 0.2]
+#GAP_TESTS = [0.0]
+NUM_RUNS = 15  # Number of runs per problem/solver combo
 RESULTS = {}
 
 def benchmark_gurobi(mps_file, gap_tests, num_runs):
@@ -94,16 +95,21 @@ def benchmark_scip(mps_file, num_runs):
                 continue
 
             scip_solver = model_builder.ModelSolver("SCIP")
-            scip_solver.set_time_limit_in_seconds(500)
+            scip_solver.set_time_limit_in_seconds(1000)
 
             start_time = time.time()
             scip_solver.solve(model)
             duration = time.time() - start_time
 
-            obj = scip_solver.objective_value
+            # Handle NAType or invalid objective values
+            try:
+                obj = float(scip_solver.objective_value)
+            except (TypeError, ValueError):
+                obj = float('nan')
+
             times.append(duration)
             objs.append(obj)
-            print(f"    SCIP run {run+1}/{num_runs}: {duration:.2f}s")
+            print(f"    SCIP run {run+1}/{num_runs}: {duration:.2f}s, obj: {obj:.2f}")
         except Exception as e:
             print(f"    WARNING: SCIP run {run+1} failed: {e}")
             continue
