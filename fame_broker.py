@@ -324,6 +324,7 @@ class Broker():
         self.workflow = workflow
         self._workflow_graph, self._timeline_graph = build_workflow_graph(self.workflow)
         self._workflow_schedule_epoch = 0 # We use this to keep track of whether we rescheduled during dispatch
+        self._reschedule_depth = 0  # Track recursive rescheduling to prevent infinite loops
 
     def schedule_workflow(
             self,
@@ -338,8 +339,24 @@ class Broker():
             max_solver_time_s: float=60.,
             receding_horizon_duration: dt.timedelta= dt.timedelta(hours=12),
             save_schedule_plot: bool=False,
-            solver_engine: str = "GUROBI" 
+            solver_engine: str = "GUROBI",
+            use_stochastic: bool = False,
+            stochastic_formulation: str = "log_linearized",
+            success_probability_function = None,  # DEPRECATED: use acceptance + execution functions
+            acceptance_probability_function = None,  # p_acc: prob constellation accepts booking
+            execution_probability_function = None,   # p_exec: prob accepted booking executes successfully
+            epsilon: float = 1e-5,
+            pwl_tolerance: float = 1e-2,
+            tax_rate: float = 0.0,  # Cost per scheduled obs as fraction of max quality. 0 = disabled.
+            submission_cost_rate: float = 0.0,  # c_sub: unconditional per-booking submission overhead
+            cancellation_cost_rate: float = 0.0,  # c_canc: conditional cancellation cost if accepted
+            max_reschedule_depth: int = 10  # Maximum recursive rescheduling depth to prevent infinite loops
     ):
+        # Prevent infinite rescheduling loops (rejection/timeout triggering more rescheduling)
+        if self._reschedule_depth >= max_reschedule_depth:
+            print(f" [{self.name}] WARNING: Maximum rescheduling depth ({max_reschedule_depth}) reached. Stopping recursive rescheduling.")
+            return
+
         # Come up with a schedule that satisfies the workflow
         if update_timelines:
             self.workflow.timeline_updater(self.world.time, self.workflow.constrained_observation_requests, self.workflow.timelines)
@@ -347,17 +364,48 @@ class Broker():
             self.workflow.request_updater(self.world.time, self.workflow.constrained_observation_requests, self.workflow.timelines)
 
         if use_ilp:
-            _ = ilp_schedule_workflow(
-                workflow_graph=self._workflow_graph,
-                timeline_graph=self._timeline_graph,
-                satellites=self._known_satellites,
-                feasibility_screener=self._screen_pass_for_feasibility,
-                current_time=current_time,
-                verbose=3,
-                max_solver_time_s=max_solver_time_s,
-                receding_horizon_duration=receding_horizon_duration,
-                solver_engine=solver_engine
+            if use_stochastic:
+                # Route to stochastic MILP scheduler
+                from fame_workflow_stochastic import ilp_schedule_workflow_stochastic
+
+                # Default success probability function
+                if success_probability_function is None:
+                    success_probability_function = lambda r, s, p: 1.0
+
+                _ = ilp_schedule_workflow_stochastic(
+                    workflow_graph=self._workflow_graph,
+                    timeline_graph=self._timeline_graph,
+                    satellites=self._known_satellites,
+                    feasibility_screener=self._screen_pass_for_feasibility,
+                    current_time=current_time,
+                    verbose=3,
+                    max_solver_time_s=max_solver_time_s,
+                    receding_horizon_duration=receding_horizon_duration,
+                    stochastic_formulation=stochastic_formulation,
+                    success_probability_function=success_probability_function,
+                    acceptance_probability_function=acceptance_probability_function,
+                    execution_probability_function=execution_probability_function,
+                    epsilon=epsilon,
+                    pwl_tolerance=pwl_tolerance,
+                    solver_engine=solver_engine,
+                    tax_rate=tax_rate,
+                    submission_cost_rate=submission_cost_rate,
+                    cancellation_cost_rate=cancellation_cost_rate
                 )
+            else:
+                # Use existing deterministic ILP scheduler
+                _ = ilp_schedule_workflow(
+                    workflow_graph=self._workflow_graph,
+                    timeline_graph=self._timeline_graph,
+                    satellites=self._known_satellites,
+                    feasibility_screener=self._screen_pass_for_feasibility,
+                    current_time=current_time,
+                    verbose=3,
+                    max_solver_time_s=max_solver_time_s,
+                    receding_horizon_duration=receding_horizon_duration,
+                    solver_engine=solver_engine,
+                    tax_rate=tax_rate
+                    )
         else:
             _ = greedy_schedule_workflow(
                 workflow_graph=self._workflow_graph,
@@ -467,7 +515,8 @@ class Broker():
                 _dispatchable_task.scheduled = False
                 _dispatchable_task.dispatched = False
                 follow_up_action_failure(reason)
-                # Recurse
+                # Recurse with ALL parameters to preserve stochastic settings
+                self._reschedule_depth += 1
                 self.schedule_workflow(
                     current_time=self.world.time,
                     use_ilp=use_ilp,
@@ -478,14 +527,24 @@ class Broker():
                     max_solver_time_s=max_solver_time_s,
                     receding_horizon_duration=receding_horizon_duration,
                     save_schedule_plot=save_schedule_plot,
-                    solver_engine=solver_engine
-
+                    solver_engine=solver_engine,
+                    use_stochastic=use_stochastic,
+                    stochastic_formulation=stochastic_formulation,
+                    success_probability_function=success_probability_function,
+                    acceptance_probability_function=acceptance_probability_function,
+                    execution_probability_function=execution_probability_function,
+                    epsilon=epsilon,
+                    pwl_tolerance=pwl_tolerance,
+                    tax_rate=tax_rate,
+                    submission_cost_rate=submission_cost_rate,
+                    cancellation_cost_rate=cancellation_cost_rate
                 )
+                self._reschedule_depth -= 1
 
                 return
             
             def callback_request_timed_out(_request=request, __best_pass=_best_pass, __best_constellation=_best_constellation, _dispatchable_task=dispatchable_task):
-                
+
                 requests_still_awaiting_data = self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass) & ((self._requests['status']==ObservationStatus.SUBMITTED) | (self._requests['status']==ObservationStatus.SCHEDULED)))]
                 if len(requests_still_awaiting_data):
                     print(" [{}] timeout for request {}, pass {}, from {}".format(self.name, request, __best_pass, __best_constellation.name))
@@ -496,7 +555,8 @@ class Broker():
                     _dispatchable_task.scheduled = False
                     _dispatchable_task.dispatched = False
                     follow_up_action_failure(ObservationStatus.TIMEOUT)
-                    # Recurse
+                    # Recurse with ALL parameters to preserve stochastic settings
+                    self._reschedule_depth += 1
                     self.schedule_workflow(
                         current_time=self.world.time,
                         use_ilp=use_ilp,
@@ -507,9 +567,19 @@ class Broker():
                         max_solver_time_s=max_solver_time_s,
                         receding_horizon_duration=receding_horizon_duration,
                         save_schedule_plot=save_schedule_plot,
-                        solver_engine=solver_engine
-
+                        solver_engine=solver_engine,
+                        use_stochastic=use_stochastic,
+                        stochastic_formulation=stochastic_formulation,
+                        success_probability_function=success_probability_function,
+                        acceptance_probability_function=acceptance_probability_function,
+                        execution_probability_function=execution_probability_function,
+                        epsilon=epsilon,
+                        pwl_tolerance=pwl_tolerance,
+                        tax_rate=tax_rate,
+                        submission_cost_rate=submission_cost_rate,
+                        cancellation_cost_rate=cancellation_cost_rate
                     )
+                    self._reschedule_depth -= 1
 
                 return
             

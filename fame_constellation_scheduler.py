@@ -23,7 +23,7 @@ from fame_workflow import AssignmentTimeline, Impact, ImpactType
 from fame_agents_base import *
 
 class ConstellationGroundScheduler():
-    def __init__(self, satellites: list, ground_stations: list, world, name="Constellation", ack_probability_if_scheduled: float=1., ack_probability_if_unscheduled: float=1.,):
+    def __init__(self, satellites: list, ground_stations: list, world, name="Constellation", ack_probability_if_scheduled: float=1., ack_probability_if_unscheduled: float=1., acceptance_probability: float=1.0, acceptance_probability_function=None):
         self.name = name
         self.satellites = satellites
         self.ground_stations = ground_stations
@@ -32,6 +32,8 @@ class ConstellationGroundScheduler():
         self._requests = pd.DataFrame(columns=requests_data_frame_columns)
         self.ack_probability_if_scheduled = ack_probability_if_scheduled
         self.ack_probability_if_unscheduled = ack_probability_if_unscheduled
+        self.acceptance_probability = acceptance_probability
+        self.acceptance_probability_function = acceptance_probability_function
         self._satellite_busy_timelines_obs  = {ks: AssignmentTimeline(name=ks.name, initial_time=world.time, initial_value=False) for ks in self.satellites}
         self._satellite_busy_timelines_comm = {ks: AssignmentTimeline(name=ks.name, initial_time=world.time, initial_value=False) for ks in self.satellites}
 
@@ -264,9 +266,30 @@ class ConstellationGroundScheduler():
             if (random.random()<self.ack_probability_if_unscheduled):
                 callback_request_unscheduled(ObservationStatus.COULD_NOT_FIND_BEST_SATELLITE)
             return -3
+
+        # === STOCHASTIC REJECTION SIMULATION ===
+        # Determine acceptance probability
+        if self.acceptance_probability_function is not None:
+            # Dynamic acceptance based on custom function (e.g., load-dependent)
+            theta_accept = self.acceptance_probability_function(request, _best_sat_object, self.world.time)
+        else:
+            # Static acceptance probability
+            theta_accept = self.acceptance_probability
+
+        # Roll dice: does constellation accept this broker request?
+        if random.random() > theta_accept:
+            # REJECT: Constellation refuses to schedule (e.g., too busy, internal conflicts)
+            print(f"   [{self.name}] REJECTED request {request.name} (acceptance prob={theta_accept:.2f})")
+            self._requests.loc[self._requests['request']==request, 'status'] = ObservationStatus.CONSTELLATION_REJECTED
+            if (random.random()<self.ack_probability_if_unscheduled):
+                callback_request_unscheduled(ObservationStatus.CONSTELLATION_REJECTED)
+            return -6  # New error code for constellation rejection
+
+        # ACCEPT: Proceed with scheduling
+        print(f"   [{self.name}] ACCEPTED request {request.name} (acceptance prob={theta_accept:.2f})")
         #
 
-        # If we have ISL, just schedule the observation through the magic comm link 
+        # If we have ISL, just schedule the observation through the magic comm link
         assert _best_sat_object == _best_pass.highest.satellite, "ERROR: something wrong with selecting the best satellite"
 
         if _best_uplink_comm_opportunity == "ISL":
