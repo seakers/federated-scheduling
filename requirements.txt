@@ -12,3 +12,12 @@ xlrd
 xarray
 netCDF4~=1.7.4
 cdsapi>=0.7.7
+numpy
+scipy
+shapely
+geopandas
+h3
+gurobipy
+python-dotenv
+requests
+urllib3
