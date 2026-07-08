@@ -166,23 +166,60 @@ def run_single_comparison(submission_cost, exec_cost, run_seed=42):
             'utility': total_realized_quality - total_cost,
         }
 
-    def run_simulation_forward(world, max_safety_limit=40000):
-        """Run simulation to completion."""
+    def run_simulation_forward(world, max_safety_limit=40000, wall_clock_timeout_s=300):
+        """
+        Run simulation to completion with multiple safety mechanisms.
+
+        Safety mechanisms:
+        1. Max tick count (prevent infinite loops)
+        2. Wall-clock timeout (prevent hung simulations)
+        3. Progress detection (detect stuck states)
+        """
+        import time
+
         ticks = 0
+        start_time = time.time()
+        last_sim_time = world.time
+        stuck_count = 0
+
         while True:
-            retcode = world.tick(print_forbidden_prefixes=["Downlink", "End of downlink", "Unlock uplink", "Unlock satellite after obs"])
+            retcode = world.tick(print_forbidden_prefixes=["Downlink", "End of downlink", "Unlock uplink", "Unlock satellite after obs", "Check timeout", "Executing Event"])
             ticks += 1
 
+            # Check if simulation is progressing
+            if world.time == last_sim_time:
+                stuck_count += 1
+                if stuck_count > 100:  # Simulation stuck for 100 ticks
+                    print(f"      WARNING: Simulation stuck at time {world.time} for {stuck_count} ticks. Terminating.")
+                    break
+            else:
+                stuck_count = 0
+                last_sim_time = world.time
+
+            # Normal termination
             if retcode == 0:
                 break
+
+            # Safety limit on tick count
             if ticks >= max_safety_limit:
+                print(f"      WARNING: Reached max tick limit ({max_safety_limit}). Terminating.")
                 break
+
+            # Wall-clock timeout
+            elapsed = time.time() - start_time
+            if elapsed > wall_clock_timeout_s:
+                print(f"      WARNING: Wall-clock timeout ({wall_clock_timeout_s}s) reached. Terminating.")
+                break
+
         return ticks
 
     results = {}
 
     # === STOCHASTIC ===
     print(f"    Running stochastic (sub={submission_cost:.2f}, exec={exec_cost:.2f})...")
+    import time
+    sto_start = time.time()
+
     random.seed(run_seed)
     np.random.seed(run_seed)
 
@@ -210,8 +247,9 @@ def run_single_comparison(submission_cost, exec_cost, run_seed=42):
             update_timelines=False,
             update_requests=False
         )
-        run_simulation_forward(world_sto)
+        ticks = run_simulation_forward(world_sto)
         m = compute_metrics(broker_sto._workflow_graph, broker_sto, submission_cost, exec_cost)
+        sto_elapsed = time.time() - sto_start
 
         results['sto_scheduled'] = m['scheduled']
         results['sto_attempts'] = m['attempts']
@@ -221,16 +259,24 @@ def run_single_comparison(submission_cost, exec_cost, run_seed=42):
         results['sto_submission_cost'] = m['submission_cost']
         results['sto_execution_cost'] = m['execution_cost']
         results['sto_utility'] = m['utility']
-        print(f"      Stochastic: sched={m['scheduled']}, qual={m['quality']:.1f}, cost={m['cost']:.1f}, util={m['utility']:.1f}")
+        results['sto_ticks'] = ticks
+        results['sto_elapsed_s'] = sto_elapsed
+        print(f"      Stochastic: sched={m['scheduled']}, qual={m['quality']:.1f}, cost={m['cost']:.1f}, util={m['utility']:.1f}, ticks={ticks}, time={sto_elapsed:.1f}s")
     except Exception as e:
         print(f"      Stochastic FAILED: {e}")
+        import traceback
+        traceback.print_exc()
         results['sto_scheduled'] = 0
         results['sto_quality'] = 0
         results['sto_cost'] = 0
         results['sto_utility'] = 0
+        results['sto_ticks'] = 0
+        results['sto_elapsed_s'] = 0
 
     # === DETERMINISTIC ===
     print(f"    Running deterministic (sub={submission_cost:.2f}, exec={exec_cost:.2f})...")
+    det_start = time.time()
+
     random.seed(run_seed)
     np.random.seed(run_seed)
 
@@ -251,8 +297,9 @@ def run_single_comparison(submission_cost, exec_cost, run_seed=42):
             update_requests=False,
             tax_rate=TAX_RATE
         )
-        run_simulation_forward(world_det)
+        ticks = run_simulation_forward(world_det)
         m = compute_metrics(broker_det._workflow_graph, broker_det, submission_cost, exec_cost)
+        det_elapsed = time.time() - det_start
 
         results['det_scheduled'] = m['scheduled']
         results['det_attempts'] = m['attempts']
@@ -262,13 +309,19 @@ def run_single_comparison(submission_cost, exec_cost, run_seed=42):
         results['det_submission_cost'] = m['submission_cost']
         results['det_execution_cost'] = m['execution_cost']
         results['det_utility'] = m['utility']
-        print(f"      Deterministic: sched={m['scheduled']}, qual={m['quality']:.1f}, cost={m['cost']:.1f}, util={m['utility']:.1f}")
+        results['det_ticks'] = ticks
+        results['det_elapsed_s'] = det_elapsed
+        print(f"      Deterministic: sched={m['scheduled']}, qual={m['quality']:.1f}, cost={m['cost']:.1f}, util={m['utility']:.1f}, ticks={ticks}, time={det_elapsed:.1f}s")
     except Exception as e:
         print(f"      Deterministic FAILED: {e}")
+        import traceback
+        traceback.print_exc()
         results['det_scheduled'] = 0
         results['det_quality'] = 0
         results['det_cost'] = 0
         results['det_utility'] = 0
+        results['det_ticks'] = 0
+        results['det_elapsed_s'] = 0
 
     return results
 
@@ -288,8 +341,8 @@ def run_ablation_study():
     print(f"\n[Results] Saving to directory: {results_dir}")
 
     # Define parameter grid
-    submission_costs = [0.00, 0.05, 0.10, 0.15]
-    execution_costs = [0.00, 0.10, 0.20, 0.30, 0.40]
+    submission_costs = [0.00, 0.10, 0.15]
+    execution_costs = [0.05, 0.20, 0.40]
 
     print(f"\n[Config] Testing {len(submission_costs)} x {len(execution_costs)} = {len(submission_costs) * len(execution_costs)} combinations")
     print(f"  Submission costs: {submission_costs}")

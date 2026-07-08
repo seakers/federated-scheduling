@@ -27,7 +27,7 @@ from fame_workflow import *
 
 # Configuration
 SIMULATION_START = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
-lookahead_horizon_h = 9
+lookahead_horizon_h = 36
 FOLLOW_UP_INTERVAL_H = 3
 MAX_SOLVER_TIME_S = 300
 
@@ -430,8 +430,8 @@ def run_comparison(num_monte_carlo_runs=2):
 
     # === COST CONFIGURATION ===
     TAX_RATE = 0.0              # Legacy execution cost (disabled)
-    SUBMISSION_COST = 0.0       # Unconditional booking submission overhead
-    EXEC_COST = 0.40     # Conditional execution cost if accepted
+    SUBMISSION_COST = 0.1       # Unconditional booking submission overhead
+    EXEC_COST = 0.3      # Conditional execution cost if accepted
 
     def compute_metrics(workflow_graph, broker, submission_cost_rate, execution_cost_rate):
         """
@@ -867,4 +867,4 @@ def run_comparison(num_monte_carlo_runs=2):
 
 
 if __name__ == "__main__":
-    run_comparison(num_monte_carlo_runs=2)
+    run_comparison(num_monte_carlo_runs=3)
