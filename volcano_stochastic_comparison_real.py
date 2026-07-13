@@ -14,6 +14,8 @@ import os
 import random
 import json
 from typing import Callable
+import pyorbital
+import pyorbital.orbital
 
 # Load environment variables
 load_dotenv()
@@ -27,9 +29,10 @@ from fame_workflow import *
 
 # Configuration
 SIMULATION_START = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
-lookahead_horizon_h = 36
+lookahead_horizon_h = 9
 FOLLOW_UP_INTERVAL_H = 3
 MAX_SOLVER_TIME_S = 300
+MAX_NUM_INSTANCES = 5
 
 
 def load_volcano_locations_from_database() -> list[Location]:
@@ -63,46 +66,145 @@ def load_volcano_locations_from_database() -> list[Location]:
 
 
 def load_satellites_once() -> list[Satellite]:
-    """Parses real LEO orbital parameters from local text catalogs once to clear loop friction."""
+    """Dynamically loads all 87 LEO satellites from TLE files using notebook approach."""
     from pyorbital.orbital import Orbital
+    import pyorbital
 
     tle_files = glob.glob("tles/all_tles_*.txt")
     if not tle_files:
         raise FileNotFoundError("No text TLE files found in the tles/ folder context.")
     tle_file_txt = sorted(tle_files)[-1]
-    
-    # Match notebook's satellite setup with 8 constellations
-    satellite_configs = {
-        # Planet constellation (RGB + Hyperspectral)
-        "SKYSAT C1": (5.9, InstrumentType.RGB),
-        "SKYSAT C2": (5.9, InstrumentType.RGB),
-        "SKYSAT C3": (5.9, InstrumentType.RGB),
-        "SKYSAT C4": (5.9, InstrumentType.RGB),
-        "SKYSAT C5": (5.9, InstrumentType.RGB),
-        "SKYSAT C6": (5.9, InstrumentType.RGB),
-        "SKYSAT C7": (5.9, InstrumentType.RGB),
-        "SKYSAT C8": (5.9, InstrumentType.RGB),
-        "SKYSAT C9": (5.9, InstrumentType.RGB),
-        "SKYSAT C10": (5.9, InstrumentType.RGB),
-        "SKYSAT C11": (5.9, InstrumentType.RGB),
-        "SKYSAT C12": (5.9, InstrumentType.RGB),
-        # Umbra constellation (SAR)
-        "UMBRA-07": (8.0, InstrumentType.SAR),
-        "UMBRA-09": (8.0, InstrumentType.SAR),
-        "UMBRA-10": (8.0, InstrumentType.SAR),
-        "UMBRA-11": (8.0, InstrumentType.SAR),
-        # Capella constellation (SAR)
-        "CAPELLA-11 (ACADIA)": (10.0, InstrumentType.SAR),
-        "CAPELLA-13 (ACADIA)": (10.0, InstrumentType.SAR),
-        "CAPELLA-14 (ACADIA)": (10.0, InstrumentType.SAR),
-        "CAPELLA-15 (ACADIA)": (10.0, InstrumentType.SAR),
+
+    # Swath definitions matching notebook
+    swaths_at_nadir_km = {
+        "SKYSAT-A": 8,
+        "SKYSAT-B": 8,
+        "SKYSAT-C1": 5.9,
+        "SKYSAT-C2": 5.9,
+        "SKYSAT-C3": 5.9,
+        "SKYSAT-C4": 5.9,
+        "SKYSAT-C5": 5.9,
+        "SKYSAT-C6": 5.9,
+        "SKYSAT-C7": 5.9,
+        "SKYSAT-C8": 5.9,
+        "SKYSAT-C9": 5.9,
+        "SKYSAT-C10": 5.9,
+        "SKYSAT-C11": 5.9,
+        "SKYSAT-C12": 5.9,
+        "SKYSAT-C13": 5.9,
+        "PELICAN-1 3001": 8,
+        "PELICAN-2 3009": 8,
+        "PELICAN-3 300A": 8,
+        "PELICAN-4 300B": 8,
+        "PELICAN-5 300C": 8,
+        "PELICAN-6 300D": 8,
+        "TANAGER-4001": 18,
+        "UMBRA-07": 8,
+        "UMBRA-09": 8,
+        "UMBRA-10": 8,
+        "UMBRA-11": 8,
+        "CAPELLA-11 (ACADIA)": 10,
+        "CAPELLA-13 (ACADIA)": 10,
+        "CAPELLA-14 (ACADIA)": 10,
+        "CAPELLA-15 (ACADIA)": 10,
+        "CAPELLA-16 (ACADIA)": 10,
+        "CAPELLA-17 (ACADIA)": 10,
+        "LOFT YAM-6": 19.8,
+        "Ubotica CogniSat-6 HAMMER": 20,
+        "Ubotica ACCENTURE-1 SUAC": 20,
+        "Mission Control Persistence": 100,
+        "AEROCUBE 18A": 80,
+        "AEROCUBE 18B": 80,
+    }
+
+    # Extract Flock (DOVE) and ICEYE satellite names from TLE file
+    flock_names = []
+    iceye_names = []
+    with open(tle_file_txt, 'r') as file:
+        for line in file:
+            if line.startswith("FLOCK"):
+                flock_names.append(line.strip())
+            elif line.startswith("ICEYE"):
+                iceye_names.append(line.strip())
+
+    # Add dynamic satellite swaths
+    for dove_name in flock_names:
+        swaths_at_nadir_km[dove_name] = 16.4
+    for iceye_name in iceye_names:
+        swaths_at_nadir_km[iceye_name] = 100
+
+    # Map TLE names to display names for known satellites (matching notebook)
+    tle_to_display = {
+        "SKYSAT 1": "SKYSAT-A",
+        "SKYSAT 2": "SKYSAT-B",
+        "SKYSAT C1": "SKYSAT-C1",
+        "SKYSAT C2": "SKYSAT-C2",
+        "SKYSAT C3": "SKYSAT-C3",
+        "SKYSAT C4": "SKYSAT-C4",
+        "SKYSAT C5": "SKYSAT-C5",
+        "SKYSAT C6": "SKYSAT-C6",
+        "SKYSAT C7": "SKYSAT-C7",
+        "SKYSAT C8": "SKYSAT-C8",
+        "SKYSAT C9": "SKYSAT-C9",
+        "SKYSAT C10": "SKYSAT-C10",
+        "SKYSAT C11": "SKYSAT-C11",
+        "SKYSAT C12": "SKYSAT-C12",
+        "SKYSAT C13": "SKYSAT-C13",
+    }
+
+    # Define constellation memberships and instruments
+    sat_constellation_map = {
+        "SKYSAT": ("Planet", InstrumentType.RGB),
+        "PELICAN": ("Planet", InstrumentType.RGB),
+        "TANAGER": ("Planet", InstrumentType.HYPERSPECTRAL),
+        "FLOCK": ("Planet", InstrumentType.RGB),
+        "UMBRA": ("Umbra", InstrumentType.SAR),
+        "CAPELLA": ("Capella", InstrumentType.SAR),
+        "ACADIA": ("Capella", InstrumentType.SAR),
+        "YAM": ("LOFT", InstrumentType.HYPERSPECTRAL),
+        "LOFT": ("LOFT", InstrumentType.HYPERSPECTRAL),
+        "HAMMER": ("Ubotica", InstrumentType.HYPERSPECTRAL),
+        "ACCENTURE": ("Ubotica", InstrumentType.HYPERSPECTRAL),
+        "LEMUR": ("Mission Control", InstrumentType.RGB),
+        "KRISH": ("Mission Control", InstrumentType.RGB),
+        "PERSISTENCE": ("Mission Control", InstrumentType.RGB),
+        "AEROCUBE": ("Aerospace", InstrumentType.RGB),
+        "ICEYE": ("ICEYE", InstrumentType.SAR),
     }
 
     satellites = []
-    for name, (swath_km, instrument) in satellite_configs.items():
+    skipped_count = 0
+
+    # Load all satellites dynamically
+    min_time = SIMULATION_START
+    max_time = SIMULATION_START + dt.timedelta(seconds=3600 * lookahead_horizon_h)
+    display_to_tle = {v: k for k, v in tle_to_display.items()}
+    for display_name, swath_km in swaths_at_nadir_km.items():
+        # Find TLE name
+        # 1. Create a reverse lookup dictionary once before the loop
+        tle_name = display_to_tle.get(display_name, display_name)
+        # Determine constellation and instrument
+        constellation = "Unknown"
+        instrument = InstrumentType.RGB
+        for key, (const, inst) in sat_constellation_map.items():
+            if key in display_name.upper():
+                constellation = const
+                instrument = inst
+                break
+
         try:
-            orbit = Orbital(name, tle_file=tle_file_txt)
-            sat = Satellite(name, orbit, instruments=[instrument], has_continuous_isl_to_ground=True)
+            orbit = Orbital(tle_name, tle_file=tle_file_txt)
+
+            # Test orbit propagation to verify satellite is valid
+            try:
+                _ = orbit.get_lonlatalt(min_time)
+                _ = orbit.get_lonlatalt(max_time)
+            except (NotImplementedError, Exception):
+                print(f"[Skipped] {display_name} failed orbit propagation tests (decayed/deep space).")
+                skipped_count += 1
+                continue
+
+            sat = Satellite(display_name, orbit, instruments=[instrument], has_continuous_isl_to_ground=True)
 
             # Initialize Field-of-View geometry profiles
             _semi_major = sat.orbit.orbit_elements.semi_major_axis * pyorbital.orbital.A
@@ -112,10 +214,11 @@ def load_satellites_once() -> list[Satellite]:
 
             satellites.append(sat)
         except Exception as e:
-            print(f"[Warning] Could not load {name}: {e}")
+            print(f"[Warning] Could not load {display_name} (TLE: {tle_name}): {e}")
+            skipped_count += 1
             continue
 
-    print(f"[Init] Cached {len(satellites)} satellites safely in memory context.\n")
+    print(f"[Init] Loaded {len(satellites)} satellites (skipped {skipped_count} decayed/invalid).\n")
     return satellites
 
 
@@ -285,7 +388,8 @@ def create_volcano_workflow(volcano_locations, min_time, max_time):
             ],
             rewarder=rewarder_observation,
             success_declarer=success_declarer_eruption,
-            request_group=volcano.name
+            request_group=volcano.name,
+            max_num_instances = MAX_NUM_INSTANCES
         )
         constrained_requests.append(detection_task)
 
@@ -316,7 +420,7 @@ def create_volcano_workflow(volcano_locations, min_time, max_time):
                 rewarder=rewarder_observation,
                 success_declarer=success_declarer_eruption,
                 request_group=volcano.name,
-                max_num_instances=5
+                max_num_instances=MAX_NUM_INSTANCES
             )
             constrained_requests.append(follow_up_task)
 
@@ -348,7 +452,25 @@ def run_comparison(num_monte_carlo_runs=2):
     timestamp = dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
     results_dir = os.path.join("results", f"volcano_{timestamp}")
     os.makedirs(results_dir, exist_ok=True)
+    plots_dir = os.path.join(results_dir, "plots")
+    media_dir = os.path.join(results_dir, "media")
+    os.makedirs(plots_dir, exist_ok=True)
+    os.makedirs(media_dir, exist_ok=True)
+
+    # Create separate subdirectories for each broker type
+    plots_dir_det = os.path.join(plots_dir, "deterministic")
+    plots_dir_stoch_log = os.path.join(plots_dir, "stochastic_log")
+    plots_dir_stoch_nc = os.path.join(plots_dir, "stochastic_nc")
+    os.makedirs(plots_dir_det, exist_ok=True)
+    os.makedirs(plots_dir_stoch_log, exist_ok=True)
+    os.makedirs(plots_dir_stoch_nc, exist_ok=True)
+
     print(f"\n[Results] Saving to directory: {results_dir}")
+    print(f"[Plots] Saving schedule plots to: {plots_dir}")
+    print(f"  - Deterministic: {plots_dir_det}")
+    print(f"  - Stochastic Log: {plots_dir_stoch_log}")
+    print(f"  - Stochastic NC: {plots_dir_stoch_nc}")
+    print(f"[Media] Saving schedule media to: {media_dir}")
 
     # Load assets outside the loop context to preserve runtime speeds
     cached_satellites = load_satellites_once()
@@ -578,7 +700,7 @@ def run_comparison(num_monte_carlo_runs=2):
         # (same acceptance/rejection outcomes, same stochastic events)
         run_seed = 42 + run_idx  # Different seed per run, but same across the 3 schedulers within each run
         print(f"  Using random seed: {run_seed} (all 3 schedulers will face identical conditions)")
-         # --- Test 2: Stochastic Log-Linearized Track ---
+          # --- Test 2: Stochastic Log-Linearized Track ---
         print("\n  Running stochastic MILP engine (log-linearized)...")
         random.seed(run_seed)  # CRITICAL: Reset RNG to SAME seed for fair comparison
         np.random.seed(run_seed)
@@ -589,19 +711,28 @@ def run_comparison(num_monte_carlo_runs=2):
         world2.add_broker(broker_log)
 
         try:
-            broker_log.schedule_workflow(
-                current_time=world2.time, use_ilp=True, use_stochastic=True,
-                stochastic_formulation="log_linearized",
-                # NEW: Two-stage probability model
-                acceptance_probability_function=acceptance_prob_function,
-                execution_probability_function=execution_prob_function,
-                # NEW: Cost structure
-                submission_cost_rate=SUBMISSION_COST,
-                execution_cost_rate=EXEC_COST,
-                tax_rate=TAX_RATE,
-                max_solver_time_s=MAX_SOLVER_TIME_S, solver_engine="GUROBI",
-                update_timelines=False, update_requests=False
-            )
+            # Save schedule plot to stochastic_log subdirectory
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(plots_dir_stoch_log)
+                broker_log.schedule_workflow(
+                    current_time=world2.time, use_ilp=True, use_stochastic=True,
+                    stochastic_formulation="log_linearized",
+                    # NEW: Two-stage probability model
+                    acceptance_probability_function=acceptance_prob_function,
+                    execution_probability_function=execution_prob_function,
+                    # NEW: Cost structure
+                    submission_cost_rate=SUBMISSION_COST,
+                    execution_cost_rate=EXEC_COST,
+                    tax_rate=TAX_RATE,
+                    max_solver_time_s=MAX_SOLVER_TIME_S, solver_engine="GUROBI",
+                    update_timelines=True, update_requests=False,
+                    plot_schedule=True,
+                    save_schedule_plot=True,
+                    results_path=results_dir
+                )
+            finally:
+                os.chdir(original_cwd)
             run_simulation_forward(world2)
             m = compute_metrics(broker_log._workflow_graph, broker_log, SUBMISSION_COST, EXEC_COST)
             results['stochastic_log_scheduled'].append(m['scheduled'])
@@ -631,7 +762,6 @@ def run_comparison(num_monte_carlo_runs=2):
             print(f"  [Saved] {run_file}")
         except Exception as e:
             print(f"    Broker Error: {e}")
-
         # # --- Test 1: Deterministic Track ---
         print("\n  Running deterministic ILP engine...")
         random.seed(run_seed)  # Reset RNG to run_seed
@@ -643,11 +773,20 @@ def run_comparison(num_monte_carlo_runs=2):
         world1.add_broker(broker_det)
 
         try:
-            broker_det.schedule_workflow(
-                current_time=world1.time, use_ilp=True, use_stochastic=False,
-                max_solver_time_s=MAX_SOLVER_TIME_S, solver_engine="GUROBI",
-                update_timelines=False, update_requests=False, tax_rate=TAX_RATE
-            )
+            # Save schedule plot to deterministic subdirectory
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(plots_dir_det)
+                broker_det.schedule_workflow(
+                    current_time=world1.time, use_ilp=True, use_stochastic=False,
+                    max_solver_time_s=MAX_SOLVER_TIME_S, solver_engine="GUROBI",
+                    update_timelines=True, update_requests=False, tax_rate=TAX_RATE,
+                    plot_schedule=True,
+                    save_schedule_plot=True,
+                    results_path=results_dir
+                )
+            finally:
+                os.chdir(original_cwd)
             run_simulation_forward(world1)
             m = compute_metrics(broker_det._workflow_graph, broker_det, SUBMISSION_COST, EXEC_COST)  # Count costs in metrics for deterministic too
             results['deterministic_scheduled'].append(m['scheduled'])
@@ -678,6 +817,9 @@ def run_comparison(num_monte_carlo_runs=2):
         except Exception as e:
             print(f"    Broker Error: {e}")
 
+       
+
+        
        
         # # --- Test 3: Stochastic Non-Convex Track ---
         # print("\n  Running stochastic MILP engine (non-convex)...")
@@ -867,4 +1009,4 @@ def run_comparison(num_monte_carlo_runs=2):
 
 
 if __name__ == "__main__":
-    run_comparison(num_monte_carlo_runs=3)
+    run_comparison(num_monte_carlo_runs=1)

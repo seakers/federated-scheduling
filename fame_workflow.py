@@ -758,6 +758,7 @@ def ilp_schedule_workflow(
         solver_engine: str = "GUROBI",  # <-- ADD THIS (Options: "SCIP" or "GUROBI")
         tax_rate: float = 0.0  # Cost per scheduled obs as fraction of max quality. Set to 0 to disable.
 ):
+    workflow_graph_request=workflow_graph
     print(f"Function ILP scheduler, the solver engine is {solver_engine}")
     
     if verbose>2:
@@ -1386,7 +1387,7 @@ def plot_workflow_schedule(
         height_ratios = [num_request_groups]
         height_ratios.extend([1,]*num_timelines)
         fig, axes = plt.subplots(num_timelines+1,1, sharex=True, height_ratios=height_ratios, figsize=(12, int(math.ceil(.2*num_request_groups+num_timelines))))
-    else:
+    else: 
         if ((type(axes)==list) or (type(axes) == np.ndarray)):
             for ax in axes:
                 ax.clear()

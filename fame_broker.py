@@ -351,7 +351,8 @@ class Broker():
             tax_rate: float = 0.0,  # Cost per scheduled obs as fraction of max quality. 0 = disabled.
             submission_cost_rate: float = 0.0,  # c_sub: unconditional per-booking submission overhead
             cancellation_cost_rate: float = 0.0,  # c_canc: conditional cancellation cost if accepted
-            max_reschedule_depth: int = 10  # Maximum recursive rescheduling depth to prevent infinite loops
+            max_reschedule_depth: int = 10,  # Maximum recursive rescheduling depth to prevent infinite loops
+            results_path: str = ""
     ):
         # Prevent infinite rescheduling loops (rejection/timeout triggering more rescheduling)
         if self._reschedule_depth >= max_reschedule_depth:
@@ -441,18 +442,16 @@ class Broker():
             #     plt.savefig(figure_name, bbox_inches='tight')
             # else:
             #     plot_axes[0].get_figure().savefig(figure_name, bbox_inches='tight')
-            # 1. Clean the time string at the very beginning of the block
-            safe_time_str = str(self.world.time).replace(':', '-')
-
-           # 2. Use the safe_time_str to build the filename
-            figure_name = "media/Schedule_{}_e{:05d}_{}.pdf".format(safe_time_str, self._workflow_schedule_epoch, self.name)
-
-# 3. Now the filename is clean for both branches!
+            # Save schedule plot when requested
             if save_schedule_plot:
-                plt.savefig(figure_name, bbox_inches='tight')
-            else:
-    # Line 388 will now safely use your sanitized hyphenated string
-                plot_axes[0].get_figure().savefig(figure_name, bbox_inches='tight')
+                safe_time_str = str(self.world.time).replace(':', '-')
+                figure_name = "Schedule_{}_e{:05d}_{}.pdf".format(safe_time_str, self._workflow_schedule_epoch, self.name)
+
+                # Save directly to current working directory (which is already plots_dir from caller's chdir)
+                if plot_axes is None:
+                    plt.savefig(figure_name, bbox_inches='tight')
+                else:
+                    plot_axes[0].get_figure().savefig(figure_name, bbox_inches='tight')
 
         local_workflow_schedule_epoch_when_dispatching_started = self._workflow_schedule_epoch
 
