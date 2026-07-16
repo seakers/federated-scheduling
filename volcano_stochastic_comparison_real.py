@@ -5,6 +5,8 @@ Using real satellite constellations from TLE files and GVP database
 
 import datetime as dt
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from dotenv import load_dotenv
 import pandas as pd
