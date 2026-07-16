@@ -29,10 +29,10 @@ from fame_workflow import *
 
 # Configuration
 SIMULATION_START = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
-lookahead_horizon_h = 9
+lookahead_horizon_h = 9  # Reduced from 18 to make stochastic tractable
 FOLLOW_UP_INTERVAL_H = 3
-MAX_SOLVER_TIME_S = 300
-MAX_NUM_INSTANCES = 5
+MAX_SOLVER_TIME_S = 100  # Increased from 300 to give more time
+MAX_NUM_INSTANCES = 3 
 
 
 def load_volcano_locations_from_database() -> list[Location]:
@@ -40,7 +40,7 @@ def load_volcano_locations_from_database() -> list[Location]:
     Reads the global GVP Holocene databases, merges the eruption catalogs,
     and isolates high-priority target positions (VEI > 4, Start Year > 1900).
     """
-    print("[Data] Reading GVP Volcano and Eruption database files...")
+    print("[Data] Reading GVP Volcano and Eruption databa se files...")
     volcano_df = pd.read_excel('data/GVP_Volcano_List_Holocene_202606021456.xlsx', header=1)
     eruption_df = pd.read_excel('data/GVP_Eruption_List_Holocene_20260424.xlsx', sheet_name="Eruption List", header=1)
     
@@ -277,7 +277,7 @@ def create_world_and_constellations(cached_satellites: list[Satellite]):
         ground_stations=ground_stations,
         world=world,
         name="Planet",
-        acceptance_probability=0.70
+        acceptance_probability=0.40
     )
 
     scheduler_umbra = ConstellationGroundScheduler(
@@ -285,7 +285,7 @@ def create_world_and_constellations(cached_satellites: list[Satellite]):
         ground_stations=ground_stations,
         world=world,
         name="Umbra",
-        acceptance_probability=0.85
+        acceptance_probability=0.60
     )
 
     scheduler_capella = ConstellationGroundScheduler(
@@ -301,7 +301,7 @@ def create_world_and_constellations(cached_satellites: list[Satellite]):
         ground_stations=ground_stations,
         world=world,
         name="LOFT",
-        acceptance_probability=0.92
+        acceptance_probability=0.71
     )
 
     scheduler_ubotica = ConstellationGroundScheduler(
@@ -309,7 +309,7 @@ def create_world_and_constellations(cached_satellites: list[Satellite]):
         ground_stations=ground_stations,
         world=world,
         name="Ubotica",
-        acceptance_probability=0.93
+        acceptance_probability=0.50
     )
 
     scheduler_mission_control = ConstellationGroundScheduler(
@@ -317,7 +317,7 @@ def create_world_and_constellations(cached_satellites: list[Satellite]):
         ground_stations=ground_stations,
         world=world,
         name="Mission Control",
-        acceptance_probability=0.94
+        acceptance_probability=0.64
     )
 
     scheduler_aerospace = ConstellationGroundScheduler(
@@ -325,7 +325,7 @@ def create_world_and_constellations(cached_satellites: list[Satellite]):
         ground_stations=ground_stations,
         world=world,
         name="AC",
-        acceptance_probability=0.95
+        acceptance_probability=0.67
     )
 
     scheduler_iceye = ConstellationGroundScheduler(
@@ -333,7 +333,7 @@ def create_world_and_constellations(cached_satellites: list[Satellite]):
         ground_stations=ground_stations,
         world=world,
         name="ICEYE",
-        acceptance_probability=0.96
+        acceptance_probability=0.74
     )
 
     all_constellations = [
@@ -458,10 +458,12 @@ def run_comparison(num_monte_carlo_runs=2):
     os.makedirs(media_dir, exist_ok=True)
 
     # Create separate subdirectories for each broker type
+    plots_dir_greedy = os.path.join(plots_dir, "greedy")
     plots_dir_det = os.path.join(plots_dir, "deterministic")
     plots_dir_stoch_log = os.path.join(plots_dir, "stochastic_log")
     plots_dir_stoch_nc = os.path.join(plots_dir, "stochastic_nc")
     os.makedirs(plots_dir_det, exist_ok=True)
+    os.makedirs(plots_dir_greedy, exist_ok=True)
     os.makedirs(plots_dir_stoch_log, exist_ok=True)
     os.makedirs(plots_dir_stoch_nc, exist_ok=True)
 
@@ -540,14 +542,21 @@ def run_comparison(num_monte_carlo_runs=2):
     results = {
         'deterministic_scheduled': [], 'deterministic_attempts': [], 'deterministic_rejections': [],
         'deterministic_quality': [], 'deterministic_cost': [], 'deterministic_utility': [],
+        'deterministic_avg_passes_per_request': [],
         'stochastic_log_scheduled': [], 'stochastic_log_attempts': [], 'stochastic_log_rejections': [],
         'stochastic_log_quality': [], 'stochastic_log_cost': [], 'stochastic_log_utility': [],
+        'stochastic_log_avg_passes_per_request': [],
         'stochastic_nc_scheduled': [], 'stochastic_nc_attempts': [], 'stochastic_nc_rejections': [],
         'stochastic_nc_quality': [], 'stochastic_nc_cost': [], 'stochastic_nc_utility': [],
+        'stochastic_nc_avg_passes_per_request': [],
+        'greedy_scheduled': [],      'greedy_attempts': [],    'greedy_rejections': [],
+        'greedy_quality': [],        'greedy_cost': [],        'greedy_utility': [],
+        'greedy_avg_passes_per_request': [],
         # Track rejected request names per run to verify fair comparison
         'deterministic_rejected_requests': [],
         'stochastic_log_rejected_requests': [],
-        'stochastic_nc_rejected_requests': []
+        'stochastic_nc_rejected_requests': [],
+        'greedy_rejected_requests': []
     }
 
     # === COST CONFIGURATION ===
@@ -651,8 +660,13 @@ def run_comparison(num_monte_carlo_runs=2):
         # Calculate average quality per scheduled task for insight
         avg_quality_per_task = total_realized_quality / len(scheduled) if len(scheduled) > 0 else 0.0
 
+        # Calculate average passes per request (unique request names)
+        unique_scheduled_requests = set(task.name for task in scheduled)
+        avg_passes_per_request = len(scheduled) / len(unique_scheduled_requests) if len(unique_scheduled_requests) > 0 else 0.0
+
         print(f"\n   [DEBUG] Completed: {len(completed_tasks)}, Successful: {len(successful_tasks)}")
         print(f"   [DEBUG] Scheduled: {len(scheduled)}, Avg Quality/Task: {avg_quality_per_task:.2f}")
+        print(f"   [DEBUG] Unique Requests: {len(unique_scheduled_requests)}, Avg Passes/Request: {avg_passes_per_request:.2f}")
         print(f"   [DEBUG] Quality: {total_realized_quality:.2f}")
         print(f"   [DEBUG] Costs: Submission={total_submission_cost:.2f}, Execution={total_execution_cost:.2f}, Total={total_cost:.2f}")
         print(f"   [DEBUG] Rejected requests: {rejected_request_names[:5]}..." if len(rejected_request_names) > 5 else f"   [DEBUG] Rejected requests: {rejected_request_names}")
@@ -667,6 +681,7 @@ def run_comparison(num_monte_carlo_runs=2):
             'submission_cost': total_submission_cost,
             'execution_cost': total_execution_cost,
             'utility': total_realized_quality - total_cost,
+            'avg_passes_per_request': avg_passes_per_request,
         }
 
     def run_simulation_forward(world, max_safety_limit=40000):
@@ -700,113 +715,47 @@ def run_comparison(num_monte_carlo_runs=2):
         # (same acceptance/rejection outcomes, same stochastic events)
         run_seed = 42 + run_idx  # Different seed per run, but same across the 3 schedulers within each run
         print(f"  Using random seed: {run_seed} (all 3 schedulers will face identical conditions)")
-          # --- Test 2: Stochastic Log-Linearized Track ---
-        print("\n  Running stochastic MILP engine (log-linearized)...")
-        random.seed(run_seed)  # CRITICAL: Reset RNG to SAME seed for fair comparison
-        np.random.seed(run_seed)
-        world2, const2 = create_world_and_constellations(cached_satellites)
-        workflow2 = create_volcano_workflow(volcano_db_locations, min_time, max_time)
-        broker_log = Broker(constellations=const2, world=world2, name="Broker-Stoch-Log")
-        broker_log.add_workflow(workflow2)
-        world2.add_broker(broker_log)
-
-        try:
-            # Save schedule plot to stochastic_log subdirectory
-            original_cwd = os.getcwd()
-            try:
-                os.chdir(plots_dir_stoch_log)
-                broker_log.schedule_workflow(
-                    current_time=world2.time, use_ilp=True, use_stochastic=True,
-                    stochastic_formulation="log_linearized",
-                    # NEW: Two-stage probability model
-                    acceptance_probability_function=acceptance_prob_function,
-                    execution_probability_function=execution_prob_function,
-                    # NEW: Cost structure
-                    submission_cost_rate=SUBMISSION_COST,
-                    execution_cost_rate=EXEC_COST,
-                    tax_rate=TAX_RATE,
-                    max_solver_time_s=MAX_SOLVER_TIME_S, solver_engine="GUROBI",
-                    update_timelines=True, update_requests=False,
-                    plot_schedule=True,
-                    save_schedule_plot=True,
-                    results_path=results_dir
-                )
-            finally:
-                os.chdir(original_cwd)
-            run_simulation_forward(world2)
-            m = compute_metrics(broker_log._workflow_graph, broker_log, SUBMISSION_COST, EXEC_COST)
-            results['stochastic_log_scheduled'].append(m['scheduled'])
-            results['stochastic_log_attempts'].append(m['attempts'])
-            results['stochastic_log_rejections'].append(m['rejections'])
-            results['stochastic_log_rejected_requests'].append(m['rejected_requests'])
-            results['stochastic_log_quality'].append(m['quality'])
-            results['stochastic_log_cost'].append(m['cost'])
-            results['stochastic_log_utility'].append(m['utility'])
-
-            # SAVE IMMEDIATELY after this run completes
-            run_file = os.path.join(results_dir, f"run_{run_idx+1:03d}_stochastic_log.json")
-            with open(run_file, 'w') as f:
-                json.dump({
-                    'run': run_idx + 1,
-                    'scheduler': 'stochastic_log',
-                    'scheduled': m['scheduled'],
-                    'attempts': m['attempts'],
-                    'rejections': m['rejections'],
-                    'rejected_requests': m['rejected_requests'],
-                    'quality': m['quality'],
-                    'cost': m['cost'],
-                    'submission_cost': m['submission_cost'],
-                    'execution_cost': m['execution_cost'],
-                    'utility': m['utility'],
-                }, f, indent=2)
-            print(f"  [Saved] {run_file}")
-        except Exception as e:
-            print(f"    Broker Error: {e}")
-        # # --- Test 1: Deterministic Track ---
-        print("\n  Running deterministic ILP engine...")
+                        # # # --- Test 1: Greedy Track ---
+        print("\n  Running greedy broker...")
         random.seed(run_seed)  # Reset RNG to run_seed
         np.random.seed(run_seed)  # Also reset numpy's RNG
-        world1, const1 = create_world_and_constellations(cached_satellites)
-        workflow1 = create_volcano_workflow(volcano_db_locations, min_time, max_time)
-        broker_det = Broker(constellations=const1, world=world1, name="Broker-Det")
-        broker_det.add_workflow(workflow1)
-        world1.add_broker(broker_det)
+        world3, const3 = create_world_and_constellations(cached_satellites)
+        workflow3 = create_volcano_workflow(volcano_db_locations, min_time, max_time)
+        broker_greedy = Broker(constellations=const3, world=world3, name="Broker-Greedy")
+        broker_greedy.add_workflow(workflow3)
+        world3.add_broker(broker_greedy)
 
         try:
-            # Save schedule plot to deterministic subdirectory
-            original_cwd = os.getcwd()
-            try:
-                os.chdir(plots_dir_det)
-                broker_det.schedule_workflow(
-                    current_time=world1.time, use_ilp=True, use_stochastic=False,
-                    max_solver_time_s=MAX_SOLVER_TIME_S, solver_engine="GUROBI",
-                    update_timelines=True, update_requests=False, tax_rate=TAX_RATE,
-                    plot_schedule=True,
-                    save_schedule_plot=True,
-                    results_path=results_dir
-                )
-            finally:
-                os.chdir(original_cwd)
-            run_simulation_forward(world1)
-            m = compute_metrics(broker_det._workflow_graph, broker_det, SUBMISSION_COST, EXEC_COST)  # Count costs in metrics for deterministic too
-            results['deterministic_scheduled'].append(m['scheduled'])
-            results['deterministic_attempts'].append(m['attempts'])
-            results['deterministic_rejections'].append(m['rejections'])
-            results['deterministic_rejected_requests'].append(m['rejected_requests'])
-            results['deterministic_quality'].append(m['quality'])
-            results['deterministic_cost'].append(m['cost'])
-            results['deterministic_utility'].append(m['utility'])
+            broker_greedy.schedule_workflow(
+                current_time=world3.time, use_ilp=False, use_stochastic=False,
+                max_solver_time_s=MAX_SOLVER_TIME_S,
+                update_timelines=False, update_requests=False, tax_rate=TAX_RATE,
+                plot_schedule=True,
+                save_schedule_plot=True,
+                results_path=plots_dir_greedy
+            )
+            run_simulation_forward(world3)
+            m = compute_metrics(broker_greedy._workflow_graph, broker_greedy, SUBMISSION_COST, EXEC_COST)
+            results['greedy_scheduled'].append(m['scheduled'])
+            results['greedy_attempts'].append(m['attempts'])
+            results['greedy_rejections'].append(m['rejections'])
+            results['greedy_rejected_requests'].append(m['rejected_requests'])
+            results['greedy_quality'].append(m['quality'])
+            results['greedy_cost'].append(m['cost'])
+            results['greedy_utility'].append(m['utility'])
+            results['greedy_avg_passes_per_request'].append(m['avg_passes_per_request'])
 
             # SAVE IMMEDIATELY after this run completes
-            run_file = os.path.join(results_dir, f"run_{run_idx+1:03d}_deterministic.json")
+            run_file = os.path.join(results_dir, f"run_{run_idx+1:03d}_greedy.json")
             with open(run_file, 'w') as f:
                 json.dump({
                     'run': run_idx + 1,
-                    'scheduler': 'deterministic',
+                    'scheduler': 'greedy',
                     'scheduled': m['scheduled'],
                     'attempts': m['attempts'],
                     'rejections': m['rejections'],
                     'rejected_requests': m['rejected_requests'],
+                    'avg_passes_per_request': m['avg_passes_per_request'],
                     'quality': m['quality'],
                     'cost': m['cost'],
                     'submission_cost': m['submission_cost'],
@@ -818,6 +767,115 @@ def run_comparison(num_monte_carlo_runs=2):
             print(f"    Broker Error: {e}")
 
        
+          # --- Test 2: Stochastic Log-Linearized Track ---
+        print("\n  Running stochastic MILP engine (log-linearized)...")
+        random.seed(run_seed)  # CRITICAL: Reset RNG to SAME seed for fair comparison
+        np.random.seed(run_seed)
+        world2, const2 = create_world_and_constellations(cached_satellites)
+        workflow2 = create_volcano_workflow(volcano_db_locations, min_time, max_time)
+        broker_log = Broker(constellations=const2, world=world2, name="Broker-Stoch-Log")
+        broker_log.add_workflow(workflow2)
+        world2.add_broker(broker_log)
+
+        try:
+            broker_log.schedule_workflow(
+                current_time=world2.time, use_ilp=True, use_stochastic=True,
+                stochastic_formulation="log_linearized",
+                # NEW: Two-stage probability model
+                acceptance_probability_function=acceptance_prob_function,
+                execution_probability_function=execution_prob_function,
+                # NEW: Cost structure
+                submission_cost_rate=SUBMISSION_COST,
+                execution_cost_rate=EXEC_COST,
+                tax_rate=TAX_RATE,
+                max_solver_time_s=MAX_SOLVER_TIME_S, solver_engine="GUROBI",
+                update_timelines=False, update_requests=False,
+                plot_schedule=True,
+                save_schedule_plot=True,
+                results_path=plots_dir_stoch_log
+            )
+            run_simulation_forward(world2)
+            m = compute_metrics(broker_log._workflow_graph, broker_log, SUBMISSION_COST, EXEC_COST)
+            results['stochastic_log_scheduled'].append(m['scheduled'])
+            results['stochastic_log_attempts'].append(m['attempts'])
+            results['stochastic_log_rejections'].append(m['rejections'])
+            results['stochastic_log_rejected_requests'].append(m['rejected_requests'])
+            results['stochastic_log_quality'].append(m['quality'])
+            results['stochastic_log_cost'].append(m['cost'])
+            results['stochastic_log_utility'].append(m['utility'])
+            results['stochastic_log_avg_passes_per_request'].append(m['avg_passes_per_request'])
+
+            # SAVE IMMEDIATELY after this run completes
+            run_file = os.path.join(results_dir, f"run_{run_idx+1:03d}_stochastic_log.json")
+            with open(run_file, 'w') as f:
+                json.dump({
+                    'run': run_idx  + 1,
+                    'scheduler': 'stochastic_log',
+                    'scheduled': m['scheduled'],
+                    'attempts': m['attempts'],
+                    'rejections': m['rejections'],
+                    'rejected_requests': m['rejected_requests'],
+                    'avg_passes_per_request': m['avg_passes_per_request'],
+                    'quality': m['quality'],
+                    'cost': m['cost'],
+                    'submission_cost': m['submission_cost'],
+                    'execution_cost': m['execution_cost'],
+                    'utility': m['utility'],
+                }, f, indent=2)
+            print(f"  [Saved] {run_file}")
+        except Exception as e:
+            print(f"    Broker Error: {e}")
+        # # # --- Test 1: Deterministic Track ---
+        print("\n  Running deterministic ILP engine...")
+        random.seed(run_seed)  # Reset RNG to run_seed
+        np.random.seed(run_seed)  # Also reset numpy's RNG
+        world1, const1 = create_world_and_constellations(cached_satellites)
+        workflow1 = create_volcano_workflow(volcano_db_locations, min_time, max_time)
+        broker_det = Broker(constellations=const1, world=world1, name="Broker-Det")
+        broker_det.add_workflow(workflow1)
+        world1.add_broker(broker_det)
+
+        try:
+            broker_det.schedule_workflow(
+                current_time=world1.time, use_ilp=True, use_stochastic=False,
+                max_solver_time_s=MAX_SOLVER_TIME_S, solver_engine="GUROBI",
+                update_timelines=False, update_requests=False, tax_rate=TAX_RATE,
+                plot_schedule=True,
+                save_schedule_plot=True,
+                results_path=plots_dir_det
+            )
+            run_simulation_forward(world1)
+            m = compute_metrics(broker_det._workflow_graph, broker_det, SUBMISSION_COST, EXEC_COST)
+            results['deterministic_scheduled'].append(m['scheduled'])
+            results['deterministic_attempts'].append(m['attempts'])
+            results['deterministic_rejections'].append(m['rejections'])
+            results['deterministic_rejected_requests'].append(m['rejected_requests'])
+            results['deterministic_quality'].append(m['quality'])
+            results['deterministic_cost'].append(m['cost'])
+            results['deterministic_utility'].append(m['utility'])
+            results['deterministic_avg_passes_per_request'].append(m['avg_passes_per_request'])
+
+            # SAVE IMMEDIATELY after this run completes
+            run_file = os.path.join(results_dir, f"run_{run_idx+1:03d}_deterministic.json")
+            with open(run_file, 'w') as f:
+                json.dump({
+                    'run': run_idx + 1,
+                    'scheduler': 'deterministic',
+                    'scheduled': m['scheduled'],
+                    'attempts': m['attempts'],
+                    'rejections': m['rejections'],
+                    'rejected_requests': m['rejected_requests'],
+                    'avg_passes_per_request': m['avg_passes_per_request'],
+                    'quality': m['quality'],
+                    'cost': m['cost'],
+                    'submission_cost': m['submission_cost'],
+                    'execution_cost': m['execution_cost'],
+                    'utility': m['utility'],
+                }, f, indent=2)
+            print(f"  [Saved] {run_file}")
+        except Exception as e:
+            print(f"    Broker Error: {e}")
+    
 
         
        
@@ -871,25 +929,27 @@ def run_comparison(num_monte_carlo_runs=2):
     print("="*70)
 
     summary_data = []
-    for track in ['deterministic', 'stochastic_log']:
+    for track in ['greedy', 'deterministic', 'stochastic_log']:
         avg_scheduled = np.mean(results[f'{track}_scheduled'])
         avg_attempts = np.mean(results[f'{track}_attempts'])
         avg_rejections = np.mean(results[f'{track}_rejections'])
         avg_utility = np.mean(results[f'{track}_utility'])
         avg_quality = np.mean(results[f'{track}_quality'])
         avg_cost = np.mean(results[f'{track}_cost'])
+        avg_passes_per_req = np.mean(results[f'{track}_avg_passes_per_request'])
         rejection_rate = (avg_rejections / avg_attempts * 100) if avg_attempts > 0 else 0
         avg_quality_per_task = avg_quality / avg_scheduled if avg_scheduled > 0 else 0
 
         print(f"\n{track.upper()}:")
-        print(f"  Final Scheduled:     {avg_scheduled:.1f} ± {np.std(results[f'{track}_scheduled']):.1f}")
-        print(f"  Total Attempts:      {avg_attempts:.1f} ± {np.std(results[f'{track}_attempts']):.1f}")
-        print(f"  Rejections:          {avg_rejections:.1f} ± {np.std(results[f'{track}_rejections']):.1f}")
-        print(f"  Rejection Rate:      {rejection_rate:.1f}%  ← KEY: Stochastic should be lower!")
-        print(f"  Total Quality:       {avg_quality:.1f}")
-        print(f"  Quality per Task:    {avg_quality_per_task:.2f}  ← Higher = better pass selection")
-        print(f"  Total Cost:          {avg_cost:.1f}")
-        print(f"  Net Utility:         {avg_utility:.1f}  ← Quality - Cost")
+        print(f"  Final Scheduled:        {avg_scheduled:.1f} ± {np.std(results[f'{track}_scheduled']):.1f}")
+        print(f"  Total Attempts:         {avg_attempts:.1f} ± {np.std(results[f'{track}_attempts']):.1f}")
+        print(f"  Rejections:             {avg_rejections:.1f} ± {np.std(results[f'{track}_rejections']):.1f}")
+        print(f"  Rejection Rate:         {rejection_rate:.1f}%")
+        print(f"  Avg Passes per Request: {avg_passes_per_req:.2f}  ← Multiple observations per volcano")
+        print(f"  Total Quality:          {avg_quality:.1f}")
+        print(f"  Quality per Task:       {avg_quality_per_task:.2f}  ← Higher = better pass selection")
+        print(f"  Total Cost:             {avg_cost:.1f}")
+        print(f"  Net Utility:            {avg_utility:.1f}  ← Quality - Cost")
 
         summary_data.append({
             'Scheduler': track,
@@ -900,6 +960,7 @@ def run_comparison(num_monte_carlo_runs=2):
             'Rejections_Mean': avg_rejections,
             'Rejections_Std': np.std(results[f'{track}_rejections']),
             'Rejection_Rate_Pct': rejection_rate,
+            'Avg_Passes_Per_Request': avg_passes_per_req,
             'Quality_Mean': avg_quality,
             'Cost_Mean': avg_cost,
             'Utility_Mean': avg_utility,
@@ -910,7 +971,7 @@ def run_comparison(num_monte_carlo_runs=2):
     per_run_rows = []
     num_runs = len(results['deterministic_scheduled'])
     for run_idx in range(num_runs):
-        for track in ['deterministic', 'stochastic_log', 'stochastic_nc']:
+        for track in ['greedy', 'deterministic', 'stochastic_log', 'stochastic_nc']:
             if run_idx < len(results[f'{track}_scheduled']):
                 attempts = results[f'{track}_attempts'][run_idx]
                 rejections = results[f'{track}_rejections'][run_idx]
@@ -921,6 +982,7 @@ def run_comparison(num_monte_carlo_runs=2):
                     'attempts': attempts,
                     'rejections': rejections,
                     'rejection_rate_pct': (rejections / attempts * 100) if attempts > 0 else 0,
+                    'avg_passes_per_request': results[f'{track}_avg_passes_per_request'][run_idx],
                     'quality': results[f'{track}_quality'][run_idx],
                     'cost': results[f'{track}_cost'][run_idx],
                     'utility': results[f'{track}_utility'][run_idx],
@@ -940,8 +1002,8 @@ def run_comparison(num_monte_carlo_runs=2):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
     # Only plot columns that have data (skip NC if not run)
-    count_cols = ['deterministic_scheduled', 'stochastic_log_scheduled']
-    utility_cols = ['deterministic_utility', 'stochastic_log_utility']
+    count_cols = ['greedy_scheduled', 'deterministic_scheduled', 'stochastic_log_scheduled']
+    utility_cols = ['greedy_utility', 'deterministic_utility', 'stochastic_log_utility']
 
     if len(results['stochastic_nc_scheduled']) > 0:
         count_cols.append('stochastic_nc_scheduled')

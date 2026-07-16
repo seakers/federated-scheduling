@@ -8,6 +8,7 @@ import math
 import pandas as pd
 import bisect
 import uuid
+import os
 from enum import Enum
 from collections.abc import Callable
 
@@ -447,11 +448,16 @@ class Broker():
                 safe_time_str = str(self.world.time).replace(':', '-')
                 figure_name = "Schedule_{}_e{:05d}_{}.pdf".format(safe_time_str, self._workflow_schedule_epoch, self.name)
 
-                # Save directly to current working directory (which is already plots_dir from caller's chdir)
-                if plot_axes is None:
-                    plt.savefig(figure_name, bbox_inches='tight')
+                # Use results_path if provided, otherwise save to current directory
+                if results_path:
+                    figure_path = os.path.join(results_path, figure_name)
                 else:
-                    plot_axes[0].get_figure().savefig(figure_name, bbox_inches='tight')
+                    figure_path = figure_name
+
+                if plot_axes is None:
+                    plt.savefig(figure_path, bbox_inches='tight')
+                else:
+                    plot_axes[0].get_figure().savefig(figure_path, bbox_inches='tight')
 
         local_workflow_schedule_epoch_when_dispatching_started = self._workflow_schedule_epoch
 
@@ -537,7 +543,8 @@ class Broker():
                     pwl_tolerance=pwl_tolerance,
                     tax_rate=tax_rate,
                     submission_cost_rate=submission_cost_rate,
-                    cancellation_cost_rate=cancellation_cost_rate
+                    cancellation_cost_rate=cancellation_cost_rate,
+                    results_path=results_path
                 )
                 self._reschedule_depth -= 1
 
@@ -577,7 +584,8 @@ class Broker():
                         pwl_tolerance=pwl_tolerance,
                         tax_rate=tax_rate,
                         submission_cost_rate=submission_cost_rate,
-                        cancellation_cost_rate=cancellation_cost_rate
+                        cancellation_cost_rate=cancellation_cost_rate,
+                        results_path=results_path
                     )
                     self._reschedule_depth -= 1
 
@@ -631,8 +639,18 @@ class Broker():
                     max_solver_time_s=max_solver_time_s,
                     receding_horizon_duration=receding_horizon_duration,
                     save_schedule_plot=save_schedule_plot,
-                    solver_engine=solver_engine
-
+                    solver_engine=solver_engine,
+                    use_stochastic=use_stochastic,
+                    stochastic_formulation=stochastic_formulation,
+                    success_probability_function=success_probability_function,
+                    acceptance_probability_function=acceptance_probability_function,
+                    execution_probability_function=execution_probability_function,
+                    epsilon=epsilon,
+                    pwl_tolerance=pwl_tolerance,
+                    tax_rate=tax_rate,
+                    submission_cost_rate=submission_cost_rate,
+                    cancellation_cost_rate=cancellation_cost_rate,
+                    results_path=results_path
                     )
                 return
 
