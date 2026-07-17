@@ -35,7 +35,7 @@ SIMULATION_START = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 lookahead_horizon_h = 9  # Reduced from 18 to make stochastic tractable
 FOLLOW_UP_INTERVAL_H = 3
 MAX_SOLVER_TIME_S = 100  # Increased from 300 to give more time
-MAX_NUM_INSTANCES = 3 
+MAX_NUM_INSTANCES = 5 
 
 
 def load_volcano_locations_from_database() -> list[Location]:
@@ -693,59 +693,7 @@ def run_comparison(num_monte_carlo_runs=2):
         # (same acceptance/rejection outcomes, same stochastic events)
         run_seed = 42 + run_idx  # Different seed per run, but same across the 3 schedulers within each run
         print(f"  Using random seed: {run_seed} (all 3 schedulers will face identical conditions)")
-                        # # # --- Test 1: Greedy Track ---
-        print("\n  Running greedy broker...")
-        random.seed(run_seed)  # Reset RNG to run_seed
-        np.random.seed(run_seed)  # Also reset numpy's RNG
-        world3, const3 = create_world_and_constellations(cached_satellites, demand_field=demand_field)
-        workflow3 = create_volcano_workflow(volcano_db_locations, min_time, max_time)
-        broker_greedy = Broker(constellations=const3, world=world3, name="Broker-Greedy")
-        broker_greedy.add_workflow(workflow3)
-        world3.add_broker(broker_greedy)
-
-        try:
-            broker_greedy.schedule_workflow(
-                current_time=world3.time, use_ilp=False, use_stochastic=False,
-                max_solver_time_s=MAX_SOLVER_TIME_S,
-                update_timelines=False, update_requests=False, tax_rate=TAX_RATE,
-                plot_schedule=True,
-                save_schedule_plot=True,
-                results_path=plots_dir_greedy
-            )
-            run_simulation_forward(world3)
-            m = compute_metrics(broker_greedy._workflow_graph, broker_greedy, SUBMISSION_COST, EXEC_COST)
-            results['greedy_scheduled'].append(m['scheduled'])
-            results['greedy_attempts'].append(m['attempts'])
-            results['greedy_rejections'].append(m['rejections'])
-            results['greedy_rejected_requests'].append(m['rejected_requests'])
-            results['greedy_quality'].append(m['quality'])
-            results['greedy_cost'].append(m['cost'])
-            results['greedy_utility'].append(m['utility'])
-            results['greedy_avg_passes_per_request'].append(m['avg_passes_per_request'])
-
-            # SAVE IMMEDIATELY after this run completes
-            run_file = os.path.join(results_dir, f"run_{run_idx+1:03d}_greedy.json")
-            with open(run_file, 'w') as f:
-                json.dump({
-                    'run': run_idx + 1,
-                    'scheduler': 'greedy',
-                    'scheduled': m['scheduled'],
-                    'attempts': m['attempts'],
-                    'rejections': m['rejections'],
-                    'rejected_requests': m['rejected_requests'],
-                    'avg_passes_per_request': m['avg_passes_per_request'],
-                    'quality': m['quality'],
-                    'cost': m['cost'],
-                    'submission_cost': m['submission_cost'],
-                    'execution_cost': m['execution_cost'],
-                    'utility': m['utility'],
-                }, f, indent=2)
-            print(f"  [Saved] {run_file}")
-        except Exception as e:
-            print(f"    Broker Error: {e}")
-
-       
-          # --- Test 2: Stochastic Log-Linearized Track ---
+                  # --- Test 2: Stochastic Log-Linearized Track ---
         print("\n  Running stochastic MILP engine (log-linearized)...")
         random.seed(run_seed)  # CRITICAL: Reset RNG to SAME seed for fair comparison
         np.random.seed(run_seed)
@@ -803,6 +751,57 @@ def run_comparison(num_monte_carlo_runs=2):
             print(f"  [Saved] {run_file}")
         except Exception as e:
             print(f"    Broker Error: {e}")
+                        # # # --- Test 1: Greedy Track ---
+        print("\n  Running greedy broker...")
+        random.seed(run_seed)  # Reset RNG to run_seed
+        np.random.seed(run_seed)  # Also reset numpy's RNG
+        world3, const3 = create_world_and_constellations(cached_satellites, demand_field=demand_field)
+        workflow3 = create_volcano_workflow(volcano_db_locations, min_time, max_time)
+        broker_greedy = Broker(constellations=const3, world=world3, name="Broker-Greedy")
+        broker_greedy.add_workflow(workflow3)
+        world3.add_broker(broker_greedy)
+
+        try:
+            broker_greedy.schedule_workflow(
+                current_time=world3.time, use_ilp=False, use_stochastic=False,
+                max_solver_time_s=MAX_SOLVER_TIME_S,
+                update_timelines=False, update_requests=False, tax_rate=TAX_RATE,
+                plot_schedule=True,
+                save_schedule_plot=True,
+                results_path=plots_dir_greedy
+            )
+            run_simulation_forward(world3)
+            m = compute_metrics(broker_greedy._workflow_graph, broker_greedy, SUBMISSION_COST, EXEC_COST)
+            results['greedy_scheduled'].append(m['scheduled'])
+            results['greedy_attempts'].append(m['attempts'])
+            results['greedy_rejections'].append(m['rejections'])
+            results['greedy_rejected_requests'].append(m['rejected_requests'])
+            results['greedy_quality'].append(m['quality'])
+            results['greedy_cost'].append(m['cost'])
+            results['greedy_utility'].append(m['utility'])
+            results['greedy_avg_passes_per_request'].append(m['avg_passes_per_request'])
+
+            # SAVE IMMEDIATELY after this run completes
+            run_file = os.path.join(results_dir, f"run_{run_idx+1:03d}_greedy.json")
+            with open(run_file, 'w') as f:
+                json.dump({
+                    'run': run_idx + 1,
+                    'scheduler': 'greedy',
+                    'scheduled': m['scheduled'],
+                    'attempts': m['attempts'],
+                    'rejections': m['rejections'],
+                    'rejected_requests': m['rejected_requests'],
+                    'avg_passes_per_request': m['avg_passes_per_request'],
+                    'quality': m['quality'],
+                    'cost': m['cost'],
+                    'submission_cost': m['submission_cost'],
+                    'execution_cost': m['execution_cost'],
+                    'utility': m['utility'],
+                }, f, indent=2)
+            print(f"  [Saved] {run_file}")
+        except Exception as e:
+            print(f"    Broker Error: {e}")
+
         # # # --- Test 1: Deterministic Track ---
         print("\n  Running deterministic ILP engine...")
         random.seed(run_seed)  # Reset RNG to run_seed

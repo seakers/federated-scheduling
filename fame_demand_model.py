@@ -88,45 +88,81 @@ class DemandFieldConfig:
     p_max: float = 0.90
 
     # --- sigmoid ---
-    sigmoid_scale: float = 1.5
+    # The demand field lives on a scale of roughly [-3, +3].
+    # sigmoid_scale controls the steepness: at d=+sigmoid_scale → ~73% of the way
+    # from midpoint to p_min; at d=-sigmoid_scale → ~73% of the way to p_max.
+    # A value of 1.0 gives a steep, well-differentiated map.
+    sigmoid_scale: float = 1.0
 
     # --- OU dynamics ---
-    reversion_rate: float = 1.0 / 3600.0   # mean-revert over ~1 hour
-    noise_std: float = 0.10                 # per sqrt-second
+    # κ: mean-reversion rate (1/s).  1/7200 → half-life ~83 min, natural variation
+    # over hours without being too slow or too jumpy.
+    reversion_rate: float = 1.0 / 7200.0
+    # σ: per-step noise std IN DEMAND UNITS (not per sqrt-second).
+    # The OU stationary std = σ_step / sqrt(1 - exp(-2κΔt)).
+    # With Δt=900s, κ=1/7200: exp(-2*900/7200)≈0.78, so stationary_std ≈ σ_step/0.47.
+    # We want stationary_std ≈ 0.4 demand units → σ_step ≈ 0.19.
+    noise_std: float = 0.19
 
     # --- event spikes ---
-    spike_magnitude: float = 2.0
-    spike_half_life_s: float = 3600.0 * 2  # 2-hour half-life
+    # Spike magnitude in demand units.  +3 pushes a previously mid-range cell
+    # to near-minimum p_accept; decays with a 3-hour half-life.
+    spike_magnitude: float = 3.0
+    spike_half_life_s: float = 3600.0 * 3
 
     # --- constellation popularity (must differ to create planner tension) ---
+    # These drive the BASELINE demand mean (mu_i) for each constellation.
+    # The mapping is:  mu = (popularity - 0.5) * 6
+    # so popularity=0.85 → mu=+2.1 (congested, p≈0.35)
+    #    popularity=0.20 → mu=-1.8 (quiet,     p≈0.85)
     constellation_popularity: dict = field(default_factory=lambda: {
-        # cheap / popular (high demand → lower p_accept at baseline)
+        # cheap / popular — high demand → low p_accept
         "Planet":          0.85,
-        "Ubotica":         0.75,
+        "Ubotica":         0.78,
         # medium
-        "LOFT":            0.55,
-        "Mission Control": 0.50,
-        "ICEYE":           0.45,
-        "AC":              0.40,
-        # expensive / reliable (low demand → higher p_accept at baseline)
-        "Umbra":           0.30,
+        "LOFT":            0.60,
+        "Mission Control": 0.55,
+        "ICEYE":           0.48,
+        "AC":              0.42,
+        # expensive / reliable — low demand → high p_accept
+        "Umbra":           0.32,
         "Capella":         0.20,
     })
     default_popularity: float = 0.50
 
-    # --- regional baselines (0=quiet, 1=congested) ---
+    # --- regional baselines (0=very quiet, 1=very congested) ---
+    # Sorted roughly quiet→busy; later entries paint over earlier ones,
+    # then the whole map is Gaussian-blurred for smooth transitions.
     regions: list = field(default_factory=lambda: [
-        RegionDef("Middle East",   lat_min=15, lat_max=40,  lon_min=35,  lon_max=65,  baseline_demand=0.80),
-        RegionDef("SE Asia",       lat_min=-10, lat_max=25, lon_min=95,  lon_max=140, baseline_demand=0.75),
-        RegionDef("East Asia",     lat_min=20,  lat_max=50, lon_min=105, lon_max=145, baseline_demand=0.65),
-        RegionDef("Europe",        lat_min=35,  lat_max=70, lon_min=-10, lon_max=40,  baseline_demand=0.60),
-        RegionDef("N America",     lat_min=25,  lat_max=60, lon_min=-130, lon_max=-60, baseline_demand=0.55),
-        RegionDef("Open Ocean",    lat_min=-60, lat_max=60, lon_min=-180, lon_max=180, baseline_demand=0.10),
+        # Polar / remote — very quiet
+        RegionDef("Arctic",        lat_min=70,  lat_max=90,  lon_min=-180, lon_max=180, baseline_demand=0.05),
+        RegionDef("Antarctica",    lat_min=-90, lat_max=-60, lon_min=-180, lon_max=180, baseline_demand=0.05),
+        RegionDef("S Pacific",     lat_min=-60, lat_max=-20, lon_min=140,  lon_max=-70, baseline_demand=0.08),
+        RegionDef("S Atlantic",    lat_min=-55, lat_max=-15, lon_min=-50,  lon_max=15,  baseline_demand=0.10),
+        RegionDef("Indian Ocean",  lat_min=-45, lat_max=10,  lon_min=40,   lon_max=100, baseline_demand=0.12),
+        RegionDef("N Pacific",     lat_min=20,  lat_max=55,  lon_min=160,  lon_max=-130,baseline_demand=0.15),
+        # Moderate demand — active but not peak
+        RegionDef("S America",     lat_min=-55, lat_max=15,  lon_min=-82,  lon_max=-34, baseline_demand=0.40),
+        RegionDef("Sub-Sah Africa",lat_min=-35, lat_max=15,  lon_min=-18,  lon_max=50,  baseline_demand=0.38),
+        RegionDef("Central Asia",  lat_min=30,  lat_max=55,  lon_min=50,   lon_max=90,  baseline_demand=0.48),
+        RegionDef("N Africa",      lat_min=15,  lat_max=38,  lon_min=-18,  lon_max=37,  baseline_demand=0.45),
+        RegionDef("Australia",     lat_min=-40, lat_max=-10, lon_min=113,  lon_max=154, baseline_demand=0.42),
+        # High demand — heavily tasked regions
+        RegionDef("N America",     lat_min=25,  lat_max=60,  lon_min=-130, lon_max=-60, baseline_demand=0.58),
+        RegionDef("Europe",        lat_min=35,  lat_max=70,  lon_min=-10,  lon_max=40,  baseline_demand=0.62),
+        RegionDef("East Asia",     lat_min=20,  lat_max=50,  lon_min=105,  lon_max=145, baseline_demand=0.70),
+        RegionDef("SE Asia",       lat_min=-10, lat_max=25,  lon_min=95,   lon_max=140, baseline_demand=0.72),
+        # Peak demand — conflict zones, choke points, major ISR targets
+        RegionDef("Middle East",   lat_min=15,  lat_max=40,  lon_min=35,   lon_max=65,  baseline_demand=0.88),
+        RegionDef("Korea Strait",  lat_min=32,  lat_max=42,  lon_min=124,  lon_max=132, baseline_demand=0.85),
+        RegionDef("Persian Gulf",  lat_min=23,  lat_max=30,  lon_min=48,   lon_max=60,  baseline_demand=0.92),
+        RegionDef("S China Sea",   lat_min=5,   lat_max=25,  lon_min=108,  lon_max=122, baseline_demand=0.90),
+        RegionDef("E Ukraine",     lat_min=46,  lat_max=52,  lon_min=30,   lon_max=40,  baseline_demand=0.95),
     ])
 
     # --- grid & timing ---
-    grid_lat_deg: float = 5.0
-    grid_lon_deg: float = 5.0
+    grid_lat_deg: float = 2.0
+    grid_lon_deg: float = 2.0
     timestep_s: float = 900.0    # 15-minute steps
 
     # --- seeds ---
@@ -225,12 +261,26 @@ class DemandField:
 
         dt_s = cfg.timestep_s
         kappa = cfg.reversion_rate
-        sigma = cfg.noise_std
         exp_k = math.exp(-kappa * dt_s)
-        noise_scale = sigma * math.sqrt((1 - math.exp(-2 * kappa * dt_s)) / (2 * kappa)) if kappa > 0 else sigma * math.sqrt(dt_s)
+        noise_scale = cfg.noise_std
+
+        # Spatially correlated noise: generate at a coarse ~20° grid then zoom
+        # to full resolution so demand perturbations drift as coherent regional
+        # blobs rather than pixel-level static.
+        from scipy.ndimage import zoom as nd_zoom
+        _coarse_lat = max(2, self._n_lat // 9)   # ~20° cells
+        _coarse_lon = max(2, self._n_lon // 9)
+        _zoom_lat = self._n_lat / _coarse_lat
+        _zoom_lon = self._n_lon / _coarse_lon
 
         for ti in range(1, self._n_steps):
-            noise = self._rng_demand.standard_normal((n_c, self._n_lat, self._n_lon)) * noise_scale
+            # Draw at coarse resolution
+            coarse = self._rng_demand.standard_normal((n_c, _coarse_lat, _coarse_lon)) * noise_scale
+            # Zoom to full grid with smooth interpolation (order=2 = quadratic spline)
+            noise = np.stack([
+                nd_zoom(coarse[ci], (_zoom_lat, _zoom_lon), order=2)[:self._n_lat, :self._n_lon]
+                for ci in range(n_c)
+            ])
             demand[..., ti] = baseline + exp_k * (demand[..., ti - 1] - baseline) + noise
 
         # --- Event spikes ---
@@ -243,25 +293,46 @@ class DemandField:
         self._precomputed = True
 
     def _build_baseline(self, n_c: int) -> np.ndarray:
-        """Return (n_c, n_lat, n_lon) array of baseline demand values."""
-        cfg = self.config
-        # Start from the global quiet ocean baseline
-        geo_baseline = np.full((self._n_lat, self._n_lon), 0.10)
+        """Return (n_c, n_lat, n_lon) array of OU mean-reversion targets (μ).
 
-        # Paint regions in increasing-priority order (last wins per pixel)
-        for region in cfg.regions:
+        The demand field lives on a scale of roughly [-3, +3] where:
+          +3  → very congested → p_accept near p_min (~0.30)
+          0   → neutral        → p_accept near midpoint (~0.60)
+          -3  → very quiet     → p_accept near p_max (~0.90)
+
+        The geographic baseline encodes region congestion as a value in [-3, +3].
+        Per-constellation popularity linearly shifts that baseline up (popular,
+        congested) or down (niche, reliable).
+        """
+        cfg = self.config
+
+        # Geo-congestion: open ocean quiet (-2), busy regions positive
+        # RegionDef.baseline_demand is [0,1] → remap to [-2, +3] demand units
+        geo_demand = np.full((self._n_lat, self._n_lon), -2.0)  # ocean default: quiet
+
+        for region in sorted(cfg.regions, key=lambda r: r.baseline_demand):
             lat_mask = (self._lats >= region.lat_min) & (self._lats <= region.lat_max)
             lon_mask = (self._lons >= region.lon_min) & (self._lons <= region.lon_max)
             lat_idx = np.where(lat_mask)[0]
             lon_idx = np.where(lon_mask)[0]
+            if len(lat_idx) == 0 or len(lon_idx) == 0:
+                continue
             ii, jj = np.meshgrid(lat_idx, lon_idx, indexing='ij')
-            geo_baseline[ii, jj] = region.baseline_demand
+            # Map [0, 1] baseline_demand linearly to [-2, +3] demand units
+            d_val = -2.0 + region.baseline_demand * 5.0
+            geo_demand[ii, jj] = d_val
 
-        # Scale per constellation by popularity
+        # Smooth the hard region boundaries with a wide Gaussian blur
+        from scipy.ndimage import gaussian_filter
+        geo_demand = gaussian_filter(geo_demand, sigma=3.0)
+
+        # Per-constellation popularity shifts the mean: popularity=0.5 → no shift;
+        # popularity=1.0 → +3 (fully congested); popularity=0.0 → -3 (very quiet)
         baseline = np.empty((n_c, self._n_lat, self._n_lon))
         for ci, cname in enumerate(self._constellations):
             pop = cfg.constellation_popularity.get(cname, cfg.default_popularity)
-            baseline[ci] = geo_baseline * pop
+            pop_shift = (pop - 0.5) * 6.0   # maps [0,1] → [-3, +3]
+            baseline[ci] = geo_demand + pop_shift
 
         return baseline
 
@@ -270,8 +341,8 @@ class DemandField:
         cfg = self.config
         decay_rate = math.log(2) / cfg.spike_half_life_s
 
-        # Spatial Gaussian: ~500 km radius (5° at equator ≈ 555 km)
-        sigma_deg = 5.0
+        # Spatial Gaussian: ~1300 km radius (12° at equator ≈ 1335 km)
+        sigma_deg = 12.0
         lat_diff = self._lats[:, None] - lat      # (n_lat, 1)
         lon_diff = self._lons[None, :] - lon       # (1, n_lon)
         dist_sq = lat_diff ** 2 + lon_diff ** 2
@@ -449,27 +520,43 @@ class DemandField:
     # Visualization
     # ------------------------------------------------------------------
 
+    def _prob_grid(self, ci: int, ti: int) -> np.ndarray:
+        """Return smoothed acceptance-probability array (n_lat, n_lon) for one constellation/timestep."""
+        from scipy.ndimage import gaussian_filter
+        cfg = self.config
+        d_slice = self._demand[ci, :, :, ti]
+        sig = 1.0 / (1.0 + np.exp(-d_slice / cfg.sigmoid_scale))
+        prob = np.clip(cfg.p_max - (cfg.p_max - cfg.p_min) * sig, cfg.p_min, cfg.p_max)
+        # Smooth across ~3 grid cells so region boundaries blend naturally
+        return gaussian_filter(prob, sigma=1.5)
+
     def plot_heatmaps(
         self,
         results_path: str,
         timestep_indices: Optional[list[int]] = None,
-        figsize_per_panel: tuple[float, float] = (5.0, 3.5),
-        dpi: int = 120,
+        dpi: int = 150,
     ) -> list[str]:
-        """Save per-constellation acceptance-probability heatmaps.
+        """Save per-constellation acceptance-probability maps on a proper Earth projection.
 
-        Parameters
-        ----------
-        results_path : directory where PNGs are saved.
-        timestep_indices : which time-steps to render (defaults to 5 evenly spaced).
-        figsize_per_panel : (width, height) in inches per map panel.
-        dpi : figure resolution.
+        Produces two outputs per run:
+        1. ``demand_heatmaps_all.png``  — grid of (constellation × timestep) world maps.
+        2. ``demand_heatmap_<name>.png`` — per-constellation multi-panel evolution strip.
 
-        Returns
-        -------
-        List of saved file paths.
+        Each panel uses a PlateCarree projection with coastlines drawn from the
+        bundled Natural Earth 50m-land shapefile (no network access required),
+        a smooth probability gradient, geographic region annotations, and a
+        shared perceptually-uniform colorbar.
         """
         import os
+        import cartopy.crs as ccrs
+        import cartopy.io.shapereader as shpreader
+        from matplotlib.colors import LinearSegmentedColormap
+        from matplotlib.patches import PathPatch
+        from matplotlib.path import Path
+        import matplotlib.patches as mpatches
+        import matplotlib.ticker as mticker
+        import shapely.geometry as sgeom
+
         os.makedirs(results_path, exist_ok=True)
 
         if not self._precomputed:
@@ -480,108 +567,236 @@ class DemandField:
             return []
 
         if timestep_indices is None:
-            n_show = min(5, self._n_steps)
+            n_show = min(4, self._n_steps)
             timestep_indices = list(np.linspace(0, self._n_steps - 1, n_show, dtype=int))
 
-        n_t = len(timestep_indices)
         cfg = self.config
         saved_files = []
 
-        # --- Multi-panel: (n_t rows) × (n_c cols) ---
-        fig_w = figsize_per_panel[0] * n_c
-        fig_h = figsize_per_panel[1] * n_t
-        fig, axes = plt.subplots(n_t, n_c, figsize=(fig_w, fig_h), squeeze=False)
+        # --- Colormap: deep red (congested/low p) → amber → teal → dark blue (quiet/high p) ---
+        _cmap = LinearSegmentedColormap.from_list(
+            "demand",
+            [
+                "#c0392b",   # 0.0 — deep red:   congested, low p_accept
+                "#e74c3c",   # 0.2
+                "#f39c12",   # 0.4 — amber:       moderate demand
+                "#f1c40f",   # 0.5 — yellow:      borderline
+                "#2ecc71",   # 0.7 — green:       light demand
+                "#1abc9c",   # 0.85— teal
+                "#1a5276",   # 1.0 — dark blue:   quiet, high p_accept
+            ],
+        )
+        norm = plt.Normalize(vmin=cfg.p_min, vmax=cfg.p_max)
+
+        # --- Load cached land shapefile for coastlines (no download needed) ---
+        _LAND_SHP = os.path.join(
+            os.path.expanduser("~"), ".local", "share", "cartopy",
+            "shapefiles", "natural_earth", "physical", "ne_50m_land.shp",
+        )
+        _land_geoms: list = []
+        if os.path.exists(_LAND_SHP):
+            reader = shpreader.Reader(_LAND_SHP)
+            _land_geoms = list(reader.geometries())
+        else:
+            print("[DemandField] Warning: ne_50m_land.shp not found; coastlines will be skipped.")
+
+        # --- Region label positions (lon, lat, text) ---
+        _region_labels = [
+            (  47.0,  26.0, "Middle East"),
+            ( 115.0,   5.0, "SE Asia"),
+            ( 127.0,  36.0, "E Asia"),
+            (  15.0,  52.0, "Europe"),
+            ( -97.0,  40.0, "N America"),
+            ( -45.0, -35.0, "S Atlantic\n(quiet)"),
+            ( 170.0, -38.0, "S Pacific\n(quiet)"),
+            (  75.0,  20.0, "S Asia"),
+            ( -65.0, -15.0, "S America"),
+        ]
+
+        proj = ccrs.PlateCarree()
+
+        # ------------------------------------------------------------------
+        # Helper: draw one probability map onto a Cartopy axes
+        # ------------------------------------------------------------------
+        def _draw_map(ax, prob_grid, title, fontsize_title=8):
+            ax.set_extent([-180, 180, -90, 90], crs=proj)
+
+            # Ocean background
+            ax.set_facecolor("#d0e8f5")
+
+            # Probability overlay (full globe incl. ocean)
+            ax.pcolormesh(
+                self._lons, self._lats, prob_grid,
+                transform=proj,
+                cmap=_cmap, norm=norm,
+                alpha=0.88, zorder=1,
+                shading="auto",
+            )
+
+            # Land outlines from cached shapefile
+            for geom in _land_geoms:
+                ax.add_geometries(
+                    [geom], proj,
+                    facecolor="none",
+                    edgecolor="#2c3e50",
+                    linewidth=0.4,
+                    zorder=3,
+                )
+
+            # Lat/lon grid lines (manual — no download required)
+            for lon_g in range(-180, 181, 60):
+                ax.plot(
+                    [lon_g, lon_g], [-90, 90],
+                    transform=proj, color="white",
+                    linewidth=0.25, alpha=0.4, zorder=2,
+                )
+                if -165 < lon_g < 180:
+                    ax.text(
+                        lon_g, -87, f"{lon_g}°",
+                        transform=proj, fontsize=4, ha="center",
+                        color="white", alpha=0.7, zorder=4,
+                    )
+            for lat_g in range(-60, 91, 30):
+                ax.plot(
+                    [-180, 180], [lat_g, lat_g],
+                    transform=proj, color="white",
+                    linewidth=0.25, alpha=0.4, zorder=2,
+                )
+                ax.text(
+                    -178, lat_g, f"{lat_g}°",
+                    transform=proj, fontsize=4, ha="left",
+                    color="white", alpha=0.7, zorder=4,
+                )
+
+            # Region annotations — always shown on every panel
+            for lon_l, lat_l, lbl in _region_labels:
+                ax.text(
+                    lon_l, lat_l, lbl,
+                    transform=proj, fontsize=4.5,
+                    ha="center", va="center",
+                    color="white", fontweight="bold",
+                    bbox=dict(
+                        boxstyle="round,pad=0.15",
+                        facecolor="#00000068",
+                        edgecolor="none",
+                    ),
+                    zorder=5,
+                )
+
+            ax.set_title(title, fontsize=fontsize_title, pad=3, color="white")
+
+        # Shared colorbar label
+        _cbar_label = (
+            "Acceptance probability   "
+            "▌ red = congested / low    ▌ yellow = moderate    ▌ blue = quiet / high"
+        )
+
+        # ------------------------------------------------------------------
+        # Figure 1: all constellations × selected timesteps
+        # ------------------------------------------------------------------
+        n_t = len(timestep_indices)
+        fig_w = max(4.5 * n_c, 12)
+        fig_h = 2.8 * n_t + 0.8
+
+        fig = plt.figure(figsize=(fig_w, fig_h), facecolor="#0d1117")
+
+        axes_flat = []
+        for row in range(n_t):
+            for col in range(n_c):
+                ax = fig.add_subplot(n_t, n_c, row * n_c + col + 1, projection=proj)
+                axes_flat.append(ax)
 
         for ti_idx, ti in enumerate(timestep_indices):
             t_s = self._times_s[ti]
             t_abs = self.reference_time + dt.timedelta(seconds=float(t_s))
+            t_label = t_abs.strftime("%Y-%m-%d %H:%M UTC")
 
             for ci, cname in enumerate(self._constellations):
-                ax = axes[ti_idx, ci]
+                idx = ti_idx * n_c + ci
+                pop = cfg.constellation_popularity.get(cname, cfg.default_popularity)
+                title = f"{cname}  (pop={pop:.0%})  —  {t_label}"
+                _draw_map(
+                    axes_flat[idx],
+                    self._prob_grid(ci, ti),
+                    title,
+                                    )
 
-                # Convert demand → probability
-                d_slice = self._demand[ci, :, :, ti]  # (n_lat, n_lon)
-                sig = 1.0 / (1.0 + np.exp(-d_slice / cfg.sigmoid_scale))
-                prob = cfg.p_max - (cfg.p_max - cfg.p_min) * sig
-                prob = np.clip(prob, cfg.p_min, cfg.p_max)
-
-                im = ax.imshow(
-                    prob,
-                    origin='lower',
-                    extent=[-180, 180, -90, 90],
-                    vmin=cfg.p_min, vmax=cfg.p_max,
-                    cmap='RdYlGn', aspect='auto',
-                    interpolation='nearest',
-                )
-                ax.set_title(f"{cname}\n{t_abs.strftime('%Y-%m-%d %H:%M')} UTC", fontsize=8)
-                ax.set_xlabel("Longitude (°)", fontsize=7)
-                ax.set_ylabel("Latitude (°)", fontsize=7)
-                ax.tick_params(labelsize=6)
-
-        fig.colorbar(
-            plt.cm.ScalarMappable(
-                cmap='RdYlGn',
-                norm=plt.Normalize(vmin=cfg.p_min, vmax=cfg.p_max)
-            ),
-            ax=axes, label='Acceptance probability', shrink=0.6,
+        # Colorbar
+        sm = plt.cm.ScalarMappable(cmap=_cmap, norm=norm)
+        sm.set_array([])
+        cbar = fig.colorbar(
+            sm, ax=axes_flat,
+            orientation="horizontal", fraction=0.018, pad=0.03, aspect=60,
         )
-        fig.suptitle("Dynamic Acceptance Probability — per constellation × time", fontsize=10)
-        plt.tight_layout()
+        cbar.set_label(_cbar_label, fontsize=7, color="white")
+        cbar.ax.tick_params(labelsize=6, colors="white")
+        cbar.outline.set_edgecolor("#555")
 
-        out_path = os.path.join(results_path, "demand_heatmaps_all.png")
-        fig.savefig(out_path, dpi=dpi, bbox_inches='tight')
+        fig.suptitle(
+            "Dynamic Acceptance Probability — commercial constellation demand field",
+            fontsize=11, color="white", y=1.002, fontweight="bold",
+        )
+        plt.subplots_adjust(left=0.01, right=0.99, top=0.96, bottom=0.06,
+                            hspace=0.25, wspace=0.05)
+
+        out_all = os.path.join(results_path, "demand_heatmaps_all.png")
+        fig.savefig(out_all, dpi=dpi, bbox_inches="tight", facecolor=fig.get_facecolor())
         plt.close(fig)
-        saved_files.append(out_path)
+        saved_files.append(out_all)
+        print(f"[DemandField] Saved overview: {out_all}")
 
-        # --- Animated / multi-panel per-constellation ---
+        # ------------------------------------------------------------------
+        # Figure 2: per-constellation evolution strip
+        # ------------------------------------------------------------------
         for ci, cname in enumerate(self._constellations):
             n_panels = len(timestep_indices)
-            cols = min(n_panels, 5)
+            cols = min(n_panels, 4)
             rows = math.ceil(n_panels / cols)
-            fig2, axes2 = plt.subplots(rows, cols, figsize=(figsize_per_panel[0] * cols, figsize_per_panel[1] * rows), squeeze=False)
 
+            pop = cfg.constellation_popularity.get(cname, cfg.default_popularity)
+            fig2 = plt.figure(
+                figsize=(4.5 * cols, 2.8 * rows + 0.6),
+                facecolor="#0d1117",
+            )
+            fig2.suptitle(
+                f"{cname}  —  acceptance probability evolution  "
+                f"(popularity={pop:.0%})",
+                fontsize=9, color="white", y=1.002, fontweight="bold",
+            )
+
+            panel_axes = []
             for panel_idx, ti in enumerate(timestep_indices):
-                row, col = divmod(panel_idx, cols)
-                ax = axes2[row, col]
+                ax2 = fig2.add_subplot(rows, cols, panel_idx + 1, projection=proj)
                 t_s = self._times_s[ti]
                 t_abs = self.reference_time + dt.timedelta(seconds=float(t_s))
-
-                d_slice = self._demand[ci, :, :, ti]
-                sig = 1.0 / (1.0 + np.exp(-d_slice / cfg.sigmoid_scale))
-                prob = np.clip(cfg.p_max - (cfg.p_max - cfg.p_min) * sig, cfg.p_min, cfg.p_max)
-
-                ax.imshow(
-                    prob, origin='lower',
-                    extent=[-180, 180, -90, 90],
-                    vmin=cfg.p_min, vmax=cfg.p_max,
-                    cmap='RdYlGn', aspect='auto',
-                    interpolation='nearest',
+                hours_offset = t_s / 3600.0
+                title = f"T+{hours_offset:.1f}h  ({t_abs.strftime('%H:%M UTC')})"
+                _draw_map(
+                    ax2,
+                    self._prob_grid(ci, ti),
+                    title,
+                    fontsize_title=7,
                 )
-                ax.set_title(t_abs.strftime('%H:%M UTC'), fontsize=8)
-                ax.set_xlabel("Lon (°)", fontsize=6)
-                ax.set_ylabel("Lat (°)", fontsize=6)
-                ax.tick_params(labelsize=5)
+                panel_axes.append(ax2)
 
-            # Hide unused panels
-            for panel_idx in range(n_panels, rows * cols):
-                row, col = divmod(panel_idx, cols)
-                axes2[row, col].set_visible(False)
-
-            fig2.suptitle(f"Acceptance Probability Evolution — {cname}", fontsize=10)
-            fig2.colorbar(
-                plt.cm.ScalarMappable(
-                    cmap='RdYlGn',
-                    norm=plt.Normalize(vmin=cfg.p_min, vmax=cfg.p_max)
-                ),
-                ax=axes2, label='p_accept', shrink=0.5,
+            sm2 = plt.cm.ScalarMappable(cmap=_cmap, norm=norm)
+            sm2.set_array([])
+            cbar2 = fig2.colorbar(
+                sm2, ax=panel_axes,
+                orientation="horizontal", fraction=0.025, pad=0.04, aspect=40,
             )
-            plt.tight_layout()
+            cbar2.set_label("p_accept", fontsize=7, color="white")
+            cbar2.ax.tick_params(labelsize=6, colors="white")
+            cbar2.outline.set_edgecolor("#555")
+
+            plt.subplots_adjust(left=0.01, right=0.99, top=0.94, bottom=0.08,
+                                hspace=0.25, wspace=0.05)
 
             safe_name = cname.replace(" ", "_").replace("/", "_")
-            out_path2 = os.path.join(results_path, f"demand_heatmap_{safe_name}.png")
-            fig2.savefig(out_path2, dpi=dpi, bbox_inches='tight')
+            out2 = os.path.join(results_path, f"demand_heatmap_{safe_name}.png")
+            fig2.savefig(out2, dpi=dpi, bbox_inches="tight", facecolor=fig2.get_facecolor())
             plt.close(fig2)
-            saved_files.append(out_path2)
+            saved_files.append(out2)
 
         print(f"[DemandField] Saved {len(saved_files)} heatmap(s) to {results_path}")
         return saved_files
