@@ -43,11 +43,19 @@ class ConstellationGroundScheduler():
         return self.__str__()
     
     def __deepcopy__(self, memo):
-        new_constellation = ConstellationGroundScheduler(satellites=self.satellites, ground_stations=self.ground_stations, world=self.world, name=self.name, ack_probability_if_scheduled=self.ack_probability_if_scheduled, ack_probability_if_unscheduled=self.ack_probability_if_unscheduled)
+        new_constellation = ConstellationGroundScheduler(
+            satellites=self.satellites,
+            ground_stations=self.ground_stations,
+            world=self.world,
+            name=self.name,
+            ack_probability_if_scheduled=self.ack_probability_if_scheduled,
+            ack_probability_if_unscheduled=self.ack_probability_if_unscheduled,
+            acceptance_probability=self.acceptance_probability,
+            acceptance_probability_function=self.acceptance_probability_function,
+        )
         new_constellation._requests = copy.deepcopy(self._requests, memo)
         new_constellation._satellite_busy_timelines_obs = copy.deepcopy(self._satellite_busy_timelines_obs, memo)
         new_constellation._satellite_busy_timelines_comm = copy.deepcopy(self._satellite_busy_timelines_comm, memo)
-
         return new_constellation
 
     def screen_opportunity_for_feasibility(self, satellite: Satellite, _request: ObservationRequest, screen_against_comm_passes:bool=True):

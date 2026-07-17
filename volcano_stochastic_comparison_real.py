@@ -28,6 +28,7 @@ from fame_agents_base import *
 from fame_constellation_scheduler import ConstellationGroundScheduler, ObservationStatus
 from fame_broker import Broker
 from fame_workflow import *
+from fame_demand_model import DemandField, DemandFieldConfig
 
 # Configuration
 SIMULATION_START = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
@@ -224,11 +225,15 @@ def load_satellites_once() -> list[Satellite]:
     return satellites
 
 
-def create_world_and_constellations(cached_satellites: list[Satellite]):
+def create_world_and_constellations(cached_satellites: list[Satellite], demand_field: DemandField = None):
     """Creates fresh simulation scopes using copied pre-cached orbital models.
 
     Uses the same 8 constellation structure as the notebook:
     Planet, Umbra, Capella, LOFT, Ubotica, Mission Control, Aerospace Corp, ICEYE
+
+    If demand_field is provided it is wired as the acceptance_probability_function
+    for every constellation so the simulator uses dynamic probabilities.
+    If demand_field is None the legacy constant per-constellation probabilities are used.
     """
     local_satellites = copy.deepcopy(cached_satellites)
     world = World(satellites=local_satellites)
@@ -273,70 +278,32 @@ def create_world_and_constellations(cached_satellites: list[Satellite]):
     # ICEYE constellation
     iceye_sats = [s for s in local_satellites if "ICEYE" in s.name.upper()]
 
-    # Create constellations with acceptance probabilities matching notebook usage patterns
-    scheduler_planet = ConstellationGroundScheduler(
-        satellites=planet_sats,
-        ground_stations=ground_stations,
-        world=world,
-        name="Planet",
-        acceptance_probability=0.40
-    )
+    # Build acceptance-probability function for the simulator.
+    # When a DemandField is provided the simulator draws from the dynamic model;
+    # otherwise fall back to the legacy constant per-constellation values.
+    if demand_field is not None:
+        _sim_acc_fn = demand_field.make_simulator_acceptance_function()
+    else:
+        _sim_acc_fn = None
 
-    scheduler_umbra = ConstellationGroundScheduler(
-        satellites=umbra_sats,
-        ground_stations=ground_stations,
-        world=world,
-        name="Umbra",
-        acceptance_probability=0.60
-    )
+    def _make_scheduler(sats, name, legacy_p):
+        return ConstellationGroundScheduler(
+            satellites=sats,
+            ground_stations=ground_stations,
+            world=world,
+            name=name,
+            acceptance_probability=legacy_p,
+            acceptance_probability_function=_sim_acc_fn,
+        )
 
-    scheduler_capella = ConstellationGroundScheduler(
-        satellites=capella_sats,
-        ground_stations=ground_stations,
-        world=world,
-        name="Capella",
-        acceptance_probability=0.90
-    )
-
-    scheduler_loft = ConstellationGroundScheduler(
-        satellites=loft_sats,
-        ground_stations=ground_stations,
-        world=world,
-        name="LOFT",
-        acceptance_probability=0.71
-    )
-
-    scheduler_ubotica = ConstellationGroundScheduler(
-        satellites=ubotica_sats,
-        ground_stations=ground_stations,
-        world=world,
-        name="Ubotica",
-        acceptance_probability=0.50
-    )
-
-    scheduler_mission_control = ConstellationGroundScheduler(
-        satellites=mission_control_sats,
-        ground_stations=ground_stations,
-        world=world,
-        name="Mission Control",
-        acceptance_probability=0.64
-    )
-
-    scheduler_aerospace = ConstellationGroundScheduler(
-        satellites=aerospace_sats,
-        ground_stations=ground_stations,
-        world=world,
-        name="AC",
-        acceptance_probability=0.67
-    )
-
-    scheduler_iceye = ConstellationGroundScheduler(
-        satellites=iceye_sats,
-        ground_stations=ground_stations,
-        world=world,
-        name="ICEYE",
-        acceptance_probability=0.74
-    )
+    scheduler_planet          = _make_scheduler(planet_sats,          "Planet",          0.40)
+    scheduler_umbra           = _make_scheduler(umbra_sats,           "Umbra",           0.60)
+    scheduler_capella         = _make_scheduler(capella_sats,         "Capella",         0.90)
+    scheduler_loft            = _make_scheduler(loft_sats,            "LOFT",            0.71)
+    scheduler_ubotica         = _make_scheduler(ubotica_sats,         "Ubotica",         0.50)
+    scheduler_mission_control = _make_scheduler(mission_control_sats, "Mission Control", 0.64)
+    scheduler_aerospace       = _make_scheduler(aerospace_sats,       "AC",              0.67)
+    scheduler_iceye           = _make_scheduler(iceye_sats,           "ICEYE",           0.74)
 
     all_constellations = [
         scheduler_planet, scheduler_umbra, scheduler_capella, scheduler_loft,
@@ -483,40 +450,45 @@ def run_comparison(num_monte_carlo_runs=2):
     min_time = SIMULATION_START
     max_time = SIMULATION_START + dt.timedelta(hours=lookahead_horizon_h)
 
-    # === TWO-STAGE PROBABILITY MODEL ===
-    def acceptance_prob_function(constrained_request, satellite, obs_pass):
-        """
-        Probability that constellation ACCEPTS the booking request.
-        This reflects constellation's internal capacity, conflicts, and scheduling flexibility.
+    # === DYNAMIC ACCEPTANCE-PROBABILITY MODEL ===
+    # Build demand field — single source of truth for both the simulator and the planner.
+    # Set use_constant_probability=True in the config to revert to legacy constants.
+    _demand_cfg = DemandFieldConfig(
+        use_constant_probability=False,  # set True for legacy regression baseline
+    )
+    _horizon_s = lookahead_horizon_h * 3600.0
+    demand_field = DemandField(
+        config=_demand_cfg,
+        reference_time=min_time,
+        horizon_s=_horizon_s,
+    )
 
-        Uses acceptance probabilities matching the 8 constellation structure from the notebook.
-        """
-        # Planet constellation (busiest - largest constellation)
-        if any(x in satellite.name.upper() for x in ["SKYSAT", "PELICAN", "TANAGER"]):
-            return 0.70
-        # Umbra
-        elif "UMBRA" in satellite.name.upper():
-            return 0.85
-        # Capella
-        elif "CAPELLA" in satellite.name.upper() or "ACADIA" in satellite.name.upper():
-            return 0.90
-        # LOFT
-        elif "LOFT" in satellite.name.upper() or "YAM" in satellite.name.upper():
-            return 0.92
-        # Ubotica
-        elif "UBOTICA" in satellite.name.upper() or "HAMMER" in satellite.name.upper() or "ACCENTURE" in satellite.name.upper():
-            return 0.93
-        # Mission Control
-        elif "PERSISTENCE" in satellite.name.upper() or "LEMUR" in satellite.name.upper():
-            return 0.94
-        # Aerospace Corp
-        elif "AEROCUBE" in satellite.name.upper():
-            return 0.95
-        # ICEYE (least busy)
-        elif "ICEYE" in satellite.name.upper():
-            return 0.96
-        # Default fallback
-        return 0.85
+    # Register demand spikes for all active volcanoes.
+    # The spike is case-study agnostic: it just adds a localised demand bump.
+    for vloc in volcano_db_locations:
+        demand_field.add_spike(vloc.lat_deg, vloc.lon_deg, min_time)
+
+    # Precompute the full trajectory for all constellations.
+    _all_constellation_names = [
+        "Planet", "Umbra", "Capella", "LOFT",
+        "Ubotica", "Mission Control", "AC", "ICEYE",
+    ]
+    print("[DemandField] Precomputing demand trajectories…")
+    demand_field.precompute(_all_constellation_names)
+    print("[DemandField] Precompute complete.")
+
+    # Check cost-reliability tension before running (warn if cheapest == most accepted).
+    # SUBMISSION_COST / EXEC_COST are defined below but we can use a proxy ordering here.
+    _cost_proxy = {
+        "Planet": 0.1, "Ubotica": 0.15, "LOFT": 0.2, "Mission Control": 0.25,
+        "ICEYE": 0.3, "AC": 0.35, "Umbra": 0.5, "Capella": 0.6,
+    }
+    demand_field.check_cost_reliability_tension(_cost_proxy)
+
+    # Planner acceptance-probability function — queries the demand field directly.
+    def acceptance_prob_function(constrained_request, satellite, obs_pass):
+        """Planner's estimate of p_accept: dynamic model (or legacy fallback)."""
+        return demand_field.make_acceptance_prob_function()(constrained_request, satellite, obs_pass)
 
     def execution_prob_function(constrained_request, satellite, obs_pass):
         """
@@ -710,6 +682,10 @@ def run_comparison(num_monte_carlo_runs=2):
                 break
         print(f"  [Sim] Event-loop finished. Total Ticks: {ticks}, Concluded Simulation Clock: {world.time}")
 
+    # Save demand-field heatmaps once (independent of MC runs)
+    demand_heatmaps_dir = os.path.join(results_dir, "demand_heatmaps")
+    demand_field.plot_heatmaps(demand_heatmaps_dir)
+
     for run_idx in range(num_monte_carlo_runs):
         print(f"\n--- Monte Carlo Horizon Iteration {run_idx + 1}/{num_monte_carlo_runs} ---")
 
@@ -721,7 +697,7 @@ def run_comparison(num_monte_carlo_runs=2):
         print("\n  Running greedy broker...")
         random.seed(run_seed)  # Reset RNG to run_seed
         np.random.seed(run_seed)  # Also reset numpy's RNG
-        world3, const3 = create_world_and_constellations(cached_satellites)
+        world3, const3 = create_world_and_constellations(cached_satellites, demand_field=demand_field)
         workflow3 = create_volcano_workflow(volcano_db_locations, min_time, max_time)
         broker_greedy = Broker(constellations=const3, world=world3, name="Broker-Greedy")
         broker_greedy.add_workflow(workflow3)
@@ -773,7 +749,7 @@ def run_comparison(num_monte_carlo_runs=2):
         print("\n  Running stochastic MILP engine (log-linearized)...")
         random.seed(run_seed)  # CRITICAL: Reset RNG to SAME seed for fair comparison
         np.random.seed(run_seed)
-        world2, const2 = create_world_and_constellations(cached_satellites)
+        world2, const2 = create_world_and_constellations(cached_satellites, demand_field=demand_field)
         workflow2 = create_volcano_workflow(volcano_db_locations, min_time, max_time)
         broker_log = Broker(constellations=const2, world=world2, name="Broker-Stoch-Log")
         broker_log.add_workflow(workflow2)
@@ -831,7 +807,7 @@ def run_comparison(num_monte_carlo_runs=2):
         print("\n  Running deterministic ILP engine...")
         random.seed(run_seed)  # Reset RNG to run_seed
         np.random.seed(run_seed)  # Also reset numpy's RNG
-        world1, const1 = create_world_and_constellations(cached_satellites)
+        world1, const1 = create_world_and_constellations(cached_satellites, demand_field=demand_field)
         workflow1 = create_volcano_workflow(volcano_db_locations, min_time, max_time)
         broker_det = Broker(constellations=const1, world=world1, name="Broker-Det")
         broker_det.add_workflow(workflow1)
@@ -1073,4 +1049,4 @@ def run_comparison(num_monte_carlo_runs=2):
 
 
 if __name__ == "__main__":
-    run_comparison(num_monte_carlo_runs=1)
+    run_comparison(num_monte_carlo_runs=5)
