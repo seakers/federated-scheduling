@@ -1,14 +1,19 @@
 """
-Cost Ablation Study for Stochastic vs Deterministic Scheduler Comparison
+Cost Ablation Study: Greedy vs Deterministic vs Stochastic Scheduler Comparison
 
-This script runs the volcano workflow comparison across a grid of cost parameter values
-to understand how submission_cost and execution_cost affect the relative performance
-of stochastic vs deterministic schedulers.
+Sweeps a grid of submission_cost × execution_cost values to understand how cost
+parameters affect the relative performance and trade-offs of all three schedulers:
+1. Stochastic MILP (Log-linearized with PWL / exact MINLP handling)
+2. Deterministic ILP (Single-pass primary booking without risk modeling)
+3. Greedy Baseline (Myopic priority-based booking)
 
-Key Questions:
-1. How sensitive is stochastic scheduler performance to cost parameters?
-2. What cost values make stochastic outperform deterministic?
-3. Is there a sweet spot where stochastic beats deterministic?
+Key Metrics Analyzed (via fame_metrics.compute_metrics_v2):
+- Task Completion Rate: Fraction of unique DAG requests delivering DATA_RECEIVED
+- Group Completion Rate: Fraction of workflow request groups fully completed
+- Realized Quality: Best delivered data quality per request
+- Total Cost: Unconditional submission overhead + conditional execution fees
+- Net Utility: Realized Quality - Total Realized Cost
+- True Redundancy: Average submitted passes per task
 """
 
 import datetime as dt
@@ -16,646 +21,538 @@ import numpy as np
 import pandas as pd
 import os
 import json
+import time
+import random
 from itertools import product
 
-# Import the main comparison function
+# Import simulation components from the primary volcano comparison module
 from volcano_stochastic_comparison_real import (
     load_volcano_locations_from_database,
     load_satellites_once,
     create_world_and_constellations,
     create_volcano_workflow,
-    # acceptance_prob_function,
-    # execution_prob_function,
     SIMULATION_START,
     lookahead_horizon_h,
     MAX_SOLVER_TIME_S,
-) 
+)
 from fame_constellation_scheduler import ObservationStatus
-import random
-def acceptance_prob_function(constrained_request, satellite, obs_pass):
-    """
-    Probability that constellation ACCEPTS the booking request.
-    This reflects constellation's internal capacity, conflicts, and scheduling flexibility.
+from fame_broker import Broker
+from fame_demand_model import DemandField, DemandFieldConfig
 
-    Uses acceptance probabilities matching the 8 constellation structure from the notebook.
-    """
-    # Planet constellation (busiest - largest constellation)
-    if any(x in satellite.name.upper() for x in ["SKYSAT", "PELICAN", "TANAGER"]):
-        return 0.70
-    # Umbra
-    elif "UMBRA" in satellite.name.upper():
-        return 0.85
-    # Capella
-    elif "CAPELLA" in satellite.name.upper() or "ACADIA" in satellite.name.upper():
-        return 0.90
-    # LOFT
-    elif "LOFT" in satellite.name.upper() or "YAM" in satellite.name.upper():
-        return 0.92
-    # Ubotica
-    elif "UBOTICA" in satellite.name.upper() or "HAMMER" in satellite.name.upper() or "ACCENTURE" in satellite.name.upper():
-        return 0.93
-    # Mission Control
-    elif "PERSISTENCE" in satellite.name.upper() or "LEMUR" in satellite.name.upper():
-        return 0.94
-    # Aerospace Corp
-    elif "AEROCUBE" in satellite.name.upper():
-        return 0.95
-    # ICEYE (least busy)
-    elif "ICEYE" in satellite.name.upper():
-        return 0.96
-    # Default fallback
-    return 0.85
+# Import authoritative demand-aware metric compiler from fame_metrics
+from fame_metrics import compute_metrics_v2
 
-def execution_prob_function(constrained_request, satellite, obs_pass):
+
+def _execution_prob_function(constrained_request, satellite, obs_pass):
     """
-    Probability that an ACCEPTED booking executes successfully.
-    For volcano monitoring: depends on cloud cover, atmospheric conditions, etc.
-    Better look angles (closer to nadir) have higher execution success.
+    Computes P(execute | accepted) conditional execution probability based on satellite look angle.
+    Returns a probability bounded in [0.70, 0.99].
     """
-    # Simple model: execution success decreases with off-nadir angle
     look_angle = abs(90.0 - obs_pass.highest.look_angle_dec_deg)
-
-    # At nadir (look_angle=0): 95% success
-    # At 45° off-nadir: ~85% success
-    # At 60° off-nadir: ~75% success
-    execution_prob = 0.95 - (look_angle / 90.0) * 0.20
-
-    return max(0.7, min(0.99, execution_prob))
+    return max(0.7, min(0.99, 0.95 - (look_angle / 90.0) * 0.20))
 
 
-def run_single_comparison(submission_cost, exec_cost, run_seed=42, results_dir=None, plots_dir=None):
+def run_simulation_forward(world, max_safety_limit=40000, wall_clock_timeout_s=300):
     """
-    Run a single deterministic vs stochastic comparison with given cost parameters.
-
-    Returns metrics dictionary with keys:
-    - det_scheduled, det_quality, det_cost, det_utility
-    - sto_scheduled, sto_quality, sto_cost, sto_utility
-
-    Args:
-        submission_cost: Cost rate for submission
-        exec_cost: Cost rate for execution
-        run_seed: Random seed for reproducibility
-        results_dir: Optional directory to save individual run results
-        plots_dir: Optional directory to save schedule plots
+    Tick discrete-event simulation to completion with tick-count, wall-clock, 
+    and stuck-state detection safety limits.
     """
-    TAX_RATE = 0.0
+    ticks = 0
+    start_time = time.time()
+    last_sim_time = world.time
+    stuck_count = 0
+    last_progress_report = 0
 
-    # Load shared resources
-    cached_satellites = load_satellites_once()
-    volcano_db_locations = load_volcano_locations_from_database()
+    while True:
+        retcode = world.tick(print_forbidden_prefixes=[
+            "Downlink", "End of downlink", "Unlock uplink",
+            "Unlock satellite after obs", "Check timeout", "Executing Event"
+        ])
+        ticks += 1
+
+        if ticks - last_progress_report >= 5000:
+            print(f"      [Sim] {ticks} ticks, current sim time: {world.time}")
+            last_progress_report = ticks
+
+        if world.time == last_sim_time:
+            stuck_count += 1
+            if stuck_count > 100:
+                print(f"      WARNING: Simulation clock stuck at {world.time} for {stuck_count} ticks. Terminating.")
+                break
+        else:
+            stuck_count = 0
+            last_sim_time = world.time
+
+        if retcode == 0:
+            break
+        if ticks >= max_safety_limit:
+            print(f"      WARNING: Max tick safety limit ({max_safety_limit}) reached. Terminating.")
+            break
+        if time.time() - start_time > wall_clock_timeout_s:
+            print(f"      WARNING: Wall-clock timeout ({wall_clock_timeout_s}s) reached. Terminating.")
+            break
+
+    return ticks
+
+
+def _save_run_json(path, scheduler, sub_cost, exec_cost, m, ticks, elapsed_s):
+    """Serializes per-run metrics dictionary to a JSON file."""
+    record = {
+        'scheduler': scheduler,
+        'submission_cost_param': sub_cost,
+        'execution_cost_param': exec_cost,
+        'task_completion_rate': m.get('task_completion_rate', 0.0),
+        'group_completion_rate': m.get('group_completion_rate', 0.0),
+        'realized_quality': m.get('realized_quality', 0.0),
+        'total_cost': m.get('total_cost', 0.0),
+        'submission_cost': m.get('submission_cost', 0.0),
+        'execution_cost': m.get('execution_cost', 0.0),
+        'utility': m.get('utility', 0.0),
+        'n_submissions': m.get('n_submissions', 0),
+        'n_accepted': m.get('n_accepted', 0),
+        'n_executed': m.get('n_executed', 0),
+        'n_rejected': m.get('n_rejected', 0),
+        'rejection_rate': m.get('rejection_rate', 0.0),
+        'submitted_passes_per_task': m.get('submitted_passes_per_task', 0.0),
+        'exec_passes_per_completed': m.get('exec_passes_per_completed', 0.0),
+        'ticks': ticks,
+        'elapsed_s': elapsed_s,
+    }
+    with open(path, 'w') as f:
+        json.dump(record, f, indent=2)
+
+
+def _zero_metrics():
+    """Returns a zeroed metrics dictionary for graceful error recovery on run failure."""
+    return {
+        'task_completion_rate': 0.0,
+        'group_completion_rate': 0.0,
+        'realized_quality': 0.0,
+        'total_cost': 0.0,
+        'submission_cost': 0.0,
+        'execution_cost': 0.0,
+        'utility': 0.0,
+        'n_submissions': 0,
+        'n_accepted': 0,
+        'n_executed': 0,
+        'n_rejected': 0,
+        'rejection_rate': 0.0,
+        'submitted_passes_per_task': 0.0,
+        'exec_passes_per_completed': 0.0,
+        'ticks': 0,
+        'elapsed_s': 0.0,
+    }
+
+
+def run_single_comparison(
+    submission_cost,
+    exec_cost,
+    run_seed=42,
+    results_dir=None,
+    plots_dir=None,
+    cached_satellites=None,
+    volcano_db_locations=None,
+    demand_field=None,
+):
+    """
+    Executes all three schedulers (Stochastic Log-Linearized, Deterministic ILP, and Greedy)
+    under an identical random seed and cost parameter pair (submission_cost, exec_cost).
+
+    Returns a unified flat dictionary with 'sto_*', 'det_*', and 'grd_*' prefixed metrics.
+    """
+    TAX_RATE = 0.0  # Legacy tax disabled; costs are directly managed via submission_cost and exec_cost
+
+    if cached_satellites is None:
+        cached_satellites = load_satellites_once()
+    if volcano_db_locations is None:
+        volcano_db_locations = load_volcano_locations_from_database()
 
     min_time = SIMULATION_START
     max_time = SIMULATION_START + dt.timedelta(hours=lookahead_horizon_h)
 
-    def compute_metrics(workflow_graph, broker, submission_cost_rate, execution_cost_rate):
-        """Simplified metrics computation."""
-        scheduled = [n for n in workflow_graph.nodes() if n.scheduled and n.feasible]
-
-        num_total_attempts = len(broker._requests)
-        rejected_rows = broker._requests[broker._requests['status'] == ObservationStatus.CONSTELLATION_REJECTED]
-        num_rejected = len(rejected_rows)
-
-        # Count accepted requests (SCHEDULED or DATA_RECEIVED)
-        accepted_rows = broker._requests[
-            broker._requests['status'].isin([ObservationStatus.SCHEDULED, ObservationStatus.DATA_RECEIVED])
-        ]
-        num_accepted = len(accepted_rows)
-
-        # Count successfully executed requests (DATA_RECEIVED only)
-        executed_rows = broker._requests[broker._requests['status'] == ObservationStatus.DATA_RECEIVED]
-        num_executed = len(executed_rows)
-
-        total_realized_quality = 0.0
-        total_submission_cost = 0.0
-        total_execution_cost = 0.0
-
-        # Calculate quality (BEST per task)
-        for task in workflow_graph.nodes():
-            task_requests = broker._requests[broker._requests['request'] == task.observation_request]
-            executed = task_requests[task_requests['status'] == ObservationStatus.DATA_RECEIVED]
-
-            if len(executed) == 0:
-                continue
-
-            executed_qualities = []
-            for _, req_row in executed.iterrows():
-                if req_row['requested_pass'] is not None:
-                    executed_qualities.append(task.rewarder(req_row['requested_pass'].highest))
-
-            if len(executed_qualities) == 0:
-                continue
-
-            total_realized_quality += max(executed_qualities)
-
-        # Calculate costs
-        for _, req_row in broker._requests.iterrows():
-            if req_row['requested_pass'] is None:
-                continue
-
-            task = None
-            for t in workflow_graph.nodes():
-                if t.observation_request == req_row['request']:
-                    task = t
-                    break
-
-            if task is None:
-                continue
-
-            quality = task.rewarder(req_row['requested_pass'].highest)
-
-            # Submission cost: ALL attempts
-            total_submission_cost += submission_cost_rate * quality
-
-            # Execution cost: ONLY executed
-            if req_row['status'] == ObservationStatus.DATA_RECEIVED:
-                total_execution_cost += execution_cost_rate * quality
-
-        total_cost = total_submission_cost + total_execution_cost
-
-        # Calculate rates
-        rejection_rate = (num_rejected / num_total_attempts * 100) if num_total_attempts > 0 else 0.0
-        acceptance_rate = (num_accepted / num_total_attempts * 100) if num_total_attempts > 0 else 0.0
-        execution_rate = (num_executed / num_accepted * 100) if num_accepted > 0 else 0.0
-
-        return {
-            'scheduled': len(scheduled),
-            'attempts': num_total_attempts,
-            'accepted': num_accepted,
-            'executed': num_executed,
-            'rejections': num_rejected,
-            'rejection_rate': rejection_rate,
-            'acceptance_rate': acceptance_rate,
-            'execution_rate': execution_rate,
-            'quality': total_realized_quality,
-            'cost': total_cost,
-            'submission_cost': total_submission_cost,
-            'execution_cost': total_execution_cost,
-            'utility': total_realized_quality - total_cost,
-        }
-
-    def run_simulation_forward(world, max_safety_limit=40000, wall_clock_timeout_s=300):
-        """
-        Run simulation to completion with multiple safety mechanisms.
-
-        Safety mechanisms:
-        1. Max tick count (prevent infinite loops)
-        2. Wall-clock timeout (prevent hung simulations)
-        3. Progress detection (detect stuck states)
-        """
-        import time
-
-        ticks = 0
-        start_time = time.time()
-        last_sim_time = world.time
-        stuck_count = 0
-
-        while True:
-            retcode = world.tick(print_forbidden_prefixes=["Downlink", "End of downlink", "Unlock uplink", "Unlock satellite after obs", "Check timeout", "Executing Event"])
-            ticks += 1
-
-            # Check if simulation is progressing
-            if world.time == last_sim_time:
-                stuck_count += 1
-                if stuck_count > 100:  # Simulation stuck for 100 ticks
-                    print(f"      WARNING: Simulation stuck at time {world.time} for {stuck_count} ticks. Terminating.")
-                    break
-            else:
-                stuck_count = 0
-                last_sim_time = world.time
-
-            # Normal termination
-            if retcode == 0:
-                break
-
-            # Safety limit on tick count
-            if ticks >= max_safety_limit:
-                print(f"      WARNING: Reached max tick limit ({max_safety_limit}). Terminating.")
-                break
-
-            # Wall-clock timeout
-            elapsed = time.time() - start_time
-            if elapsed > wall_clock_timeout_s:
-                print(f"      WARNING: Wall-clock timeout ({wall_clock_timeout_s}s) reached. Terminating.")
-                break
-
-        return ticks
+    # Use dynamic spatio-temporal acceptance probability function from DemandField if present
+    if demand_field is not None:
+        acceptance_prob_fn = demand_field.make_acceptance_prob_function()
+    else:
+        # Fallback acceptance probability function
+        def acceptance_prob_fn(constrained_request, satellite, obs_pass):
+            name = satellite.name.upper()
+            if any(x in name for x in ["SKYSAT", "PELICAN", "TANAGER"]):
+                return 0.70
+            elif "UMBRA" in name:
+                return 0.85
+            elif "CAPELLA" in name or "ACADIA" in name:
+                return 0.90
+            elif "LOFT" in name or "YAM" in name:
+                return 0.92
+            elif "UBOTICA" in name or "HAMMER" in name or "ACCENTURE" in name:
+                return 0.93
+            elif "PERSISTENCE" in name or "LEMUR" in name:
+                return 0.94
+            elif "AEROCUBE" in name:
+                return 0.95
+            elif "ICEYE" in name:
+                return 0.96
+            return 0.85
 
     results = {}
 
-    # === STOCHASTIC ===
-    print(f"    Running stochastic (sub={submission_cost:.2f}, exec={exec_cost:.2f})...")
-    import time
-    sto_start = time.time()
+    def _plots_subdir(scheduler_name):
+        if plots_dir is None:
+            return None
+        d = os.path.join(plots_dir, f"sub{submission_cost:.2f}_exec{exec_cost:.2f}", scheduler_name)
+        os.makedirs(d, exist_ok=True)
+        return d
 
+    # ── 1. STOCHASTIC LOG-LINEARIZED SCHEDULER ─────────────────────────────────
+    print(f"    Running stochastic_log (sub={submission_cost:.2f}, exec={exec_cost:.2f})...")
+    sto_start = time.time()
     random.seed(run_seed)
     np.random.seed(run_seed)
 
-    from fame_broker import Broker
-
-    world_sto, const_sto = create_world_and_constellations(cached_satellites)
+    world_sto, const_sto = create_world_and_constellations(cached_satellites, demand_field=demand_field)
     workflow_sto = create_volcano_workflow(volcano_db_locations, min_time, max_time)
-    broker_sto = Broker(constellations=const_sto, world=world_sto, name="Broker-Sto")
+    broker_sto = Broker(constellations=const_sto, world=world_sto, name="Broker-Sto-Log")
     broker_sto.add_workflow(workflow_sto)
     world_sto.add_broker(broker_sto)
 
     try:
-        # Save schedule plot to plots directory
-        if plots_dir:
-            original_cwd = os.getcwd()
-            try:
-                os.chdir(plots_dir)
-                broker_sto.schedule_workflow(
-                    current_time=world_sto.time,
-                    use_ilp=True,
-                    use_stochastic=True,
-                    stochastic_formulation="log_linearized",
-                    acceptance_probability_function=acceptance_prob_function,
-                    execution_probability_function=execution_prob_function,
-                    submission_cost_rate=submission_cost,
-                    execution_cost_rate=exec_cost,
-                    tax_rate=TAX_RATE,
-                    max_solver_time_s=MAX_SOLVER_TIME_S,
-                    solver_engine="GUROBI",
-                    update_timelines=False,
-                    update_requests=False,
-                    plot_schedule=True,
-                    save_schedule_plot=True
-                )
-            finally:
-                os.chdir(original_cwd)
-        else:
-            broker_sto.schedule_workflow(
-                current_time=world_sto.time,
-                use_ilp=True,
-                use_stochastic=True,
-                stochastic_formulation="log_linearized",
-                acceptance_probability_function=acceptance_prob_function,
-                execution_probability_function=execution_prob_function,
-                submission_cost_rate=submission_cost,
-                execution_cost_rate=exec_cost,
-                tax_rate=TAX_RATE,
-                max_solver_time_s=MAX_SOLVER_TIME_S,
-                solver_engine="GUROBI",
-                update_timelines=False,
-                update_requests=False
-            )
-        ticks = run_simulation_forward(world_sto)
-        m = compute_metrics(broker_sto._workflow_graph, broker_sto, submission_cost, exec_cost)
-        sto_elapsed = time.time() - sto_start
+        sto_kwargs = dict(
+            current_time=world_sto.time,
+            use_ilp=True,
+            use_stochastic=True,
+            stochastic_formulation="log_linearized",
+            acceptance_probability_function=acceptance_prob_fn,
+            execution_probability_function=_execution_prob_function,
+            submission_cost_rate=submission_cost,
+            execution_cost_rate=exec_cost,
+            tax_rate=TAX_RATE,
+            max_solver_time_s=MAX_SOLVER_TIME_S,
+            solver_engine="GUROBI",
+            update_timelines=False,
+            update_requests=False,
+            max_reschedule_depth=5,
+        )
+        subdir = _plots_subdir("stochastic_log")
+        if subdir:
+            sto_kwargs.update(plot_schedule=True, save_schedule_plot=True, results_path=subdir)
 
-        results['sto_scheduled'] = m['scheduled']
-        results['sto_attempts'] = m['attempts']
-        results['sto_accepted'] = m['accepted']
-        results['sto_executed'] = m['executed']
-        results['sto_rejections'] = m['rejections']
-        results['sto_rejection_rate'] = m['rejection_rate']
-        results['sto_acceptance_rate'] = m['acceptance_rate']
-        results['sto_execution_rate'] = m['execution_rate']
-        results['sto_quality'] = m['quality']
-        results['sto_cost'] = m['cost']
-        results['sto_submission_cost'] = m['submission_cost']
-        results['sto_execution_cost'] = m['execution_cost']
-        results['sto_utility'] = m['utility']
+        broker_sto.schedule_workflow_redundant(**sto_kwargs)
+        ticks = run_simulation_forward(world_sto)
+
+        m = compute_metrics_v2(
+            workflow_graph=broker_sto._workflow_graph,
+            broker=broker_sto,
+            observation_status_enum=ObservationStatus,
+            submission_cost_rate=submission_cost,
+            execution_cost_rate=exec_cost,
+            verbose=False,
+        )
+        sto_elapsed = time.time() - sto_start
+        print(f"      [Sto] TaskComp={m['task_completion_rate']:.3f}, GroupComp={m['group_completion_rate']:.3f}, "
+              f"Qual={m['realized_quality']:.1f}, Cost={m['total_cost']:.1f}, Util={m['utility']:.1f}, "
+              f"Passes/Task={m['submitted_passes_per_task']:.2f}, Elapsed={sto_elapsed:.1f}s")
+
+        for k, v in m.items():
+            results[f'sto_{k}'] = v
         results['sto_ticks'] = ticks
         results['sto_elapsed_s'] = sto_elapsed
-        print(f"      Stochastic: sched={m['scheduled']}, qual={m['quality']:.1f}, cost={m['cost']:.1f}, util={m['utility']:.1f}, ticks={ticks}, time={sto_elapsed:.1f}s")
 
-        # Save immediately after this run completes
         if results_dir:
-            run_file = os.path.join(results_dir, f"run_sub{submission_cost:.2f}_exec{exec_cost:.2f}_stochastic.json")
-            with open(run_file, 'w') as f:
-                json.dump({
-                    'scheduler': 'stochastic',
-                    'submission_cost': submission_cost,
-                    'execution_cost': exec_cost,
-                    'scheduled': m['scheduled'],
-                    'attempts': m['attempts'],
-                    'accepted': m['accepted'],
-                    'executed': m['executed'],
-                    'rejections': m['rejections'],
-                    'rejection_rate': m['rejection_rate'],
-                    'acceptance_rate': m['acceptance_rate'],
-                    'execution_rate': m['execution_rate'],
-                    'quality': m['quality'],
-                    'cost': m['cost'],
-                    'submission_cost_value': m['submission_cost'],
-                    'execution_cost_value': m['execution_cost'],
-                    'utility': m['utility'],
-                    'ticks': ticks,
-                    'elapsed_s': sto_elapsed,
-                }, f, indent=2)
-            print(f"      [Saved] {run_file}")
+            path = os.path.join(results_dir, f"run_sub{submission_cost:.2f}_exec{exec_cost:.2f}_stochastic_log.json")
+            _save_run_json(path, 'stochastic_log', submission_cost, exec_cost, m, ticks, sto_elapsed)
     except Exception as e:
         print(f"      Stochastic FAILED: {e}")
-        import traceback
-        traceback.print_exc()
-        results['sto_scheduled'] = 0
-        results['sto_attempts'] = 0
-        results['sto_accepted'] = 0
-        results['sto_executed'] = 0
-        results['sto_rejections'] = 0
-        results['sto_rejection_rate'] = 0
-        results['sto_acceptance_rate'] = 0
-        results['sto_execution_rate'] = 0
-        results['sto_quality'] = 0
-        results['sto_cost'] = 0
-        results['sto_submission_cost'] = 0
-        results['sto_execution_cost'] = 0
-        results['sto_utility'] = 0
-        results['sto_ticks'] = 0
-        results['sto_elapsed_s'] = 0
+        import traceback; traceback.print_exc()
+        zm = _zero_metrics()
+        for k, v in zm.items():
+            results[f'sto_{k}'] = v
 
-    # === DETERMINISTIC ===
+    # ── 2. DETERMINISTIC ILP SCHEDULER ─────────────────────────────────────────
     print(f"    Running deterministic (sub={submission_cost:.2f}, exec={exec_cost:.2f})...")
     det_start = time.time()
-
     random.seed(run_seed)
     np.random.seed(run_seed)
 
-    world_det, const_det = create_world_and_constellations(cached_satellites)
+    world_det, const_det = create_world_and_constellations(cached_satellites, demand_field=demand_field)
     workflow_det = create_volcano_workflow(volcano_db_locations, min_time, max_time)
     broker_det = Broker(constellations=const_det, world=world_det, name="Broker-Det")
     broker_det.add_workflow(workflow_det)
     world_det.add_broker(broker_det)
 
     try:
-        # Save schedule plot to plots directory
-        if plots_dir:
-            original_cwd = os.getcwd()
-            try:
-                os.chdir(plots_dir)
-                broker_det.schedule_workflow(
-                    current_time=world_det.time,
-                    use_ilp=True,
-                    use_stochastic=False,
-                    max_solver_time_s=MAX_SOLVER_TIME_S,
-                    solver_engine="GUROBI",
-                    update_timelines=False,
-                    update_requests=False,
-                    tax_rate=TAX_RATE,
-                    plot_schedule=True,
-                    save_schedule_plot=True
-                )
-            finally:
-                os.chdir(original_cwd)
-        else:
-            broker_det.schedule_workflow(
-                current_time=world_det.time,
-                use_ilp=True,
-                use_stochastic=False,
-                max_solver_time_s=MAX_SOLVER_TIME_S,
-                solver_engine="GUROBI",
-                update_timelines=False,
-                update_requests=False,
-                tax_rate=TAX_RATE
-            )
-        ticks = run_simulation_forward(world_det)
-        m = compute_metrics(broker_det._workflow_graph, broker_det, submission_cost, exec_cost)
-        det_elapsed = time.time() - det_start
+        det_kwargs = dict(
+            current_time=world_det.time,
+            use_ilp=True,
+            use_stochastic=False,
+            max_solver_time_s=MAX_SOLVER_TIME_S,
+            solver_engine="GUROBI",
+            update_timelines=False,
+            update_requests=False,
+            tax_rate=TAX_RATE,
+            max_reschedule_depth=1,
+        )
+        subdir = _plots_subdir("deterministic")
+        if subdir:
+            det_kwargs.update(plot_schedule=True, save_schedule_plot=True, results_path=subdir)
 
-        results['det_scheduled'] = m['scheduled']
-        results['det_attempts'] = m['attempts']
-        results['det_accepted'] = m['accepted']
-        results['det_executed'] = m['executed']
-        results['det_rejections'] = m['rejections']
-        results['det_rejection_rate'] = m['rejection_rate']
-        results['det_acceptance_rate'] = m['acceptance_rate']
-        results['det_execution_rate'] = m['execution_rate']
-        results['det_quality'] = m['quality']
-        results['det_cost'] = m['cost']
-        results['det_submission_cost'] = m['submission_cost']
-        results['det_execution_cost'] = m['execution_cost']
-        results['det_utility'] = m['utility']
+        broker_det.schedule_workflow_redundant(**det_kwargs)
+        ticks = run_simulation_forward(world_det)
+
+        m = compute_metrics_v2(
+            workflow_graph=broker_det._workflow_graph,
+            broker=broker_det,
+            observation_status_enum=ObservationStatus,
+            submission_cost_rate=submission_cost,
+            execution_cost_rate=exec_cost,
+            verbose=False,
+        )
+        det_elapsed = time.time() - det_start
+        print(f"      [Det] TaskComp={m['task_completion_rate']:.3f}, GroupComp={m['group_completion_rate']:.3f}, "
+              f"Qual={m['realized_quality']:.1f}, Cost={m['total_cost']:.1f}, Util={m['utility']:.1f}, "
+              f"Passes/Task={m['submitted_passes_per_task']:.2f}, Elapsed={det_elapsed:.1f}s")
+
+        for k, v in m.items():
+            results[f'det_{k}'] = v
         results['det_ticks'] = ticks
         results['det_elapsed_s'] = det_elapsed
-        print(f"      Deterministic: sched={m['scheduled']}, qual={m['quality']:.1f}, cost={m['cost']:.1f}, util={m['utility']:.1f}, ticks={ticks}, time={det_elapsed:.1f}s")
 
-        # Save immediately after this run completes
         if results_dir:
-            run_file = os.path.join(results_dir, f"run_sub{submission_cost:.2f}_exec{exec_cost:.2f}_deterministic.json")
-            with open(run_file, 'w') as f:
-                json.dump({
-                    'scheduler': 'deterministic',
-                    'submission_cost': submission_cost,
-                    'execution_cost': exec_cost,
-                    'scheduled': m['scheduled'],
-                    'attempts': m['attempts'],
-                    'accepted': m['accepted'],
-                    'executed': m['executed'],
-                    'rejections': m['rejections'],
-                    'rejection_rate': m['rejection_rate'],
-                    'acceptance_rate': m['acceptance_rate'],
-                    'execution_rate': m['execution_rate'],
-                    'quality': m['quality'],
-                    'cost': m['cost'],
-                    'submission_cost_value': m['submission_cost'],
-                    'execution_cost_value': m['execution_cost'],
-                    'utility': m['utility'],
-                    'ticks': ticks,
-                    'elapsed_s': det_elapsed,
-                }, f, indent=2)
-            print(f"      [Saved] {run_file}")
+            path = os.path.join(results_dir, f"run_sub{submission_cost:.2f}_exec{exec_cost:.2f}_deterministic.json")
+            _save_run_json(path, 'deterministic', submission_cost, exec_cost, m, ticks, det_elapsed)
     except Exception as e:
         print(f"      Deterministic FAILED: {e}")
-        import traceback
-        traceback.print_exc()
-        results['det_scheduled'] = 0
-        results['det_attempts'] = 0
-        results['det_accepted'] = 0
-        results['det_executed'] = 0
-        results['det_rejections'] = 0
-        results['det_rejection_rate'] = 0
-        results['det_acceptance_rate'] = 0
-        results['det_execution_rate'] = 0
-        results['det_quality'] = 0
-        results['det_cost'] = 0
-        results['det_submission_cost'] = 0
-        results['det_execution_cost'] = 0
-        results['det_utility'] = 0
-        results['det_ticks'] = 0
-        results['det_elapsed_s'] = 0
+        import traceback; traceback.print_exc()
+        zm = _zero_metrics()
+        for k, v in zm.items():
+            results[f'det_{k}'] = v
+
+    # ── 3. GREEDY SCHEDULER ────────────────────────────────────────────────────
+    print(f"    Running greedy (sub={submission_cost:.2f}, exec={exec_cost:.2f})...")
+    grd_start = time.time()
+    random.seed(run_seed)
+    np.random.seed(run_seed)
+
+    world_grd, const_grd = create_world_and_constellations(cached_satellites, demand_field=demand_field)
+    workflow_grd = create_volcano_workflow(volcano_db_locations, min_time, max_time)
+    broker_grd = Broker(constellations=const_grd, world=world_grd, name="Broker-Greedy")
+    broker_grd.add_workflow(workflow_grd)
+    world_grd.add_broker(broker_grd)
+
+    try:
+        grd_kwargs = dict(
+            current_time=world_grd.time,
+            use_ilp=False,
+            use_stochastic=False,
+            max_solver_time_s=MAX_SOLVER_TIME_S,
+            update_timelines=False,
+            update_requests=False,
+            tax_rate=TAX_RATE,
+            max_reschedule_depth=1,
+        )
+        subdir = _plots_subdir("greedy")
+        if subdir:
+            grd_kwargs.update(plot_schedule=True, save_schedule_plot=True, results_path=subdir)
+
+        broker_grd.schedule_workflow_redundant(**grd_kwargs)
+        ticks = run_simulation_forward(world_grd)
+
+        m = compute_metrics_v2(
+            workflow_graph=broker_grd._workflow_graph,
+            broker=broker_grd,
+            observation_status_enum=ObservationStatus,
+            submission_cost_rate=submission_cost,
+            execution_cost_rate=exec_cost,
+            verbose=False,
+        )
+        grd_elapsed = time.time() - grd_start
+        print(f"      [Grd] TaskComp={m['task_completion_rate']:.3f}, GroupComp={m['group_completion_rate']:.3f}, "
+              f"Qual={m['realized_quality']:.1f}, Cost={m['total_cost']:.1f}, Util={m['utility']:.1f}, "
+              f"Passes/Task={m['submitted_passes_per_task']:.2f}, Elapsed={grd_elapsed:.1f}s")
+
+        for k, v in m.items():
+            results[f'grd_{k}'] = v
+        results['grd_ticks'] = ticks
+        results['grd_elapsed_s'] = grd_elapsed
+
+        if results_dir:
+            path = os.path.join(results_dir, f"run_sub{submission_cost:.2f}_exec{exec_cost:.2f}_greedy.json")
+            _save_run_json(path, 'greedy', submission_cost, exec_cost, m, ticks, grd_elapsed)
+    except Exception as e:
+        print(f"      Greedy FAILED: {e}")
+        import traceback; traceback.print_exc()
+        zm = _zero_metrics()
+        for k, v in zm.items():
+            results[f'grd_{k}'] = v
 
     return results
 
 
 def run_ablation_study():
-    """
-    Run ablation study across a grid of cost parameter values.
-    """
-    print("\n" + "="*70)
-    print("COST ABLATION STUDY: Stochastic vs Deterministic")
-    print("="*70)
+    """Sweeps a cost parameter grid running Greedy + Deterministic + Stochastic_Log at each point."""
+    print("\n" + "=" * 70)
+    print("COST ABLATION STUDY: Greedy vs Deterministic vs Stochastic")
+    print("=" * 70)
 
-    # Create results directory
     timestamp = dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
     results_dir = os.path.join("results", f"cost_ablation_{timestamp}")
-    os.makedirs(results_dir, exist_ok=True)
     plots_dir = os.path.join(results_dir, "plots")
+    os.makedirs(results_dir, exist_ok=True)
     os.makedirs(plots_dir, exist_ok=True)
-    print(f"\n[Results] Saving to directory: {results_dir}")
-    print(f"[Plots] Saving schedule plots to: {plots_dir}")
+    print(f"\n[Results] {results_dir}")
+    print(f"[Plots]   {plots_dir}")
 
-    # Define parameter grid
-    submission_costs = [0.00, 0.10, 0.15, 0.25]
-    execution_costs = [0.05, 0.20, 0.40, 0.50]
+    print("\n[Init] Loading satellites and volcano database...")
+    cached_satellites = load_satellites_once()
+    volcano_db_locations = load_volcano_locations_from_database()
 
-    print(f"\n[Config] Testing {len(submission_costs)} x {len(execution_costs)} = {len(submission_costs) * len(execution_costs)} combinations")
-    print(f"  Submission costs: {submission_costs}")
-    print(f"  Execution costs: {execution_costs}")
+    min_time = SIMULATION_START
+
+    # Build demand field — single source of truth for simulator and planner
+    _demand_cfg = DemandFieldConfig(use_constant_probability=False)
+    _horizon_s = lookahead_horizon_h * 3600.0
+    demand_field = DemandField(config=_demand_cfg, reference_time=min_time, horizon_s=_horizon_s)
+
+    for vloc in volcano_db_locations:
+        demand_field.add_spike(vloc.lat_deg, vloc.lon_deg, min_time)
+
+    _all_constellation_names = ["Planet", "Umbra", "Capella", "LOFT", "Ubotica", "Mission Control", "AC", "ICEYE"]
+    print("[DemandField] Precomputing demand trajectories...")
+    demand_field.precompute(_all_constellation_names)
+    print("[DemandField] Precompute complete.")
+
+    # Cost parameter grid
+    submission_costs = [0.00, 0.05, 0.10, 0.20]
+    execution_costs  = [0.05, 0.15, 0.30, 0.50]
+
+    n_combos = len(submission_costs) * len(execution_costs)
+    print(f"\n[Config] {len(submission_costs)} × {len(execution_costs)} = {n_combos} cost combinations")
+    print(f"  Submission costs (c_sub): {submission_costs}")
+    print(f"  Execution costs (c_exec):  {execution_costs}")
 
     all_results = []
 
     for sub_cost, exec_cost in product(submission_costs, execution_costs):
-        print(f"\n--- Testing submission_cost={sub_cost:.2f}, execution_cost={exec_cost:.2f} ---")
+        print(f"\n--- submission_cost={sub_cost:.2f}, execution_cost={exec_cost:.2f} ---")
 
-        # Run comparison (pass results_dir and plots_dir for immediate saves)
-        result = run_single_comparison(sub_cost, exec_cost, run_seed=42, results_dir=results_dir, plots_dir=plots_dir)
-
-        # Add cost parameters to result
+        result = run_single_comparison(
+            sub_cost, exec_cost,
+            run_seed=42,
+            results_dir=results_dir,
+            plots_dir=plots_dir,
+            cached_satellites=cached_satellites,
+            volcano_db_locations=volcano_db_locations,
+            demand_field=demand_field,
+        )
         result['submission_cost_param'] = sub_cost
         result['execution_cost_param'] = exec_cost
 
-        # Calculate relative performance
-        if result['det_utility'] > 0:
-            result['sto_vs_det_utility_ratio'] = result['sto_utility'] / result['det_utility']
-            result['sto_vs_det_utility_diff'] = result['sto_utility'] - result['det_utility']
-        else:
-            result['sto_vs_det_utility_ratio'] = 0
-            result['sto_vs_det_utility_diff'] = 0
+        # Comparative utility metrics (Stochastic vs Deterministic & Greedy)
+        det_util = result.get('det_utility', 0.0)
+        sto_util = result.get('sto_utility', 0.0)
+        grd_util = result.get('grd_utility', 0.0)
 
-        if result['det_scheduled'] > 0:
-            result['sto_quality_per_task'] = result['sto_quality'] / result['sto_scheduled'] if result['sto_scheduled'] > 0 else 0
-            result['det_quality_per_task'] = result['det_quality'] / result['det_scheduled']
-        else:
-            result['sto_quality_per_task'] = 0
-            result['det_quality_per_task'] = 0
+        result['sto_vs_det_utility_diff'] = sto_util - det_util
+        result['sto_vs_grd_utility_diff'] = sto_util - grd_util
+        result['sto_vs_det_task_comp_diff'] = result.get('sto_task_completion_rate', 0.0) - result.get('det_task_completion_rate', 0.0)
+        result['sto_vs_grd_task_comp_diff'] = result.get('sto_task_completion_rate', 0.0) - result.get('grd_task_completion_rate', 0.0)
 
         all_results.append(result)
 
-        # Save individual result
-        result_file = os.path.join(results_dir, f"result_sub{sub_cost:.2f}_exec{exec_cost:.2f}.json")
-        with open(result_file, 'w') as f:
-            json.dump(result, f, indent=2)
+        # Save combined result JSON for this parameter grid point
+        with open(os.path.join(results_dir, f"result_sub{sub_cost:.2f}_exec{exec_cost:.2f}.json"), 'w') as f:
+            json.dump({k: v for k, v in result.items() if not isinstance(v, (list, set, dict))}, f, indent=2)
 
-    # Save summary CSV (one row per parameter combination with aggregated metrics)
+    # ── SAVE SUMMARY CSVs ──────────────────────────────────────────────────────
     df = pd.DataFrame(all_results)
-    summary_csv = os.path.join(results_dir, "ablation_summary.csv")
-    df.to_csv(summary_csv, index=False)
-    print(f"\n[Summary] Saved ablation results to {summary_csv}")
+    ablation_summary_csv = os.path.join(results_dir, "ablation_summary.csv")
+    df.to_csv(ablation_summary_csv, index=False)
+    print(f"\n[Summary Wide CSV]  {ablation_summary_csv}")
 
-    # Save detailed per-run results in long format (one row per scheduler+parameter combination)
+    # Long-format all_runs.csv (one row per scheduler × cost combination)
     detailed_rows = []
     for result in all_results:
-        sub_cost = result['submission_cost_param']
+        sub_cost  = result['submission_cost_param']
         exec_cost = result['execution_cost_param']
-
-        # Stochastic row
-        detailed_rows.append({
-            'submission_cost': sub_cost,
-            'execution_cost': exec_cost,
-            'scheduler': 'stochastic',
-            'scheduled': result['sto_scheduled'],
-            'attempts': result['sto_attempts'],
-            'accepted': result.get('sto_accepted', 0),
-            'executed': result.get('sto_executed', 0),
-            'rejections': result['sto_rejections'],
-            'rejection_rate': result.get('sto_rejection_rate', 0),
-            'acceptance_rate': result.get('sto_acceptance_rate', 0),
-            'execution_rate': result.get('sto_execution_rate', 0),
-            'quality': result['sto_quality'],
-            'cost': result['sto_cost'],
-            'submission_cost_value': result['sto_submission_cost'],
-            'execution_cost_value': result['sto_execution_cost'],
-            'utility': result['sto_utility'],
-            'ticks': result.get('sto_ticks', 0),
-            'elapsed_s': result.get('sto_elapsed_s', 0),
-        })
-
-        # Deterministic row
-        detailed_rows.append({
-            'submission_cost': sub_cost,
-            'execution_cost': exec_cost,
-            'scheduler': 'deterministic',
-            'scheduled': result['det_scheduled'],
-            'attempts': result['det_attempts'],
-            'accepted': result.get('det_accepted', 0),
-            'executed': result.get('det_executed', 0),
-            'rejections': result['det_rejections'],
-            'rejection_rate': result.get('det_rejection_rate', 0),
-            'acceptance_rate': result.get('det_acceptance_rate', 0),
-            'execution_rate': result.get('det_execution_rate', 0),
-            'quality': result['det_quality'],
-            'cost': result['det_cost'],
-            'submission_cost_value': result['det_submission_cost'],
-            'execution_cost_value': result['det_execution_cost'],
-            'utility': result['det_utility'],
-            'ticks': result.get('det_ticks', 0),
-            'elapsed_s': result.get('det_elapsed_s', 0),
-        })
+        for prefix, scheduler in [('sto', 'stochastic_log'), ('det', 'deterministic'), ('grd', 'greedy')]:
+            detailed_rows.append({
+                'submission_cost_param':    sub_cost,
+                'execution_cost_param':     exec_cost,
+                'scheduler':                 scheduler,
+                'task_completion_rate':      result.get(f'{prefix}_task_completion_rate', 0.0),
+                'group_completion_rate':     result.get(f'{prefix}_group_completion_rate', 0.0),
+                'realized_quality':          result.get(f'{prefix}_realized_quality', 0.0),
+                'total_cost':                result.get(f'{prefix}_total_cost', 0.0),
+                'submission_cost':           result.get(f'{prefix}_submission_cost', 0.0),
+                'execution_cost':            result.get(f'{prefix}_execution_cost', 0.0),
+                'utility':                   result.get(f'{prefix}_utility', 0.0),
+                'n_submissions':             result.get(f'{prefix}_n_submissions', 0),
+                'n_accepted':                result.get(f'{prefix}_n_accepted', 0),
+                'n_executed':                result.get(f'{prefix}_n_executed', 0),
+                'n_rejected':                result.get(f'{prefix}_n_rejected', 0),
+                'rejection_rate':            result.get(f'{prefix}_rejection_rate', 0.0),
+                'submitted_passes_per_task': result.get(f'{prefix}_submitted_passes_per_task', 0.0),
+                'exec_passes_per_completed': result.get(f'{prefix}_exec_passes_per_completed', 0.0),
+                'ticks':                     result.get(f'{prefix}_ticks', 0),
+                'elapsed_s':                 result.get(f'{prefix}_elapsed_s', 0.0),
+            })
 
     detailed_df = pd.DataFrame(detailed_rows)
-    detailed_csv = os.path.join(results_dir, "all_runs.csv")
-    detailed_df.to_csv(detailed_csv, index=False)
-    print(f"[Detailed] Saved detailed per-run results to {detailed_csv}")
+    all_runs_csv = os.path.join(results_dir, "all_runs.csv")
+    detailed_df.to_csv(all_runs_csv, index=False)
+    print(f"[Detailed Long CSV]  {all_runs_csv}")
 
-    # Print summary analysis
-    print("\n" + "="*70)
-    print("ABLATION STUDY SUMMARY")
-    print("="*70)
+    # ── SUMMARY STATISTICAL ANALYSIS ──────────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("ABLATION STUDY EXECUTIVE SUMMARY")
+    print("=" * 70)
 
-    # Find best configuration for stochastic
-    best_sto_idx = df['sto_utility'].idxmax()
-    best_sto = df.loc[best_sto_idx]
+    for prefix, label in [('sto', 'STOCHASTIC_LOG'), ('det', 'DETERMINISTIC'), ('grd', 'GREEDY')]:
+        col_util = f'{prefix}_utility'
+        col_comp = f'{prefix}_task_completion_rate'
+        col_pass = f'{prefix}_submitted_passes_per_task'
 
-    print(f"\n✓ Best Stochastic Configuration:")
-    print(f"  Submission cost: {best_sto['submission_cost_param']:.2f}")
-    print(f"  Execution cost: {best_sto['execution_cost_param']:.2f}")
-    print(f"  Utility: {best_sto['sto_utility']:.2f}")
-    print(f"  Scheduled: {best_sto['sto_scheduled']:.0f}")
-    print(f"  Quality/task: {best_sto['sto_quality_per_task']:.2f}")
+        if col_util in df.columns:
+            print(f"\n{label}:")
+            print(f"  Task Comp Rate:   {df[col_comp].mean():.3f} ± {df[col_comp].std():.3f} (Range: {df[col_comp].min():.3f} – {df[col_comp].max():.3f})")
+            print(f"  Net Utility:      {df[col_util].mean():.2f} ± {df[col_util].std():.2f} (Range: {df[col_util].min():.2f} – {df[col_util].max():.2f})")
+            print(f"  Redundancy Pass:  {df[col_pass].mean():.2f} submitted passes/task")
 
-    # Find configuration where stochastic beats deterministic by most
-    df['sto_advantage'] = df['sto_utility'] - df['det_utility']
-    best_advantage_idx = df['sto_advantage'].idxmax()
-    best_advantage = df.loc[best_advantage_idx]
+    # Best Stochastic Configuration
+    if 'sto_utility' in df.columns:
+        best_sto = df.loc[df['sto_utility'].idxmax()]
+        print(f"\nBest Stochastic Net Utility Configuration:")
+        print(f"  sub_cost={best_sto['submission_cost_param']:.2f}, exec_cost={best_sto['execution_cost_param']:.2f}")
+        print(f"  Net Utility={best_sto['sto_utility']:.2f}, Task Comp Rate={best_sto['sto_task_completion_rate']:.3f}")
 
-    print(f"\n✓ Largest Stochastic Advantage:")
-    print(f"  Submission cost: {best_advantage['submission_cost_param']:.2f}")
-    print(f"  Execution cost: {best_advantage['execution_cost_param']:.2f}")
-    print(f"  Stochastic utility: {best_advantage['sto_utility']:.2f}")
-    print(f"  Deterministic utility: {best_advantage['det_utility']:.2f}")
-    print(f"  Advantage: {best_advantage['sto_advantage']:.2f} ({best_advantage['sto_advantage']/best_advantage['det_utility']*100:.1f}%)")
+    # Stochastic Advantage Analysis
+    df['sto_adv_det'] = df['sto_utility'] - df['det_utility']
+    df['sto_adv_grd'] = df['sto_utility'] - df['grd_utility']
 
-    # Find where deterministic wins by most
-    worst_advantage_idx = df['sto_advantage'].idxmin()
-    worst_advantage = df.loc[worst_advantage_idx]
+    best_adv_det = df.loc[df['sto_adv_det'].idxmax()]
+    worst_adv_det = df.loc[df['sto_adv_det'].idxmin()]
 
-    print(f"\n✓ Largest Deterministic Advantage:")
-    print(f"  Submission cost: {worst_advantage['submission_cost_param']:.2f}")
-    print(f"  Execution cost: {worst_advantage['execution_cost_param']:.2f}")
-    print(f"  Stochastic utility: {worst_advantage['sto_utility']:.2f}")
-    print(f"  Deterministic utility: {worst_advantage['det_utility']:.2f}")
-    print(f"  Disadvantage: {worst_advantage['sto_advantage']:.2f} ({worst_advantage['sto_advantage']/worst_advantage['det_utility']*100:.1f}%)")
+    print(f"\nLargest Stochastic Advantage over Deterministic ILP:")
+    print(f"  sub={best_adv_det['submission_cost_param']:.2f}, exec={best_adv_det['execution_cost_param']:.2f}: "
+          f"Δutility={best_adv_det['sto_adv_det']:+.2f}, ΔTaskComp={best_adv_det['sto_vs_det_task_comp_diff']:+.3f}")
 
-    # Analyze sensitivity
-    print(f"\n✓ Sensitivity Analysis:")
-    print(f"  Stochastic utility range: {df['sto_utility'].min():.2f} to {df['sto_utility'].max():.2f}")
-    print(f"  Deterministic utility range: {df['det_utility'].min():.2f} to {df['det_utility'].max():.2f}")
-    print(f"  Stochastic advantage range: {df['sto_advantage'].min():.2f} to {df['sto_advantage'].max():.2f}")
+    print(f"\nSmallest Stochastic Advantage over Deterministic ILP:")
+    print(f"  sub={worst_adv_det['submission_cost_param']:.2f}, exec={worst_adv_det['execution_cost_param']:.2f}: "
+          f"Δutility={worst_adv_det['sto_adv_det']:+.2f}, ΔTaskComp={worst_adv_det['sto_vs_det_task_comp_diff']:+.3f}")
 
-    # Count wins
-    sto_wins = (df['sto_utility'] > df['det_utility']).sum()
-    det_wins = (df['det_utility'] > df['sto_utility']).sum()
-    ties = (df['det_utility'] == df['sto_utility']).sum()
+    n = len(df)
+    sto_wins_det = (df['sto_utility'] > df['det_utility']).sum()
+    sto_wins_grd = (df['sto_utility'] > df['grd_utility']).sum()
+    det_wins_grd = (df['det_utility'] > df['grd_utility']).sum()
 
-    print(f"\n✓ Win/Loss Record:")
-    print(f"  Stochastic wins: {sto_wins}/{len(df)} ({sto_wins/len(df)*100:.1f}%)")
-    print(f"  Deterministic wins: {det_wins}/{len(df)} ({det_wins/len(df)*100:.1f}%)")
-    print(f"  Ties: {ties}/{len(df)}")
+    print(f"\nWin/Loss Head-to-Head Record across {n} Cost Grid Points:")
+    print(f"  Stochastic > Deterministic: {sto_wins_det}/{n} ({sto_wins_det/n*100:.0f}%)")
+    print(f"  Stochastic > Greedy:        {sto_wins_grd}/{n} ({sto_wins_grd/n*100:.0f}%)")
+    print(f"  Deterministic > Greedy:     {det_wins_grd}/{n} ({det_wins_grd/n*100:.0f}%)")
 
     return df, results_dir
 
 
 if __name__ == "__main__":
     df, results_dir = run_ablation_study()
-    print(f"\n[Done] All results saved to {results_dir}")
+    print(f"\n[Done] All cost ablation results saved to {results_dir}")
