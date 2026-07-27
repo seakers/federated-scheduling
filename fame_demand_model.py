@@ -142,7 +142,7 @@ class DemandFieldConfig:
         RegionDef("Indian Ocean",  lat_min=-45, lat_max=10,  lon_min=40,   lon_max=100, baseline_demand=0.12),
         RegionDef("N Pacific",     lat_min=20,  lat_max=55,  lon_min=160,  lon_max=-130,baseline_demand=0.15),
         # Moderate demand — active but not peak
-        RegionDef("S America",     lat_min=-55, lat_max=15,  lon_min=-82,  lon_max=-34, baseline_demand=0.40),
+        RegionDef("S America",     lat_min=-55, lat_max=15,  lon_min=-82,  lon_max=-34, baseline_demand=0.38),
         RegionDef("Sub-Sah Africa",lat_min=-35, lat_max=15,  lon_min=-18,  lon_max=50,  baseline_demand=0.38),
         RegionDef("Central Asia",  lat_min=30,  lat_max=55,  lon_min=50,   lon_max=90,  baseline_demand=0.48),
         RegionDef("N Africa",      lat_min=15,  lat_max=38,  lon_min=-18,  lon_max=37,  baseline_demand=0.45),
@@ -153,7 +153,7 @@ class DemandFieldConfig:
         RegionDef("East Asia",     lat_min=20,  lat_max=50,  lon_min=105,  lon_max=145, baseline_demand=0.70),
         RegionDef("SE Asia",       lat_min=-10, lat_max=25,  lon_min=95,   lon_max=140, baseline_demand=0.72),
         # Peak demand — conflict zones, choke points, major ISR targets
-        RegionDef("Middle East",   lat_min=15,  lat_max=40,  lon_min=35,   lon_max=65,  baseline_demand=0.88),
+        RegionDef("Middle East",   lat_min=15,  lat_max=40,  lon_min=35,   lon_max=65,  baseline_demand=0.98),
         RegionDef("Korea Strait",  lat_min=32,  lat_max=42,  lon_min=124,  lon_max=132, baseline_demand=0.85),
         RegionDef("Persian Gulf",  lat_min=23,  lat_max=30,  lon_min=48,   lon_max=60,  baseline_demand=0.92),
         RegionDef("S China Sea",   lat_min=5,   lat_max=25,  lon_min=108,  lon_max=122, baseline_demand=0.90),

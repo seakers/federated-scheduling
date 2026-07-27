@@ -347,8 +347,8 @@ class Broker():
             success_probability_function = None,  # DEPRECATED: use acceptance + execution functions
             acceptance_probability_function = None,  # p_acc: prob constellation accepts booking
             execution_probability_function = None,   # p_exec: prob accepted booking executes successfully
-            epsilon: float = 1e-5,
-            pwl_tolerance: float = 1e-2,
+            epsilon: float = 1e-3,
+            pwl_tolerance: float = 1e-1,
             tax_rate: float = 0.0,  # Cost per scheduled obs as fraction of max quality. 0 = disabled.
             submission_cost_rate: float = 0.0,  # c_sub: unconditional per-booking submission overhead
             cancellation_cost_rate: float = 0.0,  # c_canc: conditional cancellation cost if accepted
@@ -393,7 +393,8 @@ class Broker():
                     solver_engine=solver_engine,
                     tax_rate=tax_rate,
                     submission_cost_rate=submission_cost_rate,
-                    execution_cost_rate=execution_cost_rate
+                    execution_cost_rate=execution_cost_rate,
+                    results_dir=results_path
                 )
             else:
                 # Use existing deterministic ILP scheduler
@@ -467,102 +468,72 @@ class Broker():
         for dispatchable_task in dispatchable_task_ids:
             # If we rescheduled in the meanwhile, don't keep dispatching stale stuff.
             # The test below will fail when _someone else_ called schedule_workflow elsewhere
-            # The end result is that only the last agent to call schedule_workflow gets to dispatch 
+            # The end result is that only the last agent to call schedule_workflow gets to dispatch
             if self._workflow_schedule_epoch != local_workflow_schedule_epoch_when_dispatching_started:
                 break
-            
+
             print(f" [{self.name}]  Attempting to dispatch task {dispatchable_task} ")
 
             request = dispatchable_task.observation_request
-            _best_satellite = dispatchable_task.observation_opportunity_satellite
-            _best_constellation = self._known_satellites_by_constellation[_best_satellite]
             follow_up_action_failure = dispatchable_task.follow_up_action_failure
             follow_up_action_success = dispatchable_task.follow_up_action_success
-            _best_pass = dispatchable_task.observation_opportunity_pass
 
-            # Let's talk about constraints. The scheduler just checks that constraints are in place before something is scheduled.
-            # For data constraints, it's start-after-end.
-            # For bool constraints, it's _also_ start-after-end. 
-            # Now that we handle rescheduling, we need to distinguish these two.
-            # - For data constraint, keep things as is AND update child data from the parent, either when the parent is done or at scheduling time.
-            # - For bool constraints, explicitly keep track of whether the task had a positive outcome, and only schedule if that is the case.
-            # - For bool constraints, if a task dependency is violated, just don't even try to schedule it. Distinguish "we don't know" and "we know and it's false".
+            # Use all redundant passes from the planner if available; fall back to
+            # the single primary pass for backward-compatibility with deterministic
+            # requests that never populate pending_dispatch_passes.
+            _passes_to_dispatch = getattr(dispatchable_task, 'pending_dispatch_passes', None)
+            if not _passes_to_dispatch:
+                _passes_to_dispatch = [
+                    (dispatchable_task.observation_opportunity_satellite,
+                     dispatchable_task.observation_opportunity_pass)
+                ]
 
-            # Set up callbacks so that, when a request comes in, it status is updated.
-            # If a request is unscheduled:
-            # - Update the requests table so we won't reuse the same requests (same as above)
-            # - Set the request to not dispatched in the graph
-            # - Call the scheduler again, which will come up with a new schedule, hopefully
-            # If a request is scheduled:
-            # - Update the requests table
-            # - Update the workflow graph reflecting that the request is dispatched. This won't touch it again in scheduling
-            # If a request is done:
-            # - Update the requests table
-            # - Update the workflow graph reflecting that the request is done. This won't touch it again in scheduling
-            # - Update the parameters for the children that depend on that request's data product!
+            n_passes = len(_passes_to_dispatch)
+            if n_passes > 1:
+                print(f" [{self.name}]  Dispatching {n_passes} redundant pass(es) for {request.name}")
 
-            def callback_request_scheduled(assigned_pass, _request=request, __best_pass=_best_pass, __best_constellation=_best_constellation, __best_satellite=_best_satellite, _dispatchable_task=dispatchable_task):
-                print(" [{}] confirmed scheduling of request {} from pass {}, constellation {}".format(self.name, _request, __best_pass, __best_constellation.name))
-                self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'assigned_pass'] = assigned_pass
-                self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = ObservationStatus.SCHEDULED
-                self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'constellation'] = __best_constellation
-                self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'satellite'] = __best_satellite
-                _dispatchable_task.scheduled = True
-                _dispatchable_task.dispatched = True
-                # print(self._workflow_graph.nodes[_dispatchable_task_id])
-                return
-            
-            def callback_request_unscheduled(reason, _request=request, __best_pass=_best_pass, __best_constellation=_best_constellation, _dispatchable_task=dispatchable_task):
-                print(" [{}] received UNscheduling of request {}, pass {}, from {}".format(self.name, request, __best_pass, __best_constellation.name))
-                self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'assigned_pass'] = None
-                self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = reason
-                self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'constellation'] = None
-                self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'satellite'] = None
-                _dispatchable_task.scheduled = False
-                _dispatchable_task.dispatched = False
-                follow_up_action_failure(reason)
-                # Recurse with ALL parameters to preserve stochastic settings
-                self._reschedule_depth += 1
-                self.schedule_workflow(
-                    current_time=self.world.time,
-                    use_ilp=use_ilp,
-                    plot_schedule=plot_schedule,
-                    plot_axes=plot_axes,
-                    plot_night_in_schedule=plot_night_in_schedule,
-                    plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
-                    max_solver_time_s=max_solver_time_s,
-                    receding_horizon_duration=receding_horizon_duration,
-                    save_schedule_plot=save_schedule_plot,
-                    solver_engine=solver_engine,
-                    use_stochastic=use_stochastic,
-                    stochastic_formulation=stochastic_formulation,
-                    success_probability_function=success_probability_function,
-                    acceptance_probability_function=acceptance_probability_function,
-                    execution_probability_function=execution_probability_function,
-                    epsilon=epsilon,
-                    pwl_tolerance=pwl_tolerance,
-                    tax_rate=tax_rate,
-                    submission_cost_rate=submission_cost_rate,
-                    cancellation_cost_rate=cancellation_cost_rate,
-                    results_path=results_path
-                )
-                self._reschedule_depth -= 1
+            # --- Phase 1: build all callbacks and register all rows in _requests
+            # so that every pass is SUBMITTED before any constellation callback
+            # can fire.  This ensures the still-in-flight guard in
+            # callback_request_unscheduled / callback_request_timed_out sees the
+            # full set even if a constellation rejects a pass synchronously.
+            _pass_callbacks = []  # list of (pass_satellite, pass_obj, pass_constellation, cb_sched, cb_unsched, cb_ready, cb_timeout)
 
-                return
-            
-            def callback_request_timed_out(_request=request, __best_pass=_best_pass, __best_constellation=_best_constellation, _dispatchable_task=dispatchable_task):
+            for _pass_satellite, _pass_obj in _passes_to_dispatch:
+                _pass_constellation = self._known_satellites_by_constellation[_pass_satellite]
 
-                requests_still_awaiting_data = self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass) & ((self._requests['status']==ObservationStatus.SUBMITTED) | (self._requests['status']==ObservationStatus.SCHEDULED)))]
-                if len(requests_still_awaiting_data):
-                    print(" [{}] timeout for request {}, pass {}, from {}".format(self.name, request, __best_pass, __best_constellation.name))
-                    requests_still_awaiting_data['assigned_pass'] = None
-                    requests_still_awaiting_data['status'] = ObservationStatus.TIMEOUT
-                    requests_still_awaiting_data['constellation'] = None
-                    requests_still_awaiting_data['satellite'] = None
+                def callback_request_scheduled(assigned_pass, _request=request, __best_pass=_pass_obj, __best_constellation=_pass_constellation, __best_satellite=_pass_satellite, _dispatchable_task=dispatchable_task):
+                    print(" [{}] confirmed scheduling of request {} from pass {}, constellation {}".format(self.name, _request, __best_pass, __best_constellation.name))
+                    self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'assigned_pass'] = assigned_pass
+                    self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = ObservationStatus.SCHEDULED
+                    self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'constellation'] = __best_constellation
+                    self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'satellite'] = __best_satellite
+                    _dispatchable_task.scheduled = True
+                    _dispatchable_task.dispatched = True
+                    return
+
+                def callback_request_unscheduled(reason, _request=request, __best_pass=_pass_obj, __best_constellation=_pass_constellation, _dispatchable_task=dispatchable_task):
+                    print(" [{}] received UNscheduling of request {}, pass {}, from {}".format(self.name, _request, __best_pass, __best_constellation.name))
+                    self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'assigned_pass'] = None
+                    self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = reason
+                    self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'constellation'] = None
+                    self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'satellite'] = None
+
+                    # If there are still other passes in flight for this same task (SUBMITTED
+                    # or SCHEDULED), do not reschedule yet — those are the backup passes and
+                    # one of them may still succeed.  Only declare failure and reschedule when
+                    # every outstanding attempt for this task has been rejected/timed-out.
+                    _still_in_flight = self._requests.loc[
+                        (self._requests['request'] == _request) &
+                        (self._requests['status'].isin([ObservationStatus.SUBMITTED, ObservationStatus.SCHEDULED]))
+                    ]
+                    if len(_still_in_flight) > 0:
+                        print(f" [{self.name}] {len(_still_in_flight)} backup pass(es) still in flight for {_request.name}, deferring reschedule.")
+                        return
+
                     _dispatchable_task.scheduled = False
                     _dispatchable_task.dispatched = False
-                    follow_up_action_failure(ObservationStatus.TIMEOUT)
-                    # Recurse with ALL parameters to preserve stochastic settings
+                    follow_up_action_failure(reason)
                     self._reschedule_depth += 1
                     self.schedule_workflow(
                         current_time=self.world.time,
@@ -588,131 +559,567 @@ class Broker():
                         results_path=results_path
                     )
                     self._reschedule_depth -= 1
+                    return
 
-                return
-            
-            def callback_request_ready(data_product,  _request=request, __best_pass=_best_pass, __best_constellation=_best_constellation, _dispatchable_task=dispatchable_task):
-                print(" [{}: ] data ready for request {}, pass {}, from {}".format(self.name, _request, __best_pass, __best_constellation.name))
-                self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = ObservationStatus.DATA_RECEIVED
+                def callback_request_timed_out(_request=request, __best_pass=_pass_obj, __best_constellation=_pass_constellation, _dispatchable_task=dispatchable_task):
+                    requests_still_awaiting_data = self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass) & ((self._requests['status']==ObservationStatus.SUBMITTED) | (self._requests['status']==ObservationStatus.SCHEDULED)))]
+                    if len(requests_still_awaiting_data):
+                        print(" [{}] timeout for request {}, pass {}, from {}".format(self.name, _request, __best_pass, __best_constellation.name))
+                        self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'assigned_pass'] = None
+                        self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = ObservationStatus.TIMEOUT
+                        self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'constellation'] = None
+                        self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'satellite'] = None
 
-                for _ix, __dp in self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'data_product'].items():
-                    self._requests.loc[_ix, 'data_product'] = data_product
-                follow_up_action_success(data_product)
+                        # Only declare failure and reschedule once all backup passes have
+                        # also timed out / been rejected — same logic as callback_request_unscheduled.
+                        _still_in_flight = self._requests.loc[
+                            (self._requests['request'] == _request) &
+                            (self._requests['status'].isin([ObservationStatus.SUBMITTED, ObservationStatus.SCHEDULED]))
+                        ]
+                        if len(_still_in_flight) > 0:
+                            print(f" [{self.name}] {len(_still_in_flight)} backup pass(es) still in flight for {_request.name} after timeout, deferring reschedule.")
+                            return
 
-                _dispatchable_task.scheduled = True
-                _dispatchable_task.dispatched = True
-                _dispatchable_task.completed = True
-                _dispatchable_task.data_product = data_product
-                
-                
-                # Update parameters. Phenomenon_processor is called on the observed events to write something to DataProducts
-                # We need to pack what we will need (e.g., the location of follow-ups) in there.
-                # We also need to compute successful_execution from the data_product
-                # Finally, we need to update children parameters based on the data product
-                # To that end, having a function that ingests the data product and produces an updated ObsRequest would be good
-                _dispatchable_task.successful_execution = _dispatchable_task.success_declarer(data_product)
-                
-                # print(f" [Broker] Updating task {dispatchable_task_id}: {self._workflow_graph.nodes[dispatchable_task_id]}")
+                        _dispatchable_task.scheduled = False
+                        _dispatchable_task.dispatched = False
+                        follow_up_action_failure(ObservationStatus.TIMEOUT)
+                        self._reschedule_depth += 1
+                        self.schedule_workflow(
+                            current_time=self.world.time,
+                            use_ilp=use_ilp,
+                            plot_schedule=plot_schedule,
+                            plot_axes=plot_axes,
+                            plot_night_in_schedule=plot_night_in_schedule,
+                            plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
+                            max_solver_time_s=max_solver_time_s,
+                            receding_horizon_duration=receding_horizon_duration,
+                            save_schedule_plot=save_schedule_plot,
+                            solver_engine=solver_engine,
+                            use_stochastic=use_stochastic,
+                            stochastic_formulation=stochastic_formulation,
+                            success_probability_function=success_probability_function,
+                            acceptance_probability_function=acceptance_probability_function,
+                            execution_probability_function=execution_probability_function,
+                            epsilon=epsilon,
+                            pwl_tolerance=pwl_tolerance,
+                            tax_rate=tax_rate,
+                            submission_cost_rate=submission_cost_rate,
+                            cancellation_cost_rate=cancellation_cost_rate,
+                            results_path=results_path
+                        )
+                        self._reschedule_depth -= 1
+                    return
 
-                try:
-                    for child_task_id in self._workflow_graph.successors(_dispatchable_task):
-                        # If the constraint type is GEOMETRY
-                        # Compute the new geometry for the child from the predecessor data_product
-                        # Update the successor's geometry in the graph
-                        outedges = self._workflow_graph.get_edge_data(_dispatchable_task, child_task_id)
-                        for constraint_key, constraint in outedges.items():
-                            if (constraint['constraint_class'] == ConstraintClass.GEOMETRY):
-                                child_task_id.observation_request = constraint['parameters']['geometry_generator'](child_task_id.observation_request, data_product)
-                except Exception as e:
-                    print(e)
-                    import pdb; pdb.set_trace()
+                def callback_request_ready(data_product, _request=request, __best_pass=_pass_obj, __best_constellation=_pass_constellation, _dispatchable_task=dispatchable_task):
+                    print(" [{}: ] data ready for request {}, pass {}, from {}".format(self.name, _request, __best_pass, __best_constellation.name))
+                    self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = ObservationStatus.DATA_RECEIVED
+                    for _ix, __dp in self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'data_product'].items():
+                        self._requests.loc[_ix, 'data_product'] = data_product
 
+                    # If another backup pass already completed this task, just record
+                    # the data received status — do not double-count or double-recurse.
+                    if _dispatchable_task.completed:
+                        print(f" [{self.name}] Task {_request.name} already completed by a prior pass, skipping follow-up for {__best_pass}.")
+                        return
 
-                # Recurse
-                self.schedule_workflow(
-                    current_time=self.world.time,
-                    use_ilp=use_ilp,
-                    plot_schedule=plot_schedule,
-                    plot_axes=plot_axes,
-                    plot_night_in_schedule=plot_night_in_schedule,
-                    plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
-                    max_solver_time_s=max_solver_time_s,
-                    receding_horizon_duration=receding_horizon_duration,
-                    save_schedule_plot=save_schedule_plot,
-                    solver_engine=solver_engine,
-                    use_stochastic=use_stochastic,
-                    stochastic_formulation=stochastic_formulation,
-                    success_probability_function=success_probability_function,
-                    acceptance_probability_function=acceptance_probability_function,
-                    execution_probability_function=execution_probability_function,
-                    epsilon=epsilon,
-                    pwl_tolerance=pwl_tolerance,
-                    tax_rate=tax_rate,
-                    submission_cost_rate=submission_cost_rate,
-                    cancellation_cost_rate=cancellation_cost_rate,
-                    results_path=results_path
+                    follow_up_action_success(data_product)
+
+                    _dispatchable_task.scheduled = True
+                    _dispatchable_task.dispatched = True
+                    _dispatchable_task.completed = True
+                    _dispatchable_task.data_product = data_product
+                    _dispatchable_task.successful_execution = _dispatchable_task.success_declarer(data_product)
+
+                    try:
+                        for child_task_id in self._workflow_graph.successors(_dispatchable_task):
+                            outedges = self._workflow_graph.get_edge_data(_dispatchable_task, child_task_id)
+                            for constraint_key, constraint in outedges.items():
+                                if (constraint['constraint_class'] == ConstraintClass.GEOMETRY):
+                                    child_task_id.observation_request = constraint['parameters']['geometry_generator'](child_task_id.observation_request, data_product)
+                    except Exception as e:
+                        print(e)
+                        import pdb; pdb.set_trace()
+
+                    self.schedule_workflow(
+                        current_time=self.world.time,
+                        use_ilp=use_ilp,
+                        plot_schedule=plot_schedule,
+                        plot_axes=plot_axes,
+                        plot_night_in_schedule=plot_night_in_schedule,
+                        plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
+                        max_solver_time_s=max_solver_time_s,
+                        receding_horizon_duration=receding_horizon_duration,
+                        save_schedule_plot=save_schedule_plot,
+                        solver_engine=solver_engine,
+                        use_stochastic=use_stochastic,
+                        stochastic_formulation=stochastic_formulation,
+                        success_probability_function=success_probability_function,
+                        acceptance_probability_function=acceptance_probability_function,
+                        execution_probability_function=execution_probability_function,
+                        epsilon=epsilon,
+                        pwl_tolerance=pwl_tolerance,
+                        tax_rate=tax_rate,
+                        submission_cost_rate=submission_cost_rate,
+                        cancellation_cost_rate=cancellation_cost_rate,
+                        results_path=results_path
                     )
-                return
+                    return
 
-            _constellation_request = ObservationRequest(
-                lon_deg=request.lon_deg,
-                lat_deg=request.lat_deg,
-                min_time=_best_pass.rise.time-dt.timedelta(minutes=1), # This is the magic, we constrain the request to the constellation AND TIME that we like.
-                max_time=_best_pass.fall.time+dt.timedelta(minutes=1),
-                alt_km=request.alt_km,
-                instrument=request.instrument,
-                request_name=request.name,
-                min_elevation_deg=request.min_elevation_deg
-            )
+                _pass_callbacks.append((_pass_satellite, _pass_obj, _pass_constellation,
+                                        callback_request_scheduled, callback_request_unscheduled,
+                                        callback_request_ready, callback_request_timed_out))
 
-            _request_dict = {
-                'request': request,
-                'requested_pass' : _best_pass,
-                'requested_constellation' : _best_constellation,
-                'requested_satellite' :_best_satellite,
-                'constellation': None,
-                'satellite': None,
-                'assigned_pass': None,
-                'assigned_downlink': None,
-                'status': ObservationStatus.SUBMITTED,
-                'data_product': None,
-                'scheduled_callback': callback_request_scheduled,
-                'unscheduled_callback': callback_request_unscheduled,
-                'ready_callback': callback_request_ready,
-            }
-            _pdrequest = pd.DataFrame([_request_dict])
-            self._requests = pd.concat([self._requests, _pdrequest], ignore_index=True)
+                _request_dict = {
+                    'request': request,
+                    'requested_pass': _pass_obj,
+                    'requested_constellation': _pass_constellation,
+                    'requested_satellite': _pass_satellite,
+                    'constellation': None,
+                    'satellite': None,
+                    'assigned_pass': None,
+                    'assigned_downlink': None,
+                    'status': ObservationStatus.SUBMITTED,
+                    'data_product': None,
+                    'scheduled_callback': callback_request_scheduled,
+                    'unscheduled_callback': callback_request_unscheduled,
+                    'ready_callback': callback_request_ready,
+                }
+                _pdrequest = pd.DataFrame([_request_dict])
+                self._requests = pd.concat([self._requests, _pdrequest], ignore_index=True)
 
-            self._satellite_busy_timelines[_best_satellite].add_impact(Impact(time=_best_pass.highest.time, type=ImpactType.ASSIGNMENT, value=True))
-            self._satellite_busy_timelines[_best_satellite].add_impact(Impact(time=_best_pass.highest.time+_best_pass.highest.duration, type=ImpactType.ASSIGNMENT, value=False))
-
-            # Submit the request to the relevant constellation
-            #  Mark the task as dispatched. This will prevent re-scheduling even if we do not get an ack right away
+            # Mark the task dispatched now that all rows are in the table, so
+            # the still-in-flight guards work even if a constellation callback
+            # fires synchronously during schedule_request below.
             dispatchable_task.scheduled = True
             dispatchable_task.dispatched = True
 
-            _best_constellation.schedule_request(
-                request=_constellation_request,
-                current_time=current_time,
-                callback_request_scheduled=callback_request_scheduled,
-                callback_request_unscheduled=callback_request_unscheduled,
-                callback_request_ready=callback_request_ready,
-                phenomenon_processor=dispatchable_task.phenomenon_processor,
-            )
+            # --- Phase 2: submit each pass to its constellation and register timeouts
+            for (_pass_satellite, _pass_obj, _pass_constellation,
+                 _cb_sched, _cb_unsched, _cb_ready, _cb_timeout) in _pass_callbacks:
 
-            # Note that, if the call above fails, we will immediately receive a reply, via the callback, that will trigger another reschedule - while we are still dispatching things here!
-            
-            # Set up a callback where, if the request is not acknowledged, we give it up as a bad job.
-            
-            timeout_time = _best_pass.fall.time + dt.timedelta(minutes=1)
-            if dispatchable_task.downlink_pass is not None:
-                timeout_time = dispatchable_task.downlink_pass.fall.time + dt.timedelta(minutes=1)
-            event_check_dispatch_timeout = Event(
-                time=timeout_time,
-                action_callable=callback_request_timed_out,
-                name=f"Check timeout {request.name}"
-            )
-            self.world.add_event(event_check_dispatch_timeout)
+                self._satellite_busy_timelines[_pass_satellite].add_impact(Impact(time=_pass_obj.highest.time, type=ImpactType.ASSIGNMENT, value=True))
+                self._satellite_busy_timelines[_pass_satellite].add_impact(Impact(time=_pass_obj.highest.time+_pass_obj.highest.duration, type=ImpactType.ASSIGNMENT, value=False))
+
+                _constellation_request = ObservationRequest(
+                    lon_deg=request.lon_deg,
+                    lat_deg=request.lat_deg,
+                    min_time=_pass_obj.rise.time-dt.timedelta(minutes=1),
+                    max_time=_pass_obj.fall.time+dt.timedelta(minutes=1),
+                    alt_km=request.alt_km,
+                    instrument=request.instrument,
+                    request_name=request.name,
+                    min_elevation_deg=request.min_elevation_deg
+                )
+
+                _pass_constellation.schedule_request(
+                    request=_constellation_request,
+                    current_time=current_time,
+                    callback_request_scheduled=_cb_sched,
+                    callback_request_unscheduled=_cb_unsched,
+                    callback_request_ready=_cb_ready,
+                    phenomenon_processor=dispatchable_task.phenomenon_processor,
+                )
+
+                timeout_time = _pass_obj.fall.time + dt.timedelta(minutes=1)
+                if dispatchable_task.downlink_pass is not None:
+                    timeout_time = dispatchable_task.downlink_pass.fall.time + dt.timedelta(minutes=1)
+                event_check_dispatch_timeout = Event(
+                    time=timeout_time,
+                    action_callable=_cb_timeout,
+                    name=f"Check timeout {request.name}"
+                )
+                self.world.add_event(event_check_dispatch_timeout)
+
+    def schedule_workflow_redundant(
+                self,
+                current_time: dt.datetime = None,
+                use_ilp: bool = True,
+                update_timelines: bool = True,
+                update_requests: bool = True,
+                plot_schedule: bool = False,
+                plot_axes: plt.axes = None,
+                plot_night_in_schedule: bool = False,
+                plot_location_for_night_in_schedule: Location = Location(0, 0, 0),
+                max_solver_time_s: float = 60.0,
+                receding_horizon_duration: dt.timedelta = dt.timedelta(hours=12),
+                save_schedule_plot: bool = False,
+                solver_engine: str = "GUROBI",
+                use_stochastic: bool = True,
+                stochastic_formulation: str = "log_linearized",
+                execution_cost_rate: float = 0.0,
+                success_probability_function = None,
+                acceptance_probability_function = None,
+                execution_probability_function = None,
+                epsilon: float = 1e-3,
+                pwl_tolerance: float = 1e-1,
+                tax_rate: float = 0.0,
+                submission_cost_rate: float = 0.0,
+                cancellation_cost_rate: float = 0.0,
+                max_reschedule_depth: int = 10,
+                results_path: str = ""
+        ):
+            """
+            Full redundant workflow scheduling and dispatching method for Broker.
+            Extracts all solved primary + backup passes from the stochastic MILP planner
+            and dispatches them directly to the constellation operator using target-specific requests.
+            """
+            if current_time is None:
+                current_time = self.world.time
+
+            # Prevent infinite rescheduling loops
+            if self._reschedule_depth >= max_reschedule_depth:
+                print(f" [{self.name}] WARNING: Maximum rescheduling depth ({max_reschedule_depth}) reached. Stopping recursive rescheduling.")
+                return
+
+            # Step 1: Update dynamic timelines and requests if applicable
+            if update_timelines and self.workflow.timeline_updater is not None:
+                self.workflow.timeline_updater(self.world.time, self.workflow.constrained_observation_requests, self.workflow.timelines)
+            if update_requests and self.workflow.request_updater is not None:
+                self.workflow.request_updater(self.world.time, self.workflow.constrained_observation_requests, self.workflow.timelines)
+
+            # Step 2: Solve optimization model (Stochastic MILP, Deterministic ILP, or Greedy)
+            if use_ilp:
+                if use_stochastic:
+                    from fame_workflow_stochastic import ilp_schedule_workflow_stochastic
+
+                    if success_probability_function is None:
+                        success_probability_function = lambda r, s, p: 1.0
+
+                    _ = ilp_schedule_workflow_stochastic(
+                        workflow_graph=self._workflow_graph,
+                        timeline_graph=self._timeline_graph,
+                        satellites=self._known_satellites,
+                        feasibility_screener=self._screen_pass_for_feasibility,
+                        current_time=current_time,
+                        verbose=3,
+                        max_solver_time_s=max_solver_time_s,
+                        receding_horizon_duration=receding_horizon_duration,
+                        stochastic_formulation=stochastic_formulation,
+                        success_probability_function=success_probability_function,
+                        acceptance_probability_function=acceptance_probability_function,
+                        execution_probability_function=execution_probability_function,
+                        epsilon=epsilon,
+                        pwl_tolerance=pwl_tolerance,
+                        solver_engine=solver_engine,
+                        tax_rate=tax_rate,
+                        submission_cost_rate=submission_cost_rate,
+                        execution_cost_rate=execution_cost_rate,
+                        results_dir=results_path
+                    )
+                else:
+                    _ = ilp_schedule_workflow(
+                        workflow_graph=self._workflow_graph,
+                        timeline_graph=self._timeline_graph,
+                        satellites=self._known_satellites,
+                        feasibility_screener=self._screen_pass_for_feasibility,
+                        current_time=current_time,
+                        verbose=3,
+                        max_solver_time_s=max_solver_time_s,
+                        receding_horizon_duration=receding_horizon_duration,
+                        solver_engine=solver_engine,
+                        tax_rate=tax_rate,
+                        submission_cost_rate=submission_cost_rate,
+                        execution_cost_rate=execution_cost_rate
+                    )
+            else:
+                _ = greedy_schedule_workflow(
+                    workflow_graph=self._workflow_graph,
+                    timeline_graph=self._timeline_graph,
+                    satellites=self._known_satellites,
+                    feasibility_screener=self._screen_pass_for_feasibility,
+                    current_time=current_time,
+                    verbose=1,
+                )
+
+            self._workflow_schedule_epoch += 1
+
+            # Step 3: Plot schedule if requested
+            if plot_schedule:
+                plot_workflow_schedule(
+                    workflow_graph=self._workflow_graph,
+                    timeline_graph=self._timeline_graph,
+                    axes=plot_axes,
+                    time=self.world.time,
+                    feasibility_screener=self._screen_pass_for_feasibility,
+                    plot_title=f"{self.name} at {self.world.time} (epoch {self._workflow_schedule_epoch})",
+                    show_night=plot_night_in_schedule,
+                    show_night_location=plot_location_for_night_in_schedule,
+                )
+                if save_schedule_plot:
+                    safe_time_str = str(self.world.time).replace(':', '-')
+                    figure_name = f"Schedule_{safe_time_str}_e{self._workflow_schedule_epoch:05d}_{self.name}.pdf"
+                    figure_path = os.path.join(results_path, figure_name) if results_path else figure_name
+                    if plot_axes is None:
+                        plt.savefig(figure_path, bbox_inches='tight')
+                    else:
+                        plot_axes[0].get_figure().savefig(figure_path, bbox_inches='tight')
+
+            # Step 4: Dispatch scheduled tasks
+            local_workflow_schedule_epoch_when_dispatching_started = self._workflow_schedule_epoch
+            dispatchable_task_ids = find_dispatchable_tasks(self._workflow_graph, self._timeline_graph, verbose=1)
+            print(f" [{self.name}] There are {len(dispatchable_task_ids)} dispatchable tasks")
+
+            for dispatchable_task in dispatchable_task_ids:
+                if self._workflow_schedule_epoch != local_workflow_schedule_epoch_when_dispatching_started:
+                    break
+
+                print(f" [{self.name}]  Attempting to dispatch task {dispatchable_task}")
+
+                request = dispatchable_task.observation_request
+                follow_up_action_failure = dispatchable_task.follow_up_action_failure
+                follow_up_action_success = dispatchable_task.follow_up_action_success
+
+                # --- EXTRACT SOLVED PASSES FROM STOCHASTIC PLANNER ---
+                _passes_to_dispatch = []
+                if hasattr(dispatchable_task, 'pending_dispatch_passes') and dispatchable_task.pending_dispatch_passes:
+                    _passes_to_dispatch = dispatchable_task.pending_dispatch_passes
+                elif hasattr(dispatchable_task, 'scheduled_bookings') and dispatchable_task.scheduled_bookings:
+                    _passes_to_dispatch = [(b['satellite'], b['pass']) for b in dispatchable_task.scheduled_bookings]
+                elif dispatchable_task.observation_opportunity_satellite is not None and dispatchable_task.observation_opportunity_pass is not None:
+                    _passes_to_dispatch = [
+                        (dispatchable_task.observation_opportunity_satellite,
+                        dispatchable_task.observation_opportunity_pass)
+                    ]
+
+                n_passes = len(_passes_to_dispatch)
+                if n_passes > 1:
+                    print(f" [{self.name}]  Dispatching {n_passes} redundant pass(es) for {request.name}")
+
+                # --- Phase 1: Build callbacks & register submitted rows ---
+                _pass_callbacks = []
+
+                for _pass_satellite, _pass_obj in _passes_to_dispatch:
+                    _pass_constellation = self._known_satellites_by_constellation[_pass_satellite]
+
+                    def callback_request_scheduled(assigned_pass, _request=request, __best_pass=_pass_obj, __best_constellation=_pass_constellation, __best_satellite=_pass_satellite, _dispatchable_task=dispatchable_task):
+                        print(f" [{self.name}] confirmed scheduling of request {_request} from pass {__best_pass}, constellation {__best_constellation.name}")
+                        self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'assigned_pass'] = assigned_pass
+                        self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'status'] = ObservationStatus.SCHEDULED
+                        self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'constellation'] = __best_constellation
+                        self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'satellite'] = __best_satellite
+                        _dispatchable_task.scheduled = True
+                        _dispatchable_task.dispatched = True
+                        return
+
+                    def callback_request_unscheduled(reason, _request=request, __best_pass=_pass_obj, __best_constellation=_pass_constellation, _dispatchable_task=dispatchable_task):
+                        print(f" [{self.name}] received UNscheduling of request {_request}, pass {__best_pass}, from {__best_constellation.name}")
+                        self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'assigned_pass'] = None
+                        self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'status'] = reason
+                        self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'constellation'] = None
+                        self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'satellite'] = None
+
+                        _still_in_flight = self._requests.loc[
+                            (self._requests['request'] == _request) &
+                            (self._requests['status'].isin([ObservationStatus.SUBMITTED, ObservationStatus.SCHEDULED]))
+                        ]
+                        if len(_still_in_flight) > 0:
+                            print(f" [{self.name}] {len(_still_in_flight)} backup pass(es) still in flight for {_request.name}, deferring reschedule.")
+                            return
+
+                        _dispatchable_task.scheduled = False
+                        _dispatchable_task.dispatched = False
+                        follow_up_action_failure(reason)
+                        self._reschedule_depth += 1
+                        self.schedule_workflow_redundant(
+                            current_time=self.world.time,
+                            use_ilp=use_ilp,
+                            plot_schedule=plot_schedule,
+                            plot_axes=plot_axes,
+                            plot_night_in_schedule=plot_night_in_schedule,
+                            plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
+                            max_solver_time_s=max_solver_time_s,
+                            receding_horizon_duration=receding_horizon_duration,
+                            save_schedule_plot=save_schedule_plot,
+                            solver_engine=solver_engine,
+                            use_stochastic=use_stochastic,
+                            stochastic_formulation=stochastic_formulation,
+                            success_probability_function=success_probability_function,
+                            acceptance_probability_function=acceptance_probability_function,
+                            execution_probability_function=execution_probability_function,
+                            epsilon=epsilon,
+                            pwl_tolerance=pwl_tolerance,
+                            tax_rate=tax_rate,
+                            submission_cost_rate=submission_cost_rate,
+                            cancellation_cost_rate=cancellation_cost_rate,
+                            results_path=results_path
+                        )
+                        self._reschedule_depth -= 1
+                        return
+
+                    def callback_request_timed_out(_request=request, __best_pass=_pass_obj, __best_constellation=_pass_constellation, _dispatchable_task=dispatchable_task):
+                        requests_still_awaiting_data = self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass) & ((self._requests['status'] == ObservationStatus.SUBMITTED) | (self._requests['status'] == ObservationStatus.SCHEDULED)))]
+                        if len(requests_still_awaiting_data):
+                            print(f" [{self.name}] timeout for request {_request}, pass {__best_pass}, from {__best_constellation.name}")
+                            self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'assigned_pass'] = None
+                            self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'status'] = ObservationStatus.TIMEOUT
+                            self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'constellation'] = None
+                            self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'satellite'] = None
+
+                            _still_in_flight = self._requests.loc[
+                                (self._requests['request'] == _request) &
+                                (self._requests['status'].isin([ObservationStatus.SUBMITTED, ObservationStatus.SCHEDULED]))
+                            ]
+                            if len(_still_in_flight) > 0:
+                                print(f" [{self.name}] {len(_still_in_flight)} backup pass(es) still in flight for {_request.name} after timeout, deferring reschedule.")
+                                return
+
+                            _dispatchable_task.scheduled = False
+                            _dispatchable_task.dispatched = False
+                            follow_up_action_failure(ObservationStatus.TIMEOUT)
+                            self._reschedule_depth += 1
+                            self.schedule_workflow_redundant(
+                                current_time=self.world.time,
+                                use_ilp=use_ilp,
+                                plot_schedule=plot_schedule,
+                                plot_axes=plot_axes,
+                                plot_night_in_schedule=plot_night_in_schedule,
+                                plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
+                                max_solver_time_s=max_solver_time_s,
+                                receding_horizon_duration=receding_horizon_duration,
+                                save_schedule_plot=save_schedule_plot,
+                                solver_engine=solver_engine,
+                                use_stochastic=use_stochastic,
+                                stochastic_formulation=stochastic_formulation,
+                                success_probability_function=success_probability_function,
+                                acceptance_probability_function=acceptance_probability_function,
+                                execution_probability_function=execution_probability_function,
+                                epsilon=epsilon,
+                                pwl_tolerance=pwl_tolerance,
+                                tax_rate=tax_rate,
+                                submission_cost_rate=submission_cost_rate,
+                                cancellation_cost_rate=cancellation_cost_rate,
+                                results_path=results_path
+                            )
+                            self._reschedule_depth -= 1
+                        return
+
+                    def callback_request_ready(data_product, _request=request, __best_pass=_pass_obj, __best_constellation=_pass_constellation, _dispatchable_task=dispatchable_task):
+                        print(f" [{self.name}: ] data ready for request {_request}, pass {__best_pass}, from {__best_constellation.name}")
+                        self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'status'] = ObservationStatus.DATA_RECEIVED
+                        for _ix, __dp in self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'data_product'].items():
+                            self._requests.loc[_ix, 'data_product'] = data_product
+
+                        if _dispatchable_task.completed:
+                            print(f" [{self.name}] Task {_request.name} already completed by a prior pass, skipping follow-up for {__best_pass}.")
+                            return
+
+                        follow_up_action_success(data_product)
+
+                        _dispatchable_task.scheduled = True
+                        _dispatchable_task.dispatched = True
+                        _dispatchable_task.completed = True
+                        _dispatchable_task.data_product = data_product
+                        _dispatchable_task.successful_execution = _dispatchable_task.success_declarer(data_product)
+
+                        try:
+                            for child_task_id in self._workflow_graph.successors(_dispatchable_task):
+                                outedges = self._workflow_graph.get_edge_data(_dispatchable_task, child_task_id)
+                                for constraint_key, constraint in outedges.items():
+                                    if (constraint['constraint_class'] == ConstraintClass.GEOMETRY):
+                                        child_task_id.observation_request = constraint['parameters']['geometry_generator'](child_task_id.observation_request, data_product)
+                        except Exception as e:
+                            print(e)
+                            import pdb; pdb.set_trace()
+
+                        self.schedule_workflow_redundant(
+                            current_time=self.world.time,
+                            use_ilp=use_ilp,
+                            plot_schedule=plot_schedule,
+                            plot_axes=plot_axes,
+                            plot_night_in_schedule=plot_night_in_schedule,
+                            plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
+                            max_solver_time_s=max_solver_time_s,
+                            receding_horizon_duration=receding_horizon_duration,
+                            save_schedule_plot=save_schedule_plot,
+                            solver_engine=solver_engine,
+                            use_stochastic=use_stochastic,
+                            stochastic_formulation=stochastic_formulation,
+                            success_probability_function=success_probability_function,
+                            acceptance_probability_function=acceptance_probability_function,
+                            execution_probability_function=execution_probability_function,
+                            epsilon=epsilon,
+                            pwl_tolerance=pwl_tolerance,
+                            tax_rate=tax_rate,
+                            submission_cost_rate=submission_cost_rate,
+                            cancellation_cost_rate=cancellation_cost_rate,
+                            results_path=results_path
+                        )
+                        return
+
+                    _pass_callbacks.append((_pass_satellite, _pass_obj, _pass_constellation,
+                                            callback_request_scheduled, callback_request_unscheduled,
+                                            callback_request_ready, callback_request_timed_out))
+
+                    _request_dict = {
+                        'request': request,
+                        'requested_pass': _pass_obj,
+                        'requested_constellation': _pass_constellation,
+                        'requested_satellite': _pass_satellite,
+                        'constellation': None,
+                        'satellite': None,
+                        'assigned_pass': None,
+                        'assigned_downlink': None,
+                        'status': ObservationStatus.SUBMITTED,
+                        'data_product': None,
+                        'scheduled_callback': callback_request_scheduled,
+                        'unscheduled_callback': callback_request_unscheduled,
+                        'ready_callback': callback_request_ready,
+                    }
+                    _pdrequest = pd.DataFrame([_request_dict])
+                    self._requests = pd.concat([self._requests, _pdrequest], ignore_index=True)
+
+                dispatchable_task.scheduled = True
+                dispatchable_task.dispatched = True
+
+                # --- Phase 2: Dispatch to constellation using schedule_request_redundant ---
+                for (_pass_satellite, _pass_obj, _pass_constellation,
+                    _cb_sched, _cb_unsched, _cb_ready, _cb_timeout) in _pass_callbacks:
+
+                    self._satellite_busy_timelines[_pass_satellite].add_impact(Impact(time=_pass_obj.highest.time, type=ImpactType.ASSIGNMENT, value=True))
+                    self._satellite_busy_timelines[_pass_satellite].add_impact(Impact(time=_pass_obj.highest.time + _pass_obj.highest.duration, type=ImpactType.ASSIGNMENT, value=False))
+
+                    _constellation_request = ObservationRequest(
+                        lon_deg=request.lon_deg,
+                        lat_deg=request.lat_deg,
+                        min_time=_pass_obj.rise.time - dt.timedelta(minutes=1),
+                        max_time=_pass_obj.fall.time + dt.timedelta(minutes=1),
+                        alt_km=request.alt_km,
+                        instrument=request.instrument,
+                        request_name=request.name,
+                        min_elevation_deg=request.min_elevation_deg
+                    )
+
+                    # Invoke target-specific schedule_request_redundant method on the constellation
+                    if hasattr(_pass_constellation, 'schedule_request_redundant'):
+                        _pass_constellation.schedule_request_redundant(
+                            request=_constellation_request,
+                            target_satellite=_pass_satellite,
+                            target_pass=_pass_obj,
+                            current_time=current_time,
+                            callback_request_scheduled=_cb_sched,
+                            callback_request_unscheduled=_cb_unsched,
+                            callback_request_ready=_cb_ready,
+                            phenomenon_processor=dispatchable_task.phenomenon_processor,
+                        )
+                    else:
+                        _pass_constellation.schedule_request(
+                            request=_constellation_request,
+                            current_time=current_time,
+                            callback_request_scheduled=_cb_sched,
+                            callback_request_unscheduled=_cb_unsched,
+                            callback_request_ready=_cb_ready,
+                            phenomenon_processor=dispatchable_task.phenomenon_processor,
+                        )
+
+                    timeout_time = _pass_obj.fall.time + dt.timedelta(minutes=1)
+                    if dispatchable_task.downlink_pass is not None:
+                        timeout_time = dispatchable_task.downlink_pass.fall.time + dt.timedelta(minutes=1)
+                    event_check_dispatch_timeout = Event(
+                        time=timeout_time,
+                        action_callable=_cb_timeout,
+                        name=f"Check timeout {request.name}"
+                    )
+                    self.world.add_event(event_check_dispatch_timeout)
 
 def request_statistics(requests_pd, display_unique_requests: bool=True):
     total_requests_no = len(requests_pd)

@@ -39,12 +39,16 @@ def ilp_schedule_workflow_stochastic(
         success_probability_function: Callable = lambda r, s, p: 1.0,  # DEPRECATED: use acceptance + execution functions
         acceptance_probability_function: Callable = None,  # p_acc: prob constellation accepts booking
         execution_probability_function: Callable = None,   # p_exec: prob accepted booking executes successfully
-        epsilon: float = 1e-5,
-        pwl_tolerance: float = 1e-2,
+        epsilon: float = 1e-3,
+        pwl_tolerance: float = 1e-1,  # SCIP path only; the Gurobi path now uses exact MINLP handling (FuncNonlinear=1)
+        mip_gap: float = 0.05,
+        default_max_instances: int = 3,  # Redundancy cap when a request has no max_num_instances attribute. >1 is REQUIRED for the stochastic planner to hedge.
         solver_engine: str = "GUROBI",
         tax_rate: float = 0.15,  # Cost per scheduled obs as fraction of max quality (dynamic, per-request). Set to 0 to disable.
         submission_cost_rate: float = 0.0,  # c_sub: unconditional per-booking submission overhead (as fraction of quality)
-        execution_cost_rate: float = 0.0  # c_canc: conditional cancellation cost if accepted (as fraction of quality)
+        execution_cost_rate: float = 0.0,  # c_canc: conditional cancellation cost if accepted (as fraction of quality)
+        results_dir: str = ""
+        
 ):
     """
     Stochastic MILP scheduler that accounts for observation success probabilities.
@@ -101,7 +105,8 @@ def ilp_schedule_workflow_stochastic(
             current_time, verbose, max_solver_time_s, receding_horizon_duration,
             stochastic_formulation, success_probability_function,
             acceptance_probability_function, execution_probability_function,
-            epsilon, pwl_tolerance, tax_rate, submission_cost_rate, execution_cost_rate
+            epsilon, pwl_tolerance, tax_rate, submission_cost_rate, execution_cost_rate,
+            mip_gap=mip_gap, default_max_instances=default_max_instances, results_dir=results_dir
         )
     elif solver_engine == "SCIP":
         return _solve_with_scip(
@@ -109,10 +114,31 @@ def ilp_schedule_workflow_stochastic(
             current_time, verbose, max_solver_time_s, receding_horizon_duration,
             stochastic_formulation, success_probability_function,
             acceptance_probability_function, execution_probability_function,
-            epsilon, pwl_tolerance, tax_rate, submission_cost_rate, execution_cost_rate
+            epsilon, pwl_tolerance, tax_rate, submission_cost_rate, execution_cost_rate,
+            default_max_instances=default_max_instances
         )
     else:
         raise ValueError(f"Unknown solver_engine: {solver_engine}. Use 'GUROBI' or 'SCIP'.")
+
+
+def _effective_max_instances(request, default_max_instances: int) -> int:
+    """Effective per-request instance cap for the STOCHASTIC planner.
+
+    ConstrainedObservationRequest defines max_num_instances with a CLASS
+    DEFAULT of 1, so the attribute always exists -- a None-fallback never
+    fires. Semantics here: default_max_instances acts as a FLOOR:
+        M = max(per_request_cap, default_max_instances)
+    Rationale: the stochastic objective correctly prices redundancy (costs,
+    diminishing first-success credit), so allowing extra instances is safe for
+    this planner and is its entire mechanism. To strictly respect per-request
+    caps (legacy behavior), call with default_max_instances=1.
+    NOTE: do NOT raise max_num_instances in the workflow definition itself --
+    the deterministic ILP counts full quality per booking and would exploit it.
+    """
+    per_request = getattr(request, 'max_num_instances', None)
+    if per_request is None:
+        return default_max_instances
+    return max(int(per_request), int(default_max_instances))
 
 
 def _solve_with_gurobi(
@@ -132,7 +158,10 @@ def _solve_with_gurobi(
         pwl_tolerance: float,
         tax_rate: float,
         submission_cost_rate: float,
-        execution_cost_rate: float
+        execution_cost_rate: float,
+        mip_gap: float,
+        default_max_instances: int,
+        results_dir: str
 ):
     """Solve stochastic scheduling problem using native Gurobi."""
     # Build Gurobi environment
@@ -157,14 +186,23 @@ def _solve_with_gurobi(
         model_name = f"FAME_Stochastic_{stochastic_formulation}"
         with gp.Model(model_name, env=env) as model:
 
-            # Set solver parameters
+            # === Solver parameters (single authoritative block) ===
+            # FuncNonlinear=1: exp()/log() general constraints are handled EXACTLY by
+            # Gurobi's global MINLP engine (outer approximation + spatial branching)
+            # instead of a static PWL translation. This is the fix for the large
+            # constraint-violation warnings: PWL error compounds around the DAG through
+            # the log->sum->exp round trip at every task boundary, so approximation
+            # tolerances that look small per-constraint blow up globally. Exactness
+            # here is required; speed is recovered via the real-space cuts added in
+            # _build_log_linearized_formulation.
             model.setParam('TimeLimit', max_solver_time_s)
-            model.setParam('MIPGap', 0.05)  # 5% optimality gap (relaxed for faster feasible solutions)
-            model.setParam('MIPFocus', 1)  # Focus on finding feasible solutions quickly
-            model.setParam('Heuristics', 0.2)  # Spend 20% of time on heuristics
-            model.setParam('Presolve', 2)  # Aggressive presolve
+            model.setParam('MIPGap', mip_gap)
+            model.setParam('FuncNonlinear', 1)
+            model.setParam('OutputFlag', 1)
+            if results_dir:
+                model.setParam('LogFile', os.path.join(results_dir, "gurobi_stochastic.log"))
 
-            # Enable non-convex solver if using quadratic formulation
+            # Enable bilinear solver if using the exact quadratic formulation
             if stochastic_formulation == "non_convex":
                 model.setParam('NonConvex', 2)
 
@@ -249,6 +287,10 @@ def _solve_with_gurobi(
                             p_acc = p_total  # Assume all uncertainty is in acceptance
                             p_exec = 1.0
 
+                        # NOTE: probabilities are used at full precision. Coefficient
+                        # rounding was considered and rejected: distinct objective
+                        # coefficients are normal and do not harm MILP structure.
+
                         solution_holder[constrained_request][satellite][satpass] = {
                             'x': x_var,
                             'quality': _quality,
@@ -283,7 +325,8 @@ def _solve_with_gurobi(
             # NOTE: Only add constraints for tasks that are actually in solution_holder
             # (tasks without passes are marked infeasible and excluded)
             _add_workflow_constraints(
-                model, workflow_graph, solution_holder, verbose
+                model, workflow_graph, solution_holder, verbose,
+                default_max_instances=default_max_instances
             )
 
             # Step 6: Solve
@@ -292,7 +335,39 @@ def _solve_with_gurobi(
             model.update()
 
             if verbose > 0:
-                print(f"[Stochastic Scheduler] Solving with {model.NumVars} variables, {model.NumConstrs} constraints")
+                n_bin  = sum(1 for v in model.getVars() if v.VType == GRB.BINARY)
+                n_int  = sum(1 for v in model.getVars() if v.VType == GRB.INTEGER)
+                n_cont = model.NumVars - n_bin - n_int
+                print(f"[Stochastic Scheduler] vars={model.NumVars} "
+                    f"(bin={n_bin}, int={n_int}, cont={n_cont}) "
+                    f"constrs={model.NumConstrs} genconstrs={model.NumGenConstrs} "
+                    f"(logs={sum(1 for gc in model.getGenConstrs() if gc.GenConstrType == GRB.GENCONSTR_LOG)})")
+
+            # Greedy MIP start: best-quality non-overlapping pass per request.
+            # Pure implementation lever -- gives Gurobi a strong incumbent at
+            # t=0 so the whole budget goes to closing the bound. Gurobi repairs
+            # or discards the start if constraints make it infeasible; no risk.
+            try:
+                _busy = {}
+                for _req in sorted(
+                        solution_holder.keys(),
+                        key=lambda r: -(max((solution_holder[r][s][p]['quality']
+                                             for s in solution_holder[r] for p in solution_holder[r][s]),
+                                            default=0.0))):
+                    _placed = False
+                    for _sat, _sp in task_to_passes.get(_req, []):
+                        _x = solution_holder[_req][_sat][_sp]['x']
+                        _s0 = _sp.highest.time
+                        _e0 = _sp.highest.time + _sp.highest.duration
+                        if (not _placed) and all(_e0 <= s or _s0 >= e for (s, e) in _busy.get(_sat, [])):
+                            _x.Start = 1.0
+                            _busy.setdefault(_sat, []).append((_s0, _e0))
+                            _placed = True
+                        else:
+                            _x.Start = 0.0
+            except Exception as _e:
+                if verbose > 0:
+                    print(f"[Stochastic Scheduler] MIP start skipped: {_e}")
 
             # Skip optimization if there are no variables (nothing to schedule)
             if model.NumVars == 0:
@@ -311,7 +386,8 @@ def _solve_with_gurobi(
                         print(f"[Stochastic Scheduler] (Reward - tax_rate={tax_rate}*max_quality_per_request*NumScheduled)")
 
                     _extract_solution(
-                        model, workflow_graph, solution_holder, verbose, timeline_graph
+                        model, workflow_graph, solution_holder, verbose, timeline_graph,
+                        task_to_passes=task_to_passes
                     )
 
                     # Store objective value on workflow graph for later analysis
@@ -321,10 +397,12 @@ def _solve_with_gurobi(
                     if model.SolCount > 0:  # At least one feasible solution found
                         if verbose > 0:
                             print(f"[Stochastic Scheduler] Time limit reached, but feasible solution found! Objective: {model.ObjVal:.2f}")
+                            print(f"[Stochastic Scheduler] Current MIP Gap: {model.MIPGap * 100:.2f}% (Best Bound: {model.ObjBound:.2f})")
                             print(f"[Stochastic Scheduler] (Not proven optimal, but using best solution found)")
 
                         _extract_solution(
-                            model, workflow_graph, solution_holder, verbose, timeline_graph
+                            model, workflow_graph, solution_holder, verbose, timeline_graph,
+                            task_to_passes=task_to_passes
                         )
 
                         workflow_graph.graph['objective_value'] = model.ObjVal
@@ -368,13 +446,17 @@ def _solve_with_scip(
         pwl_tolerance: float,
         tax_rate: float,
         submission_cost_rate: float,
-        execution_cost_rate: float
+        execution_cost_rate: float,
+        default_max_instances: int = 3
 ):
     """
     Solve stochastic scheduling problem using OR-Tools SCIP with manual PWL approximations.
 
     NOTE: Only log_linearized formulation is supported with SCIP.
     Non-convex formulation requires Gurobi's quadratic solver.
+    WARNING: this path still uses the static log floor and coarse manual PWL
+    approximations; prefer solver_engine="GUROBI" (exact via FuncNonlinear=1)
+    for any result that will be reported.
     """
     from ortools.linear_solver import pywraplp
 
@@ -388,15 +470,12 @@ def _solve_with_scip(
         print("[SCIP Stochastic] Building log-linearized formulation with manual PWL approximations...")
 
     # Create SCIP solver
-# Create SCIP solver
     solver = pywraplp.Solver.CreateSolver('SCIP')
     if not solver:
         raise ValueError("SCIP solver not available")
 
     solver.set_time_limit(int(max_solver_time_s * 1000))  # milliseconds
     
-    # Configure SCIP to find high-quality feasible solutions quickly
-    # Configure SCIP with valid key-value parameters
     # Configure SCIP with valid key-value parameters
     scip_params = (
         "limits/gap = 0.05\n"
@@ -492,6 +571,11 @@ def _solve_with_scip(
                     p_total = success_probability_function(constrained_request, satellite, satpass)
                     p_acc = p_total
                     p_exec = 1.0
+
+                # Round to 2 d.p. — see Gurobi path above for rationale.
+                p_acc   = round(p_acc,   2)
+                p_exec  = round(p_exec,  2)
+                p_total = round(p_acc * p_exec, 2)
 
                 solution_holder[constrained_request][satellite][satpass] = {
                     'x': x_var,
@@ -606,16 +690,21 @@ def _solve_with_scip(
             hint_values_map[f"w_abs_{req.observation_request.name}_k{k}"] = w_abs_val
             current_Y_track -= solution_holder[req][sat][satpass]['theta'] * w_abs_val
         hint_values_map[f"Y_{req.observation_request.name}_k{len(task_to_passes[req])}"] = current_Y_track
-# Step 4: Build log-linearized formulation with manual PWL
-        _build_scip_log_linearized_formulation(
-            solver, workflow_graph, solution_holder, task_to_passes,
-            epsilon, pwl_tolerance, tax_rate, submission_cost_rate, execution_cost_rate, verbose,
-            hint_values_map  # <-- Add this to pass the generated hints!
-        )
+
+    # Step 4: Build log-linearized formulation with manual PWL.
+    # NOTE: this call must run exactly ONCE, after the hint-propagation loop.
+    # It was previously indented inside the loop, rebuilding the entire
+    # formulation (duplicate variables/constraints) once per request.
+    _build_scip_log_linearized_formulation(
+        solver, workflow_graph, solution_holder, task_to_passes,
+        epsilon, pwl_tolerance, tax_rate, submission_cost_rate, execution_cost_rate, verbose,
+        hint_values_map
+    )
 
     # Step 5: Add constraints
     _add_scip_workflow_constraints(
-        solver, workflow_graph, solution_holder, task_to_passes, verbose
+        solver, workflow_graph, solution_holder, task_to_passes, verbose,
+        default_max_instances=default_max_instances
     )
 
     # Step 6: Solve
@@ -661,7 +750,8 @@ def _solve_with_scip(
                 print(f"[SCIP Stochastic] {status_str} solution found! Objective: {solver.Objective().Value():.2f}")
 
             _extract_scip_solution(
-                solver, workflow_graph, solution_holder, verbose, timeline_graph
+                solver, workflow_graph, solution_holder, verbose, timeline_graph,
+                task_to_passes=task_to_passes
             )
 
             workflow_graph.graph['objective_value'] = solver.Objective().Value()
@@ -919,7 +1009,8 @@ def _add_scip_workflow_constraints(
         workflow_graph: nx.MultiDiGraph,
         solution_holder: dict,
         task_to_passes: dict,
-        verbose: int
+        verbose: int,
+        default_max_instances: int = 3
 ):
     """Add workflow constraints using OR-Tools."""
     from fame_workflow import ConstraintClass, TemporalConstraintType
@@ -932,7 +1023,7 @@ def _add_scip_workflow_constraints(
             for sp in solution_holder[constrained_request][sat].keys()
         ]
         if x_vars:
-            max_instances = getattr(constrained_request, 'max_num_instances', 1)
+            max_instances = _effective_max_instances(constrained_request, default_max_instances)
             solver.Add(sum(x_vars) <= max_instances)
 
     # Mandatory tasks
@@ -1015,56 +1106,79 @@ def _extract_scip_solution(
         workflow_graph: nx.MultiDiGraph,
         solution_holder: dict,
         verbose: int,
-        timeline_graph: nx.MultiDiGraph = None
+        timeline_graph: nx.MultiDiGraph = None,
+        task_to_passes: dict = None
 ):
-    """Extract solution from OR-Tools solver."""
+    """Extract solution from OR-Tools solver (ALL selected passes per task,
+    mirroring the Gurobi extractor: primary booking in the legacy scalar
+    attributes, full redundant set in `scheduled_bookings`, timeline impacts
+    applied per selected pass)."""
     from fame_workflow import TaskTimelineImpact, TaskImpactTime, Impact
 
     for constrained_request in solution_holder.keys():
-        scheduled = False
+        if task_to_passes is not None and constrained_request in task_to_passes:
+            ordered_passes = task_to_passes[constrained_request]
+        else:
+            ordered_passes = [
+                (sat, sp)
+                for sat in solution_holder[constrained_request].keys()
+                for sp in solution_holder[constrained_request][sat].keys()
+            ]
+            ordered_passes.sort(
+                key=lambda t: solution_holder[constrained_request][t[0]][t[1]]['quality'],
+                reverse=True
+            )
 
-        for satellite in solution_holder[constrained_request].keys():
-            for satpass in solution_holder[constrained_request][satellite].keys():
-                x_var = solution_holder[constrained_request][satellite][satpass]['x']
+        selected = [
+            (satellite, satpass)
+            for (satellite, satpass) in ordered_passes
+            if solution_holder[constrained_request][satellite][satpass]['x'].solution_value() > 0.5
+        ]
 
-                if x_var.solution_value() > 0.5:
-                    constrained_request.scheduled = True
-                    constrained_request.observation_opportunity_satellite = satellite
-                    constrained_request.observation_opportunity_pass = satpass
-                    constrained_request.observation_opportunity = satpass.highest
-
-                    scheduled = True
-
-                    if verbose > 1:
-                        print(f"[SCIP Solution] Scheduled {constrained_request.observation_request.name} "
-                              f"on {satellite.name} at {satpass.highest.time}")
-
-                    # Apply timeline impacts
-                    if timeline_graph is not None and constrained_request in timeline_graph.nodes():
-                        for _timeline in timeline_graph.successors(constrained_request):
-                            tl_edges = timeline_graph.get_edge_data(constrained_request, _timeline)
-                            for impact_key, impact in tl_edges.items():
-                                if impact['edge_type'] == TaskTimelineImpact:
-                                    _time = satpass.highest.time
-                                    if impact['impact_time'] == TaskImpactTime.POST:
-                                        _time = satpass.highest.time + satpass.highest.duration
-                                    tl_impact = Impact(
-                                        time=_time,
-                                        type=impact['impact_type'],
-                                        value=impact['impact_value'] * x_var.solution_value(),
-                                        owner=constrained_request,
-                                    )
-                                    _timeline.add_impact(impact=tl_impact)
-
-                    break
-
-            if scheduled:
-                break
-
-        if not scheduled:
+        if not selected:
             constrained_request.scheduled = False
+            constrained_request.scheduled_bookings = []
             if verbose > 2:
                 print(f"[SCIP Solution] NOT scheduled: {constrained_request.observation_request.name}")
+            continue
+
+        constrained_request.scheduled = True
+        best_satellite, best_pass = selected[0]
+        constrained_request.observation_opportunity_satellite = best_satellite
+        constrained_request.observation_opportunity_pass = best_pass
+        constrained_request.observation_opportunity = best_pass.highest
+        constrained_request.scheduled_bookings = [
+            {
+                'satellite': satellite,
+                'pass': satpass,
+                'quality': solution_holder[constrained_request][satellite][satpass]['quality'],
+                'theta': solution_holder[constrained_request][satellite][satpass]['theta'],
+            }
+            for (satellite, satpass) in selected
+        ]
+
+        if verbose > 1:
+            for i, (satellite, satpass) in enumerate(selected):
+                role = "PRIMARY" if i == 0 else f"BACKUP-{i}"
+                print(f"[SCIP Solution] Scheduled {constrained_request.observation_request.name} "
+                      f"[{role}] on {satellite.name} at {satpass.highest.time}")
+
+        if timeline_graph is not None and constrained_request in timeline_graph.nodes():
+            for (satellite, satpass) in selected:
+                for _timeline in timeline_graph.successors(constrained_request):
+                    tl_edges = timeline_graph.get_edge_data(constrained_request, _timeline)
+                    for impact_key, impact in tl_edges.items():
+                        if impact['edge_type'] == TaskTimelineImpact:
+                            _time = satpass.highest.time
+                            if impact['impact_time'] == TaskImpactTime.POST:
+                                _time = satpass.highest.time + satpass.highest.duration
+                            tl_impact = Impact(
+                                time=_time,
+                                type=impact['impact_type'],
+                                value=impact['impact_value'],
+                                owner=constrained_request,
+                            )
+                            _timeline.add_impact(impact=tl_impact)
 
 
 def _cleanup_solver_objects(workflow_graph: nx.MultiDiGraph, timeline_graph: nx.MultiDiGraph):
@@ -1232,10 +1346,6 @@ def _build_non_convex_formulation(
     model.setObjective(gp.quicksum(objective_terms), GRB.MAXIMIZE)
 
 
-import gurobipy as gp
-from gurobipy import GRB
-import networkx as nx
-
 def _build_log_linearized_formulation(
         model: gp.Model,
         workflow_graph: nx.MultiDiGraph,
@@ -1246,150 +1356,435 @@ def _build_log_linearized_formulation(
         tax_rate: float,
         submission_cost_rate: float,
         cancellation_cost_rate: float,
-        verbose: int
+        verbose: int,
+        tighten_bounds: bool = True,
+        default_max_instances: int = 3,
+        reward_envelope_cuts: bool = True
 ):
     """
-    Build high-speed log-linearized formulation tracking vertical propagation 
-    via a unified O(Tasks) scaled timeline approach. Completely eliminates 
-    unscaled parallel tracks and pass-level general non-linear constraints.
+    Log-linearized stochastic formulation (paper Sections 5.2-5.6), built in a
+    single topological sweep over the DAG.
+
+    Key properties (each fixing a previously observed failure mode):
+
+    1. PROPORTIONAL log-protection floor:
+           A_prot = A_e2e * (1 - eps) + eps * A_parents
+       (instead of the static "+ eps"). Consequence: A_prot <= A_parents holds
+       structurally, so ln_S = ln(A_prot) - ln(A_parents) <= 0 is ALWAYS
+       satisfiable and ln_S >= ln(eps) exactly. The static floor could force
+       ln_S > 0 for deep tasks with weak ancestors, which collided with the
+       ln_S <= 0 bound and created massive infeasibility pressure / branching
+       churn ("adaptive floor trap"). The proportional floor removes the trap
+       at its root.
+
+    2. DEPTH-AWARE log-variable bounds. Because ln_S in [ln(eps), 0] exactly
+       (see 1), the valid bounds are:
+           ln_A_parents >= n_anc * ln(eps)
+           ln_A         >= (n_anc + 1) * ln(eps)
+       A static bound of -12 silently acted as a hidden constraint forcing
+       ancestral chains to stay healthy (second door into the floor trap).
+       Bounds are capped at LN_FLOOR for numerical sanity; the cap only binds
+       for chains of many near-dead ancestors, which are objective-irrelevant.
+
+    3. SINGLE-PARENT SHORTCUT: for a node r whose unique in-model ancestors
+       equal {q} + ancestors(q) for a single direct parent q (chain structure),
+       the entry boundary is set linearly:
+           ln_A_parents[r] == ln_A[q],   A_parents[r] == A_prot[q]
+       This is exact (Sum of ancestor ln_S telescopes to ln_A[q]) and removes
+       one exp() general constraint per chain node -- the dominant source of
+       MINLP work in chain-heavy workflows.
+
+    4. REAL-SPACE VALID CUTS: A_parents[r] <= A_prot[a] for every in-model
+       ancestor a (event inclusion: r's ancestral-success event is a subset of
+       a's protected end-to-end event). These bound the exp() relaxation in
+       probability space directly, bypassing the log machinery exactly where
+       its relaxation is loosest, recovering speed after switching to exact
+       nonlinear handling (FuncNonlinear=1).
+
+    5. DATA-DRIVEN BOUND PROPAGATION (dual-bound tightening). The incumbent
+       is typically found quickly; what is expensive is proving optimality,
+       because the LP/OA relaxation of the exp()/log() equalities is one-sided
+       (the relaxed A_parents can float up to the chord of exp between its
+       variable bounds) and that overestimation COMPOUNDS multiplicatively
+       down the DAG, inflating the root dual bound. We therefore precompute,
+       in one topological pass over constants, the best-case protected
+       probabilities with ALL passes scheduled:
+           lmax(r)      = 1 - prod_k (1 - p_{r,k})              (union of all passes)
+           S_ub(r)      = lmax(r)*(1-eps) + eps
+           A_par_ub(r)  = prod_{a in anc(r)} S_ub(a)
+           e2e_ub(r)    = A_par_ub(r) * lmax(r)
+           A_prot_ub(r) = A_par_ub(r) * S_ub(r)
+       and install them as VARIABLE BOUNDS (plus matching log-space bounds).
+       Scheduling more passes only increases success probabilities, so these
+       are valid regardless of conflicts/max-instances; they cut the chord gap
+       of every exp/log relaxation at the root, before any branching.
+
+    6. UNION-BOUND CUTS: e2e[r] <= A_par_ub(r) * sum_k p_k x_k, valid since
+       1 - prod(1 - p x) <= sum p x. Ties the reward a task can claim in the
+       relaxation to the probability mass actually scheduled, so fractional
+       solutions cannot harvest reward without paying for bookings.
+
+    7. BINARY BRANCH PRIORITY: x variables get BranchPriority 10 so Gurobi
+       branches the schedule decisions before spatially branching the
+       continuous exp/log operands -- once x is integral the McCormick track
+       is exact and interval tightening closes the rest fast.
+
+    NOTE: pwl_tolerance is unused here (kept for API compatibility); the
+    Gurobi path relies on FuncNonlinear=1 for exact exp/log handling.
     """
-    # Initialize workspace trackers
+    import math
+
     scaled_remaining_risk = {}
     effective_pass_realization = {}
-    
     ancestor_success_prob = {}
     end_to_end_success = {}
-    
+    A_prot_vars = {}
     ln_A_vars = {}
     ln_A_parents_vars = {}
     ln_S_vars = {}
 
-    # Apply global high-performance piecewise linear (PWL) configuration parameters
-    model.setParam('FuncPieces', -1)
-    model.setParam('FuncPieceError', pwl_tolerance)
+    ln_eps = math.log(epsilon)
+    LN_FLOOR = -1000.0  # absolute cap on log-space lower bounds (exp(-50) ~ 2e-22)
+
+    # Topological order restricted to tasks actually in the model; guarantees
+    # every ancestor's variables exist before its descendants reference them.
+    topo = [r for r in nx.topological_sort(workflow_graph) if r in solution_holder]
+
+    # Unique-ancestor closure sets (transitive closure trick: summing local
+    # ln_S over the UNIQUE ancestor set gives the exact joint ancestral
+    # probability under independence on general DAGs -- shared ancestors of
+    # diamond patterns are counted exactly once).
+    anc_sets = {
+        r: frozenset(a for a in nx.ancestors(workflow_graph, r) if a in solution_holder)
+        for r in topo
+    }
+
+    # --- Constant bound propagation, CARDINALITY-AWARE -------------------------
+    # The instances cap (max_num_instances) is a hard constraint, so no integer
+    # solution can ever schedule more than M_r passes. All best-case constants
+    # are therefore computed over the TOP-M_r probabilities only:
+    #     lmax_M(r) = 1 - prod_{k in top-M_r}(1 - p_k)
+    # Computing them over ALL passes (previous version) degenerates to ~1.0 as
+    # soon as a request has many candidate passes, making every bound trivial.
+    lmax_ub, S_ub, A_par_ub, e2e_ub, A_prot_ub, M_of = {}, {}, {}, {}, {}, {}
+    for r in topo:
+        M = _effective_max_instances(r, default_max_instances)
+        M_of[r] = max(0, min(M, len(task_to_passes[r])))
+        thetas = sorted(
+            (solution_holder[r][sat][sp]['theta'] for (sat, sp) in task_to_passes[r]),
+            reverse=True)[:M_of[r]]
+        lmax = 1.0 - math.prod(1.0 - t for t in thetas) if thetas else 0.0
+        lmax_ub[r] = min(1.0, lmax)
+        S_ub[r] = lmax_ub[r] * (1.0 - epsilon) + epsilon
+        A_par_ub[r] = math.prod(S_ub[a] for a in anc_sets[r]) if anc_sets[r] else 1.0
+        e2e_ub[r] = A_par_ub[r] * lmax_ub[r]
+        A_prot_ub[r] = A_par_ub[r] * S_ub[r]  # == e2e_ub*(1-eps) + eps*A_par_ub
+    if not tighten_bounds:
+        for r in topo:
+            A_par_ub[r], e2e_ub[r], A_prot_ub[r], S_ub[r] = 1.0, 1.0, 1.0, 1.0
+            lmax_ub[r] = 1.0
+
+    # --- Node classification + nonlinearity pruning ----------------------------
+    # Classify every node once: ROOT (no in-model ancestors), CHAIN (single
+    # in-model parent whose closure telescopes), MERGE (general log-space join,
+    # needs an exp() constraint). Then compute which tasks actually need their
+    # log() constraint: ln_S(r) is consumed ONLY inside merge-node joins, so
+    # log machinery is required exactly on the union of merge-node ancestor
+    # closures. Everything else propagates through the purely LINEAR real-space
+    # identities (A_parents[child] == A_prot[parent]). Consequence: a window
+    # with no live merge nodes builds a PURE MILP -- zero nonlinear constraints.
+    node_kind = {}
+    for r in topo:
+        dps = [p for p in workflow_graph.predecessors(r) if p in solution_holder]
+        if not anc_sets[r]:
+            node_kind[r] = 'root'
+        elif len(dps) == 1 and anc_sets[r] == anc_sets[dps[0]] | {dps[0]}:
+            node_kind[r] = 'chain'
+        else:
+            node_kind[r] = 'merge'
+    merge_nodes = [r for r in topo if node_kind[r] == 'merge']
+    need_lnS = set()
+    for m in merge_nodes:
+        need_lnS |= anc_sets[m]
+    if verbose > 0:
+        import collections
+        M_hist = dict(collections.Counter(M_of[r] for r in topo))
+        lmaxs = [lmax_ub[r] for r in topo if task_to_passes[r]]
+        print(f"[Log-Linearized] {len(merge_nodes)} merge nodes; log constraints "
+              f"pruned to {len(need_lnS)} of {len(topo)} tasks "
+              f"({'PURE MILP' if not merge_nodes else 'MINLP on merge closures only'}).")
+        if lmaxs:
+            print(f"[Log-Linearized] ENGAGEMENT CHECK -- instance caps M (histogram): {M_hist}; "
+                  f"lmax_M: min={min(lmaxs):.3f} mean={sum(lmaxs)/len(lmaxs):.3f} max={max(lmaxs):.3f}; "
+                  f"tighten_bounds={tighten_bounds}. "
+                  f"(If M is mostly 1, hedging is OFF; if lmax_M ~1.0, drain cuts are weak.)")
+        else:
+            print(f"[Log-Linearized] ENGAGEMENT CHECK -- no task in this window has any "
+                  f"feasible pass (M histogram: {M_hist}); nothing to schedule or hedge.")
 
     if verbose > 0:
-        print(f"[Log-Linearized] Compiling streamlined single-horizon matrix for {len(solution_holder)} tasks.")
+        n_chain = sum(
+            1 for r in topo
+            if len([p for p in workflow_graph.predecessors(r) if p in solution_holder]) == 1
+        )
+        print(f"[Log-Linearized] Building exact formulation for {len(topo)} tasks "
+              f"({n_chain} single-parent candidates for the linear shortcut).")
 
-    # === STEP 1: INITIALIZE TASK-LEVEL CONTINUOUS LOG CHANNELS ===
-    for constrained_request in solution_holder.keys():
+    for constrained_request in topo:
         req_name = getattr(getattr(constrained_request, 'observation_request', constrained_request), 'name', str(id(constrained_request)))
-        
-        # Core vertical real-space probabilities
-        ancestor_success_prob[constrained_request] = model.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS, name=f"A_parents_{req_name}")
-        end_to_end_success[constrained_request] = model.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS, name=f"A_node_{req_name}")
-        
-        # Mapped log metrics bound tightly to active operational windows
-        ln_A_vars[constrained_request] = model.addVar(lb=-30.0, ub=0.0, vtype=GRB.CONTINUOUS, name=f"ln_A_{req_name}")
-        ln_A_parents_vars[constrained_request] = model.addVar(lb=-30.0, ub=0.0, vtype=GRB.CONTINUOUS, name=f"ln_A_parents_{req_name}")
-        ln_S_vars[constrained_request] = model.addVar(lb=-30.0, ub=0.0, vtype=GRB.CONTINUOUS, name=f"ln_S_{req_name}")
+        n_anc = len(anc_sets[constrained_request])
 
-    # === STEP 2: TRANSITIVE LINEAGE INTEGRATION (DAG WIDE CLOSURE SETS) ===
-    for constrained_request in solution_holder.keys():
-        req_name = getattr(getattr(constrained_request, 'observation_request', constrained_request), 'name', str(id(constrained_request)))
-        
-        # Extract unique ancestral dependencies to prevent the Reconvergence Trap
-        unique_ancestors = [anc for anc in nx.ancestors(workflow_graph, constrained_request) if anc in solution_holder]
-        
-        if not unique_ancestors:
-            # Root Node Initialization Boundary
-            model.addConstr(ln_A_parents_vars[constrained_request] == 0.0)
-            model.addConstr(ancestor_success_prob[constrained_request] == 1.0)
+        # --- Depth-aware bounds -------------------------------------------------
+        lb_ln_parents = max(n_anc * ln_eps, LN_FLOOR) if n_anc > 0 else 0.0
+        lb_ln_A = max((n_anc + 1) * ln_eps, LN_FLOOR)
+
+        r_ub = constrained_request
+        kind = node_kind[constrained_request]
+        needs_log = constrained_request in need_lnS
+        ancestor_success_prob[constrained_request] = model.addVar(
+            lb=math.exp(lb_ln_parents) if n_anc > 0 else 1.0, ub=A_par_ub[r_ub],
+            vtype=GRB.CONTINUOUS, name=f"A_parents_{req_name}")
+        end_to_end_success[constrained_request] = model.addVar(
+            lb=0.0, ub=e2e_ub[r_ub], vtype=GRB.CONTINUOUS, name=f"A_node_{req_name}")
+        if needs_log:
+            ln_A_vars[constrained_request] = model.addVar(
+                lb=lb_ln_A, ub=math.log(A_prot_ub[r_ub]) if A_prot_ub[r_ub] < 1.0 else 0.0,
+                vtype=GRB.CONTINUOUS, name=f"ln_A_{req_name}")
+            # Exact range under the proportional floor: ln_S in [ln(eps), ln(S_ub)].
+            ln_S_vars[constrained_request] = model.addVar(
+                lb=ln_eps, ub=math.log(S_ub[r_ub]) if S_ub[r_ub] < 1.0 else 0.0,
+                vtype=GRB.CONTINUOUS, name=f"ln_S_{req_name}")
+        if needs_log or kind == 'merge':
+            ln_A_parents_vars[constrained_request] = model.addVar(
+                lb=lb_ln_parents, ub=math.log(A_par_ub[r_ub]) if A_par_ub[r_ub] < 1.0 else 0.0,
+                vtype=GRB.CONTINUOUS, name=f"ln_A_parents_{req_name}")
+
+        # --- Vertical entry boundary (paper Sec 5.3) ---------------------------
+        direct_parents = [p for p in workflow_graph.predecessors(constrained_request)
+                          if p in solution_holder]
+
+        if kind == 'root':
+            model.addConstr(ancestor_success_prob[constrained_request] == 1.0,
+                            name=f"root_Ap_{req_name}")
+            if needs_log or kind == 'merge':
+                model.addConstr(ln_A_parents_vars[constrained_request] == 0.0,
+                                name=f"root_lnAp_{req_name}")
+        elif kind == 'chain':
+            # Single-parent shortcut: entry boundary is linear in parent's vars.
+            q = direct_parents[0]
+            model.addConstr(ancestor_success_prob[constrained_request] == A_prot_vars[q],
+                            name=f"chain_Ap_{req_name}")
+            if needs_log:
+                # parent q is in anc(merge) whenever r is, so ln_A_vars[q] exists
+                model.addConstr(ln_A_parents_vars[constrained_request] == ln_A_vars[q],
+                                name=f"chain_lnAp_{req_name}")
         else:
-            # Multi-Parent AND Junction Convergence Map
-            model.addConstr(ln_A_parents_vars[constrained_request] == gp.quicksum(ln_S_vars[anc] for anc in unique_ancestors))
-            model.addGenConstrExp(ln_A_parents_vars[constrained_request], ancestor_success_prob[constrained_request])
+            # General merge node: exact log-space join over the unique closure set.
+            model.addConstr(
+                ln_A_parents_vars[constrained_request]
+                == gp.quicksum(ln_S_vars[anc] for anc in anc_sets[constrained_request]),
+                name=f"join_lnAp_{req_name}")
+            model.addGenConstrExp(ln_A_parents_vars[constrained_request],
+                                  ancestor_success_prob[constrained_request],
+                                  name=f"exp_Ap_{req_name}")
+            # Real-space valid cuts tightening the exp() relaxation:
+            # A_parents[r] <= A_prot[a] for every in-model ancestor a.
+            for anc in anc_sets[constrained_request]:
+                model.addConstr(
+                    ancestor_success_prob[constrained_request] <= A_prot_vars[anc],
+                    name=f"cut_Ap_le_Aprot_{req_name}_{getattr(getattr(anc, 'observation_request', anc), 'name', id(anc))}")
 
-    # === STEP 3: SINGLE SCALED HORIZONTAL TIMELINE GENERATION ===
-    for constrained_request in solution_holder.keys():
-        req_name = getattr(getattr(constrained_request, 'observation_request', constrained_request), 'name', str(id(constrained_request)))
+        # --- Horizontal scaled timeline (paper Sec 5.2) ------------------------
         passes = task_to_passes[constrained_request]
         K_r = len(passes)
 
-        # Allocate variables tracking ancestral risk decay across the timeline indices
         for k in range(K_r + 1):
             scaled_remaining_risk[(constrained_request, k)] = model.addVar(
-                lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS, name=f"Y_{req_name}_k{k}"
-            )
+                lb=0.0, ub=A_par_ub[constrained_request], vtype=GRB.CONTINUOUS,
+                name=f"Y_{req_name}_k{k}")
 
-        # INJECTION IDENTITY: Direct vertical coupling onto baseline entry index
-        model.addConstr(scaled_remaining_risk[(constrained_request, 0)] == ancestor_success_prob[constrained_request])
+        # Injection identity: timeline starts at the parents' joint success.
+        model.addConstr(
+            scaled_remaining_risk[(constrained_request, 0)] == ancestor_success_prob[constrained_request],
+            name=f"inject_{req_name}")
 
-        # Recurrence step calculations
         for k, (satellite, satpass) in enumerate(passes):
             x_var = solution_holder[constrained_request][satellite][satpass]['x']
             theta_k = solution_holder[constrained_request][satellite][satpass]['theta']
             Y_current = scaled_remaining_risk[(constrained_request, k)]
 
-            # Instantiate absolute realization variable
-            w_abs = model.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS, name=f"w_abs_{req_name}_k{k}")
+            w_abs = model.addVar(lb=0.0, ub=A_par_ub[constrained_request],
+                                 vtype=GRB.CONTINUOUS, name=f"w_abs_{req_name}_k{k}")
             effective_pass_realization[(constrained_request, satellite, satpass)] = w_abs
+            x_var.BranchPriority = 10  # branch schedule decisions before spatial branching
 
-            # Exact McCormick Polytope bindings linking binary switch x with scaled risk Y
-            model.addConstr(w_abs <= x_var)
-            model.addConstr(w_abs <= Y_current)
-            model.addConstr(w_abs >= Y_current - (1.0 - x_var))
-            model.addConstr(w_abs >= 0.0)
+            # Exact McCormick linearization of the binary-continuous product.
+            model.addConstr(w_abs <= x_var, name=f"mc1_{req_name}_k{k}")
+            model.addConstr(w_abs <= Y_current, name=f"mc2_{req_name}_k{k}")
+            model.addConstr(w_abs >= Y_current - (1.0 - x_var), name=f"mc3_{req_name}_k{k}")
 
-            # Linear progress updates down the timeline
-            model.addConstr(scaled_remaining_risk[(constrained_request, k + 1)] == Y_current - theta_k * w_abs)
+            model.addConstr(
+                scaled_remaining_risk[(constrained_request, k + 1)] == Y_current - theta_k * w_abs,
+                name=f"rec_{req_name}_k{k}")
 
-        # Connect end-of-horizon values to final node fulfillment variables
-        model.addConstr(end_to_end_success[constrained_request] == ancestor_success_prob[constrained_request] - scaled_remaining_risk[(constrained_request, K_r)])
+        # End-of-horizon fulfillment (paper Eq. 29).
+        model.addConstr(
+            end_to_end_success[constrained_request]
+            == ancestor_success_prob[constrained_request] - scaled_remaining_risk[(constrained_request, K_r)],
+            name=f"e2e_{req_name}")
 
-        # Apply domain contraction mapping [0.0, 1.0] -> [epsilon, 1.0] to protect log evaluation spaces
-        A_prot = model.addVar(lb=epsilon, ub=1.0, vtype=GRB.CONTINUOUS, name=f"A_prot_{req_name}")
-        model.addConstr(A_prot == end_to_end_success[constrained_request] * (1.0 - epsilon) + epsilon)
-        model.addGenConstrLog(A_prot, ln_A_vars[constrained_request])
+        # Union-bound cut (docstring item 6): reward-carrying probability mass
+        # is capped by the scheduled probability mass, scaled by the best-case
+        # ancestral survival. Valid since 1 - prod(1-p*x) <= sum(p*x).
+        if K_r > 0:
+            model.addConstr(
+                end_to_end_success[constrained_request]
+                <= A_par_ub[constrained_request] * gp.quicksum(
+                    solution_holder[constrained_request][sat][sp]['theta']
+                    * solution_holder[constrained_request][sat][sp]['x']
+                    for (sat, sp) in passes),
+                name=f"cut_union_{req_name}")
 
-        # LOG DEDUCTION IDENTITY: Calculate standalone local values completely linearly
-        model.addConstr(ln_S_vars[constrained_request] == ln_A_vars[constrained_request] - ln_A_parents_vars[constrained_request])
+        # DRAIN CUT (the decisive one). In the LP relaxation, fractional x lets
+        # the McCormick track fully drain Y (claim near-certain local success)
+        # while "paying" only max_instances worth of booking mass -- this, not
+        # the exp/log chords, is what inflates the root bound by hundreds of
+        # percent when requests have many candidate passes. No INTEGER solution
+        # can exceed the top-M union probability, so:
+        #     e2e[r] <= lmax_M(r) * A_parents[r]
+        # is valid, linear, and caps the relaxation at the true per-task ceiling.
+        if tighten_bounds and K_r > 0 and lmax_ub[constrained_request] < 1.0:
+            model.addConstr(
+                end_to_end_success[constrained_request]
+                <= lmax_ub[constrained_request] * ancestor_success_prob[constrained_request],
+                name=f"cut_drain_{req_name}")
 
-    # === STEP 4: MATHEMATICAL OBJECTIVE COMPILER ===
-    # New objective: Maximize E[Quality] - (submission cost + cancellation cost)
-    # Maximize: sum_k Q_k * p_acc_k * p_exec_k * w_k - (c_sub_k + c_canc_k * p_acc_k) * x_k
+        # REWARD ENVELOPE CUTS (cardinality-priced reward). The LP relaxation
+        # can otherwise earn near-union success probability while paying only
+        # a fraction of the integer booking count (McCormick complementarity
+        # binds only at integral x), so per-booking costs barely discount the
+        # bound. The per-task reward with n integer bookings is bounded by the
+        # CONCAVE curve R_ub(n) = A_par_ub * Q_max * lmax(n), where
+        # lmax(n) = 1 - prod over top-n p of (1-p). We add its tangents at
+        # n = 0..M-1: valid for every integer point by concavity, and they
+        # force the relaxation to pay one full booking of cost per top-marginal
+        # unit of reward. This encodes the diminishing-returns structure --
+        # invisible to the plain relaxation -- as linear inequalities, with no
+        # change to the feasible integer set or the objective.
+        if reward_envelope_cuts and tighten_bounds and K_r > 0:
+            _thetas_desc = sorted(
+                (solution_holder[constrained_request][sat][sp]['theta'] for (sat, sp) in passes),
+                reverse=True)
+            _Qmax = max(solution_holder[constrained_request][sat][sp]['quality']
+                        for (sat, sp) in passes)
+            _scale = A_par_ub[constrained_request] * _Qmax
+            _lmax_curve = [0.0]
+            _fail = 1.0
+            for _p in _thetas_desc[:M_of[constrained_request]]:
+                _fail *= (1.0 - _p)
+                _lmax_curve.append(1.0 - _fail)
+            _reward_expr = gp.quicksum(
+                solution_holder[constrained_request][sat][sp]['quality']
+                * solution_holder[constrained_request][sat][sp]['theta']
+                * effective_pass_realization[(constrained_request, sat, sp)]
+                for (sat, sp) in passes)
+            _xsum = gp.quicksum(
+                solution_holder[constrained_request][sat][sp]['x'] for (sat, sp) in passes)
+            for _n in range(len(_lmax_curve) - 1):
+                _slope = _lmax_curve[_n + 1] - _lmax_curve[_n]
+                model.addConstr(
+                    _reward_expr <= _scale * (_lmax_curve[_n] - _slope * _n)
+                                    + _scale * _slope * _xsum,
+                    name=f"cut_renv_{req_name}_n{_n}")
+                # SURVIVAL envelope: the same concave cardinality pricing must
+                # also cap e2e itself, or the LP fractionally drains Y to the
+                # union level "for free" and hands inflated survival to every
+                # descendant (the recurrence Y_0[child] = A_prot[parent] then
+                # compounds the inflation down the DAG). With these cuts the
+                # survival passed downstream is priced per integer booking,
+                # and the chain recurrence compounds cost-consistent values.
+                model.addConstr(
+                    end_to_end_success[constrained_request]
+                    <= A_par_ub[constrained_request] * (_lmax_curve[_n] - _slope * _n)
+                       + A_par_ub[constrained_request] * _slope * _xsum,
+                    name=f"cut_senv_{req_name}_n{_n}")
+
+            # QUALITY-PROBABILITY frontier envelope: an integer solution picks
+            # ONE subset of passes; its credited reward is at most the sum of
+            # its Q*p products (dropping failure discounting), hence at most
+            # the sum of the n LARGEST Q*p products for n bookings -- a concave
+            # curve in n. The fractional LP otherwise splits booking mass to
+            # take survival from high-p passes and reward from high-Q slots at
+            # the same time, exceeding every integer subset on both axes.
+            _qp_desc = sorted(
+                (solution_holder[constrained_request][sat][sp]['quality']
+                 * solution_holder[constrained_request][sat][sp]['theta']
+                 for (sat, sp) in passes), reverse=True)[:M_of[constrained_request]]
+            _qp_cum = [0.0]
+            for _qp in _qp_desc:
+                _qp_cum.append(_qp_cum[-1] + _qp)
+            for _n in range(len(_qp_cum) - 1):
+                _slope_qp = _qp_cum[_n + 1] - _qp_cum[_n]
+                model.addConstr(
+                    _reward_expr <= A_par_ub[constrained_request]
+                                    * ((_qp_cum[_n] - _slope_qp * _n) + _slope_qp * _xsum),
+                    name=f"cut_qpenv_{req_name}_n{_n}")
+
+        # --- PROPORTIONAL floor + protected log (fix of the floor trap) --------
+        A_prot = model.addVar(lb=max(math.exp(lb_ln_A), 1e-30),
+                              ub=A_prot_ub[constrained_request],
+                              vtype=GRB.CONTINUOUS, name=f"A_prot_{req_name}")
+        A_prot_vars[constrained_request] = A_prot
+        model.addConstr(
+            A_prot == end_to_end_success[constrained_request] * (1.0 - epsilon)
+                      + epsilon * ancestor_success_prob[constrained_request],
+            name=f"prot_{req_name}")
+        # Log machinery only where ln_S(r) is actually consumed downstream.
+        if needs_log:
+            model.addGenConstrLog(A_prot, ln_A_vars[constrained_request], name=f"log_{req_name}")
+            # Log deduction identity (paper Eq. 32), now always satisfiable.
+            model.addConstr(
+                ln_S_vars[constrained_request]
+                == ln_A_vars[constrained_request] - ln_A_parents_vars[constrained_request],
+                name=f"lnS_{req_name}")
+
+    # === OBJECTIVE (paper Eq. 34) ==============================================
+    # Maximize sum_k Q_k * p_k * W_abs_k  -  sum_k (c_sub + c_exec * p_acc + c_tax) * x_k
     objective_terms = []
-    for constrained_request in solution_holder.keys():
-        # Skip tasks with no feasible passes
+    for constrained_request in topo:
         if not solution_holder[constrained_request]:
             continue
 
-        # Find max quality among all feasible passes for this request
         all_qualities = [
             solution_holder[constrained_request][sat][sp]['quality']
             for sat in solution_holder[constrained_request].keys()
             for sp in solution_holder[constrained_request][sat].keys()
         ]
-
         if not all_qualities:
-            continue  # Skip if no passes available
+            continue
 
         _max_quality_for_request = max(all_qualities)
-
-        # Compute costs as fractions of max quality for this request
         c_sub = submission_cost_rate * _max_quality_for_request
         c_canc = cancellation_cost_rate * _max_quality_for_request
-        c_tax = tax_rate * _max_quality_for_request  # Legacy tax (kept for backward compatibility)
+        c_tax = tax_rate * _max_quality_for_request  # legacy tax; set tax_rate=0 for paper-exact objective
 
         for satellite, satpass in task_to_passes[constrained_request]:
             x_var = solution_holder[constrained_request][satellite][satpass]['x']
             quality = solution_holder[constrained_request][satellite][satpass]['quality']
-            theta = solution_holder[constrained_request][satellite][satpass]['theta']  # p_acc * p_exec
+            theta = solution_holder[constrained_request][satellite][satpass]['theta']
             theta_acc = solution_holder[constrained_request][satellite][satpass]['theta_acc']
             w_abs = effective_pass_realization[(constrained_request, satellite, satpass)]
 
-            # Expected Reward: Q * p_acc * p_exec * w (where w encodes ancestral success)
+            # Expected best-success quality credit for this pass.
             objective_terms.append(quality * theta * w_abs)
-
-            # Costs:
-            # - Submission cost (unconditional, paid on every booking attempt)
+            # Unconditional submission overhead.
             objective_terms.append(-c_sub * x_var)
-
-            # - Cancellation cost (conditional on acceptance, only paid if constellation accepts)
+            # Execution/cancellation cost, conditional on acceptance.
             objective_terms.append(-c_canc * theta_acc * x_var)
-
-            # - Legacy tax cost (for backward compatibility with old tax_rate parameter)
-            objective_terms.append(-c_tax * x_var)
+            # Legacy per-booking tax (now applied consistently with the
+            # non-convex formulation; previously dead code in this path).
+            if c_tax:
+                objective_terms.append(-c_tax * x_var)
 
     model.setObjective(gp.quicksum(objective_terms), GRB.MAXIMIZE)
 
@@ -1398,13 +1793,17 @@ def _add_workflow_constraints(
         model: gp.Model,
         workflow_graph: nx.MultiDiGraph,
         solution_holder: dict,
-        verbose: int
+        verbose: int,
+        default_max_instances: int = 3
 ):
     """
     Add temporal, success, and timeline constraints from workflow graph.
 
     Constraints:
-    - At most max_num_instances per task
+    - At most max_num_instances per task (defaulting to `default_max_instances`
+      when the request does not specify one -- MUST be > 1 for the stochastic
+      planner to be able to book redundant passes, which is the entire
+      mechanism the stochastic formulation exists to price)
     - No overlapping observations on same satellite
     - Temporal constraints (START_AFTER, START_BEFORE, etc.)
     - Success constraints (conditional execution)
@@ -1421,7 +1820,7 @@ def _add_workflow_constraints(
                 x_vars.append(solution_holder[constrained_request][satellite][satpass]['x'])
 
         if len(x_vars) > 0:
-            max_instances = getattr(constrained_request, 'max_num_instances', 1)
+            max_instances = _effective_max_instances(constrained_request, default_max_instances)
             model.addConstr(
                 gp.quicksum(x_vars) <= max_instances,
                 name=f"max_instances_{constrained_request.observation_request.name}"
@@ -1535,60 +1934,100 @@ def _extract_solution(
         workflow_graph: nx.MultiDiGraph,
         solution_holder: dict,
         verbose: int,
-        timeline_graph: nx.MultiDiGraph = None
+        timeline_graph: nx.MultiDiGraph = None,
+        task_to_passes: dict = None
 ):
     """
     Extract solution from solved model and update workflow graph.
 
+    CRITICAL: extracts ALL selected passes per task, not just the first.
+    The stochastic formulation's entire value proposition is redundant
+    (multi-pass) booking; the previous version broke out of the loop after the
+    first active x variable, silently discarding backup bookings whose costs
+    had been paid in the objective but whose hedging value was never realized,
+    and never applying their timeline impacts.
+
     Updates each ConstrainedObservationRequest node with:
-    - scheduled = True (if assigned)
-    - observation_opportunity_satellite
-    - observation_opportunity_pass
-    - Applies timeline impacts for scheduled tasks
+    - scheduled = True (if at least one pass selected)
+    - scheduled_bookings: list of dicts (quality-descending) with keys
+      'satellite', 'pass', 'quality', 'theta' -- one entry per selected pass.
+      Downstream dispatch should attempt EVERY entry.
+    - observation_opportunity_satellite / _pass / observation_opportunity:
+      backward-compatible scalar attributes pointing at the BEST-QUALITY
+      selected pass (legacy consumers see the primary booking).
+    - Timeline impacts applied for EVERY selected pass (each booking consumes
+      resources whether or not it turns out to be the one that succeeds).
     """
 
     for constrained_request in solution_holder.keys():
-        scheduled = False
+        # Enumerate passes in descending-quality order (task_to_passes preserves
+        # the global quality sort across satellites; the nested dict does not).
+        if task_to_passes is not None and constrained_request in task_to_passes:
+            ordered_passes = task_to_passes[constrained_request]
+        else:
+            ordered_passes = [
+                (sat, sp)
+                for sat in solution_holder[constrained_request].keys()
+                for sp in solution_holder[constrained_request][sat].keys()
+            ]
+            ordered_passes.sort(
+                key=lambda t: solution_holder[constrained_request][t[0]][t[1]]['quality'],
+                reverse=True
+            )
 
-        for satellite in solution_holder[constrained_request].keys():
-            for satpass in solution_holder[constrained_request][satellite].keys():
-                x_var = solution_holder[constrained_request][satellite][satpass]['x']
+        selected = [
+            (satellite, satpass)
+            for (satellite, satpass) in ordered_passes
+            if solution_holder[constrained_request][satellite][satpass]['x'].X > 0.5
+        ]
 
-                if x_var.X > 0.5:  # Binary variable is "on"
-                    constrained_request.scheduled = True
-                    constrained_request.observation_opportunity_satellite = satellite
-                    constrained_request.observation_opportunity_pass = satpass
-                    constrained_request.observation_opportunity = satpass.highest
-
-                    scheduled = True
-
-                    if verbose > 1:
-                        print(f"[Solution] Scheduled {constrained_request.observation_request.name} "
-                              f"on {satellite.name} at {satpass.highest.time}")
-
-                    # Apply timeline impacts (matching deterministic scheduler behavior)
-                    if timeline_graph is not None and constrained_request in timeline_graph.nodes():
-                        for _timeline in timeline_graph.successors(constrained_request):
-                            tl_edges = timeline_graph.get_edge_data(constrained_request, _timeline)
-                            for impact_key, impact in tl_edges.items():
-                                if impact['edge_type'] == TaskTimelineImpact:
-                                    _time = satpass.highest.time
-                                    if impact['impact_time'] == TaskImpactTime.POST:
-                                        _time = satpass.highest.time + satpass.highest.duration
-                                    tl_impact = Impact(
-                                        time=_time,
-                                        type=impact['impact_type'],
-                                        value=impact['impact_value'] * x_var.X,
-                                        owner=constrained_request,
-                                    )
-                                    _timeline.add_impact(impact=tl_impact)
-
-                    break  # Only one pass per task
-
-            if scheduled:
-                break
-
-        if not scheduled:
+        if not selected:
             constrained_request.scheduled = False
+            constrained_request.scheduled_bookings = []
             if verbose > 2:
                 print(f"[Solution] NOT scheduled: {constrained_request.observation_request.name}")
+            continue
+
+        constrained_request.scheduled = True
+
+        # Backward-compatible scalars = best-quality (primary) booking.
+        best_satellite, best_pass = selected[0]
+        constrained_request.observation_opportunity_satellite = best_satellite
+        constrained_request.observation_opportunity_pass = best_pass
+        constrained_request.observation_opportunity = best_pass.highest
+
+        # Full redundant booking set (plain data only -- no solver objects, so
+        # _cleanup_solver_objects leaves it intact and it pickles cleanly).
+        constrained_request.scheduled_bookings = [
+            {
+                'satellite': satellite,
+                'pass': satpass,
+                'quality': solution_holder[constrained_request][satellite][satpass]['quality'],
+                'theta': solution_holder[constrained_request][satellite][satpass]['theta'],
+            }
+            for (satellite, satpass) in selected
+        ]
+
+        if verbose > 1:
+            for i, (satellite, satpass) in enumerate(selected):
+                role = "PRIMARY" if i == 0 else f"BACKUP-{i}"
+                print(f"[Solution] Scheduled {constrained_request.observation_request.name} "
+                      f"[{role}] on {satellite.name} at {satpass.highest.time}")
+
+        # Apply timeline impacts for EVERY selected pass.
+        if timeline_graph is not None and constrained_request in timeline_graph.nodes():
+            for (satellite, satpass) in selected:
+                for _timeline in timeline_graph.successors(constrained_request):
+                    tl_edges = timeline_graph.get_edge_data(constrained_request, _timeline)
+                    for impact_key, impact in tl_edges.items():
+                        if impact['edge_type'] == TaskTimelineImpact:
+                            _time = satpass.highest.time
+                            if impact['impact_time'] == TaskImpactTime.POST:
+                                _time = satpass.highest.time + satpass.highest.duration
+                            tl_impact = Impact(
+                                time=_time,
+                                type=impact['impact_type'],
+                                value=impact['impact_value'],
+                                owner=constrained_request,
+                            )
+                            _timeline.add_impact(impact=tl_impact)

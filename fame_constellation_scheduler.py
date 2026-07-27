@@ -101,6 +101,158 @@ class ConstellationGroundScheduler():
 
         # return screen_pass_for_feasibility(existing_requests=self._requests, satellite=satellite, _obs_pass=_obs_pass, screen_against_comm_passes=screen_against_comm_passes, log_prefix=self.name)
 
+    def schedule_request_redundant(
+            self,
+            request: ObservationRequest,
+            target_satellite: Satellite,
+            target_pass: ObservationPass,
+            current_time: dt.datetime = None,
+            callback_request_scheduled=lambda req_pass: None,
+            callback_request_unscheduled=lambda reason: None,
+            callback_request_ready=lambda data_product: None,
+            phenomenon_processor=lambda o, s, p: p
+            ):
+        """
+        Submits a specific (target_satellite, target_pass) pair selected by the stochastic MILP planner.
+        Bypasses internal greedy selection to guarantee that redundant backup passes are booked on 
+        their intended satellites.
+        """
+        if current_time is None:
+            current_time = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
+        print(f"[{self.name}] Scheduling target-specific request {request.name} on {target_satellite.name} at {target_pass.highest.time}")
+
+        _request_dict = {
+            'request': request,
+            'satellite': target_satellite,
+            'observation': target_pass.highest,
+            'uplink': None,
+            'downlink': None,
+            'status': ObservationStatus.UNKNOWN,
+            'data_product': None,
+            'scheduled_callback': callback_request_scheduled,
+            'unscheduled_callback': callback_request_unscheduled,
+            'ready_callback': callback_request_ready,
+        }
+
+        _pdrequest = pd.DataFrame([_request_dict])
+        self._requests = pd.concat([self._requests, _pdrequest], ignore_index=True)
+
+        # Step 1: Screen ONLY the target satellite pass for feasibility
+        _pass_is_feasible = self.screen_opportunity_for_feasibility(target_satellite, target_pass.highest)
+        if not _pass_is_feasible:
+            print(f"   [{self.name}] Target pass on {target_satellite.name} is conflicted/busy")
+            self._requests.loc[self._requests['request'] == request, 'status'] = ObservationStatus.ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING
+            if random.random() < self.ack_probability_if_unscheduled:
+                callback_request_unscheduled(ObservationStatus.ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING)
+            return -5
+
+        # Step 2: Establish Uplink/Downlink opportunities for this target satellite
+        if target_satellite.has_continuous_isl_to_ground:
+            earliest_ul_opportunity = "ISL"
+            earliest_ul_opportunity_station = "ISL"
+            dl_pass = "ISL"
+            dl_station = "ISL"
+        else:
+            # Find uplink contact window
+            _, ul_comm_opportunities = find_contact_opportunities(
+                ground_stations=self.ground_stations,
+                satellites=[target_satellite],
+                min_time=current_time,
+                max_time=target_pass.highest.time,
+                passes_error_s=60,
+                passes_horizon_deg=MIN_HORIZON_ANGLE_FOR_PASS_DEG,
+            )
+
+            earliest_ul_opportunity = None
+            earliest_ul_opportunity_station = None
+            if target_satellite in ul_comm_opportunities:
+                for comm_opportunity in ul_comm_opportunities[target_satellite]:
+                    if self.screen_pass_for_feasibility(target_satellite, comm_opportunity[1], screen_against_comm_passes=False):
+                        earliest_ul_opportunity = comm_opportunity[1]
+                        earliest_ul_opportunity_station = comm_opportunity[0]
+                        break
+
+            if earliest_ul_opportunity is None or earliest_ul_opportunity_station is None:
+                print(f"   [{self.name}] No unconflicted uplink contact for {target_satellite.name}")
+                self._requests.loc[self._requests['request'] == request, 'status'] = ObservationStatus.ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING
+                if random.random() < self.ack_probability_if_unscheduled:
+                    callback_request_unscheduled(ObservationStatus.ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING)
+                return -5
+
+            # Find downlink contact window
+            _, dl_comm_opportunities = find_contact_opportunities(
+                ground_stations=self.ground_stations,
+                satellites=[target_satellite],
+                min_time=target_pass.highest.time + target_pass.highest.duration,
+                max_time=target_pass.highest.time + target_pass.highest.duration + dt.timedelta(hours=48),
+                passes_error_s=60,
+                passes_horizon_deg=MIN_HORIZON_ANGLE_FOR_PASS_DEG,
+            )
+
+            dl_pass = None
+            dl_station = None
+            if target_satellite in dl_comm_opportunities:
+                for comm_opportunity in dl_comm_opportunities[target_satellite]:
+                    if self.screen_pass_for_feasibility(target_satellite, comm_opportunity[1], screen_against_comm_passes=False):
+                        dl_pass = comm_opportunity[1]
+                        dl_station = comm_opportunity[0]
+                        break
+
+            if dl_pass is None or dl_station is None:
+                print(f"   [{self.name}] No unconflicted downlink contact for {target_satellite.name}")
+                self._requests.loc[self._requests['request'] == request, 'status'] = ObservationStatus.ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING
+                if random.random() < self.ack_probability_if_unscheduled:
+                    callback_request_unscheduled(ObservationStatus.ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING)
+                return -5
+
+        # Step 3: Stochastic Rejection Simulation
+        if self.acceptance_probability_function is not None:
+            theta_accept = self.acceptance_probability_function(request, target_satellite, self.world.time)
+        else:
+            theta_accept = self.acceptance_probability
+
+        if random.random() > theta_accept:
+            print(f"   [{self.name}] REJECTED request {request.name} on {target_satellite.name} (acceptance prob={theta_accept:.2f})")
+            self._requests.loc[self._requests['request'] == request, 'status'] = ObservationStatus.CONSTELLATION_REJECTED
+            if random.random() < self.ack_probability_if_unscheduled:
+                callback_request_unscheduled(ObservationStatus.CONSTELLATION_REJECTED)
+            return -6  # Rejected: timeline remains free for other requests, but this pass fails
+
+        # Step 4: ACCEPTED - Book pass and lock timeline
+        print(f"   [{self.name}] ACCEPTED request {request.name} on {target_satellite.name} (acceptance prob={theta_accept:.2f})")
+
+        if earliest_ul_opportunity == "ISL":
+            schedule_observation(self.world, target_pass.highest, phenomenon_processor=phenomenon_processor)
+        else:
+            schedule_observation_uplink(self.world, earliest_ul_opportunity, target_pass.highest, earliest_ul_opportunity_station, phenomenon_processor=phenomenon_processor)
+
+        if dl_pass == "ISL":
+            schedule_isl_downlink(_world=self.world, satellite=target_satellite, time=target_pass.highest.time, constellation_scheduler=self)
+        else:
+            schedule_sat_downlink(_world=self.world, satellite=target_satellite, comm_pass=dl_pass, station=dl_station, constellation_scheduler=self)
+
+        self._requests.loc[self._requests['request'] == request, 'satellite'] = target_satellite
+        self._requests.loc[self._requests['request'] == request, 'observation'] = target_pass.highest
+        self._requests.loc[self._requests['request'] == request, 'uplink'] = earliest_ul_opportunity
+        self._requests.loc[self._requests['request'] == request, 'downlink'] = dl_pass
+        self._requests.loc[self._requests['request'] == request, 'status'] = ObservationStatus.SCHEDULED
+
+        # Lock satellite busy timeline for accepted pass
+        self._satellite_busy_timelines_obs[target_satellite].add_impact(Impact(time=target_pass.highest.time, type=ImpactType.ASSIGNMENT, value=True))
+        self._satellite_busy_timelines_obs[target_satellite].add_impact(Impact(time=target_pass.highest.time + target_pass.highest.duration, type=ImpactType.ASSIGNMENT, value=False))
+
+        if type(earliest_ul_opportunity) == ObservationPass:
+            self._satellite_busy_timelines_comm[target_satellite].add_impact(Impact(time=earliest_ul_opportunity.rise.time, type=ImpactType.ASSIGNMENT, value=True))
+            self._satellite_busy_timelines_comm[target_satellite].add_impact(Impact(time=earliest_ul_opportunity.fall.time, type=ImpactType.ASSIGNMENT, value=False))
+        if type(dl_pass) == ObservationPass:
+            self._satellite_busy_timelines_comm[target_satellite].add_impact(Impact(time=dl_pass.rise.time, type=ImpactType.ASSIGNMENT, value=True))
+            self._satellite_busy_timelines_comm[target_satellite].add_impact(Impact(time=dl_pass.fall.time, type=ImpactType.ASSIGNMENT, value=False))
+
+        if random.random() < self.ack_probability_if_scheduled:
+            callback_request_scheduled(target_pass.highest)
+
+        return 0
     def schedule_request(
             self,
             request: ObservationRequest,

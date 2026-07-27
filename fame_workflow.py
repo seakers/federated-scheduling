@@ -127,6 +127,11 @@ class ConstrainedObservationRequest():
         self.uplink_pass: ObservationPass = None
         self.downlink_pass: ObservationPass = None
         self.observation_opportunities = {}
+        # All passes selected by the scheduler for this task (satellite, pass) pairs.
+        # When max_num_instances > 1 the planner may pick multiple backup passes;
+        # the broker dispatches all of them and waits for any one to succeed before
+        # declaring the task complete and triggering children.
+        self.pending_dispatch_passes: list = []
         self.scheduled: bool = False
         self.feasible: bool = True
         self.dispatched: bool = False
@@ -756,7 +761,9 @@ def ilp_schedule_workflow(
         max_solver_time_s: int=1e3,
         receding_horizon_duration: dt.timedelta=dt.timedelta(weeks=52),
         solver_engine: str = "GUROBI",  # <-- ADD THIS (Options: "SCIP" or "GUROBI")
-        tax_rate: float = 0.0  # Cost per scheduled obs as fraction of max quality. Set to 0 to disable.
+        tax_rate: float = 0.0,  # Cost per scheduled obs as fraction of max quality. Set to 0 to disable.
+        submission_cost_rate: float = 0.0,  # c_sub: unconditional per-booking submission overhead (as fraction of quality)
+        execution_cost_rate: float = 0.0  # c_canc: conditional cancellation cost if accepted (as fraction of quality)
 ):
     workflow_graph_request=workflow_graph
     print(f"Function ILP scheduler, the solver engine is {solver_engine}")
@@ -872,6 +879,9 @@ def ilp_schedule_workflow(
         # Compute max quality across all feasible passes for this request, used to compute tax
         _max_quality_for_request = max([q for (_, _, q) in allsatpasses]) if len(allsatpasses) > 0 else 0.0
         _tax = tax_rate * _max_quality_for_request
+        _submission_cost = submission_cost_rate* _max_quality_for_request
+        _execution_cost = execution_cost_rate*_max_quality_for_request
+    
 
         for (satellite, satpass, _quality) in allsatpasses:
             if feasibility_screener(satellite, satpass):
@@ -889,7 +899,7 @@ def ilp_schedule_workflow(
                 flat_boolean_solution_holder.append(solution_holder[constrained_request][satellite][satpass])
 
                 # Net coefficient = quality - tax (tax=0 disables the cost penalty)
-                objective.SetCoefficient(solution_holder[constrained_request][satellite][satpass], _quality - _tax)
+                objective.SetCoefficient(solution_holder[constrained_request][satellite][satpass], _quality - _submission_cost-_execution_cost)
 
                 # TODO for each timeline impacted, add a variable for that timeline value at that time. Add an Impact with that timeline value times "do we do it".
                 if constrained_request in timeline_graph.nodes():
@@ -1204,6 +1214,7 @@ def ilp_schedule_workflow(
             # Suppress Gurobi's standard console output to keep your logs clean
             env.setParam('OutputFlag', 0) 
             env.setParam('MIPGap', 0.01)  # 0.02 = 2% gap limit
+            env.setParam('OutputFlag', 1)
             
             if os.environ.get("WLSACCESSID"):
                 env.setParam("WLSACCESSID", os.environ.get("WLSACCESSID"))
@@ -1283,10 +1294,11 @@ def ilp_schedule_workflow(
                 continue
             else:
                 constrained_request.scheduled=True
+                constrained_request.pending_dispatch_passes = []  # reset for this scheduling epoch
                 _feasible = False
                 for this_satellite in solution_holder[constrained_request].keys():
                     for this_pass, this_decision_variable in solution_holder[constrained_request][this_satellite].items():
-                        
+
                         # --- THE VALUE LOOKUP SWITCH ---
                         if solver_engine == "GUROBI":
                             # Look up the value from the Gurobi map we made
@@ -1295,14 +1307,20 @@ def ilp_schedule_workflow(
                             # Use normal OR-Tools method
                             var_value = this_decision_variable.solution_value()
                         # -------------------------------
-                            
+
                         if var_value > 0.5: # Use 0.5 to be safe with float rounding
                             if verbose>1:
                                 print("    [Scheduler] ", this_decision_variable.name(), " = ", var_value)
                             _feasible = True
-                            constrained_request.observation_opportunity_pass = this_pass
-                            constrained_request.observation_opportunity = this_pass.highest
-                            constrained_request.observation_opportunity_satellite = this_satellite
+                            # Store the primary (first/best) pass in the legacy slot for
+                            # compatibility with timeline constraints and display code.
+                            if not constrained_request.pending_dispatch_passes:
+                                constrained_request.observation_opportunity_pass = this_pass
+                                constrained_request.observation_opportunity = this_pass.highest
+                                constrained_request.observation_opportunity_satellite = this_satellite
+                            # Accumulate ALL selected passes so the broker can dispatch
+                            # all of them as backups (sorted chronologically below).
+                            constrained_request.pending_dispatch_passes.append((this_satellite, this_pass))
 
                             # Now apply the relevant impacts
                             if constrained_request in timeline_graph.nodes():
@@ -1321,6 +1339,8 @@ def ilp_schedule_workflow(
                                                 )
                                             _timeline.add_impact(impact=tl_impact)
 
+                # Sort backup passes chronologically so the earliest is dispatched first.
+                constrained_request.pending_dispatch_passes.sort(key=lambda sp: sp[1].highest.time)
                 constrained_request.feasible=_feasible
 
         # Clean up timeline impacts - remove unpicklable solver objects (OR-Tools and Gurobi)
