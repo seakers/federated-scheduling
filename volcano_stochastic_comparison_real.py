@@ -79,7 +79,7 @@ TAX_RATE = 0.0              # Legacy per-booking tax (disabled)
 SUBMISSION_COST = 0.05      # Unconditional booking submission overhead
 EXEC_COST = 0.2             # Conditional execution cost if accepted
 
-SCHEDULERS = ['deterministic', 'greedy', 'stochastic_log']
+SCHEDULERS = ['stochastic_log','deterministic', 'greedy']
 
 
 def load_volcano_locations_from_database() -> list[Location]:
@@ -225,7 +225,8 @@ def load_satellites_once() -> list[Satellite]:
 def create_world_and_constellations(cached_satellites: list[Satellite],
                                     demand_field: DemandField = None):
     """Creates fresh simulation scopes using copied pre-cached orbital models."""
-    local_satellites = copy.deepcopy(cached_satellites)
+    #local_satellites = copy.deepcopy(cached_satellites)
+    local_satellites = load_satellites_once()
     world = World(satellites=local_satellites)
     world.time = SIMULATION_START
 

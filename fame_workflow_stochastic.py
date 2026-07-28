@@ -24,7 +24,52 @@ from fame_workflow import ConstrainedObservationRequest, TaskTimelineImpact, Tas
 
 # Load environment variables from .env file
 load_dotenv()
+class StochasticTimeline(Timeline):
+    """
+    A state timeline whose value decays over time unless refreshed
+    by successful observation completions.
+    """
+    def __init__(
+        self,
+        name: str,
+        initial_time: dt.datetime,
+        initial_value: float = 1.0,
+        half_life_s: float = 10800.0,  # 3 hours default memory
+        min_value: float = -100.0,
+        max_value: float = 100.0,
+    ):
+        decay_rate = -1.0 / half_life_s
+        super().__init__(
+            name=name,
+            initial_time=initial_time,
+            initial_value=initial_value,
+            initial_rate=decay_rate,
+            min_value=min_value,
+            max_value=max_value,
+        )
+        self.half_life = dt.timedelta(seconds=half_life_s)
 
+    def refresh_if_observed(self, current_time: dt.datetime, requests: list) -> bool:
+        """
+        Scans requests for any successful observation within the half-life window.
+        Returns True if state is active (known), False if decayed/unknown.
+        """
+        is_active = False
+        for r in requests:
+            if getattr(r, 'completed', False) and getattr(r, 'successful_execution', False):
+                # Find actual executed pass time (primary or backup)
+                exec_time = getattr(r, 'execution_time', None)
+                if exec_time is None and getattr(r, 'observation_opportunity', None):
+                    exec_time = r.observation_opportunity.time
+                
+                if exec_time and (current_time - exec_time) <= self.half_life:
+                    is_active = True
+                    break
+
+        new_value = 1.0 if is_active else 0.0
+        _, current_rate = self._get_value_and_rate_at(current_time, print_debug=False)
+        self.reset_timeline(current_time, new_value, current_rate)
+        return is_active
 
 def ilp_schedule_workflow_stochastic(
         workflow_graph: nx.MultiDiGraph,
@@ -197,7 +242,9 @@ def _solve_with_gurobi(
             # _build_log_linearized_formulation.
             model.setParam('TimeLimit', max_solver_time_s)
             model.setParam('MIPGap', mip_gap)
-            model.setParam('FuncNonlinear', 1)
+            model.setParam('FuncNonlinear', 0)
+            model.setParam('Cuts', 1) 
+            model.setParam('Threads', 128)                
             model.setParam('OutputFlag', 1)
             if results_dir:
                 model.setParam('LogFile', os.path.join(results_dir, "gurobi_stochastic.log"))
