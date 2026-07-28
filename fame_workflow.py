@@ -1174,7 +1174,7 @@ def ilp_schedule_workflow(
     # Add a hint
     solver.SetHint(flat_boolean_solution_holder, [0.,]*len(flat_boolean_solution_holder))
 
-# ==========================================
+    # ==========================================
     # THE SOLVER SWITCH (MPS TRICK)
     # ==========================================
     if solver_engine == "GUROBI":
@@ -1184,100 +1184,89 @@ def ilp_schedule_workflow(
                 print("    [Scheduler] No pending tasks to schedule. Skipping Gurobi.")
             # Mimic SCIP returning optimal for an empty problem
             status = pywraplp.Solver.OPTIMAL 
-            m = None # Dummy object just in case
+            m = None 
             gurobi_var_map = {}
         else:
             if verbose > 0:
                 print("    [Scheduler] Exporting to MPS and solving with Native Gurobi...")
             mps_path = "temp_workflow.mps"
-            # mps_text = solver.ExportModelAsMpsFormat(False, False)
-            # with open(mps_path, "w") as f:
-            #     f.write(mps_text)
             solver.WriteModelToMpsFile(mps_path, False, False)
-            # --- THE FIX: Wait for Windows to actually finish writing ENDATA ---
+            
+            # --- THE FIX: Wait for OS to finish writing file ---
             import time
             print("    [Scheduler] Waiting for OS I/O to finish writing file...")
-            for _ in range(20): # Try for up to 10 seconds
+            for _ in range(20): 
                 try:
                     with open(mps_path, 'rb') as f:
-                        f.seek(-30, os.SEEK_END) # Jump to the last 30 bytes of the file
+                        f.seek(-30, os.SEEK_END) 
                         tail = f.read().decode('utf-8', errors='ignore')
                         if "ENDATA" in tail:
-                            break # File is complete!
+                            break 
                 except Exception:
                     pass
-                time.sleep(0.5) # Wait half a second and check again
+                time.sleep(0.5) 
             print("    [Scheduler] MPS file flush confirmed!")
             
-            # --- THE FIX: Explicitly authenticate with your WLS credentials ---
-            env = gp.Env(empty=True)
-            # Suppress Gurobi's standard console output to keep your logs clean
-            env.setParam('OutputFlag', 0) 
-            env.setParam('MIPGap', 0.01)  # 0.02 = 2% gap limit
-            env.setParam('OutputFlag', 1)
-            
-            if os.environ.get("WLSACCESSID"):
-                env.setParam("WLSACCESSID", os.environ.get("WLSACCESSID"))
-                env.setParam("WLSSECRET", os.environ.get("WLSSECRET"))
-                env.setParam("LICENSEID", int(os.environ.get("LICENSEID", 0)))
-            env.start()
-            
-            # Pass the authenticated environment into the reader
-            m = gp.read(mps_path, env=env)
-            # ------------------------------------------------------------------
-            
-            m.optimize()
-        if m is not None:
-            # Map Gurobi status back to OR-Tools format
-            # Gurobi status codes: OPTIMAL=2, INFEASIBLE=3, INF_OR_UNBD=4, TIME_LIMIT=9, etc.
-            if m.Status == gp.GRB.OPTIMAL:
-                status = pywraplp.Solver.OPTIMAL
-            elif m.Status in [gp.GRB.TIME_LIMIT, gp.GRB.SOLUTION_LIMIT, gp.GRB.INTERRUPTED]:
-                # Found a feasible solution but not proven optimal
-                status = pywraplp.Solver.FEASIBLE
-            elif m.Status == gp.GRB.INFEASIBLE:
-                if verbose > 0:
-                    print(f"    [Scheduler] Model is INFEASIBLE (no valid schedule found)")
-                status = pywraplp.Solver.INFEASIBLE
-            elif m.Status == gp.GRB.INF_OR_UNBD:
-                if verbose > 0:
-                    print(f"    [Scheduler] Model is INFEASIBLE or UNBOUNDED")
-                status = pywraplp.Solver.ABNORMAL
-            else:
-                if verbose > 0:
-                    print(f"    [Scheduler] Gurobi status: {m.Status}")
-                status = pywraplp.Solver.NOT_SOLVED
-        else:
-             status = pywraplp.Solver.OPTIMAL
-
-            
-        # Create a dictionary of Gurobi variable results for quick lookup
-       # --- THE FIX: Map variables by sequential index instead of mangled strings ---
-        gurobi_var_map = {}
-        if status in [pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE]:
-            ort_vars = solver.variables()
-            
-            # --- THE FIX: Only ask Gurobi for variables if Gurobi actually ran ---
-            if m is not None:
-                grb_vars = m.getVars()
+            # Initialize variables before try block
+            env = None
+            m = None
+            try:
+                # --- Authenticate and start Gurobi Env ---
+                env = gp.Env(empty=True)
+                env.setParam('OutputFlag', 0) 
+                env.setParam('MIPGap', 0.01)  
+                env.setParam('OutputFlag', 1)
                 
-                # Zip them together so we perfectly link the OR-Tools name to the Gurobi value
-                if len(ort_vars) == len(grb_vars):
-                    gurobi_var_map = {ort_vars[i].name(): grb_vars[i].X for i in range(len(ort_vars))}
+                if os.environ.get("WLSACCESSID"):
+                    env.setParam("WLSACCESSID", os.environ.get("WLSACCESSID"))
+                    env.setParam("WLSSECRET", os.environ.get("WLSSECRET"))
+                    env.setParam("LICENSEID", int(os.environ.get("LICENSEID", 0)))
+                env.start()
+                
+                # Load model & solve
+                m = gp.read(mps_path, env=env)
+                m.optimize()
+
+                # Map Gurobi status back to OR-Tools format
+                if m.Status == gp.GRB.OPTIMAL:
+                    status = pywraplp.Solver.OPTIMAL
+                elif m.Status in [gp.GRB.TIME_LIMIT, gp.GRB.SOLUTION_LIMIT, gp.GRB.INTERRUPTED]:
+                    status = pywraplp.Solver.FEASIBLE
+                elif m.Status == gp.GRB.INFEASIBLE:
+                    if verbose > 0:
+                        print(f"    [Scheduler] Model is INFEASIBLE (no valid schedule found)")
+                    status = pywraplp.Solver.INFEASIBLE
+                elif m.Status == gp.GRB.INF_OR_UNBD:
+                    if verbose > 0:
+                        print(f"    [Scheduler] Model is INFEASIBLE or UNBOUNDED")
+                    status = pywraplp.Solver.ABNORMAL
                 else:
-                    print("    [Scheduler] WARNING: Variable counts do not match between OR-Tools and Gurobi!")
-            else:
-                # m is None (empty problem), so there's nothing to map. 
-                # gurobi_var_map safely remains an empty dictionary {}.
-                pass
+                    if verbose > 0:
+                        print(f"    [Scheduler] Gurobi status: {m.Status}")
+                    status = pywraplp.Solver.NOT_SOLVED
+
+                # Extract variable results
+                gurobi_var_map = {}
+                if status in [pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE]:
+                    ort_vars = solver.variables()
+                    grb_vars = m.getVars()
+                    if len(ort_vars) == len(grb_vars):
+                        gurobi_var_map = {ort_vars[i].name(): grb_vars[i].X for i in range(len(ort_vars))}
+                    else:
+                        print("    [Scheduler] WARNING: Variable counts do not match between OR-Tools and Gurobi!")
+
+            finally:
+                # Safely dispose C++ objects only if they were initialized
+                if m is not None:
+                    m.dispose()
+                if env is not None:
+                    env.dispose()
     else:
-        solver.WriteModelToMpsFile("isolated_benchmark_problem.mps", False, False) #This basically saves the optimization problem for further isloated study
+        solver.WriteModelToMpsFile("isolated_benchmark_problem.mps", False, False)
         print(" Isolated problem snapshot saved to file!")
-        # Standard OR-Tools SCIP Solve
         if verbose > 0:
             print("    [Scheduler] Solving with standard OR-Tools SCIP...")
         status = solver.Solve()
-
     # ==========================================
     # RECONSTRUCT THE SOLUTION
     # ==========================================
@@ -1609,6 +1598,8 @@ def plot_workflow_schedule(
 
     if save_schedule_plot:
         plt.savefig(save_name, bbox_inches='tight')
+    if axes is None:
+        plt.close(fig)
 
 
 def find_dispatchable_tasks(workflow_graph = nx.MultiDiGraph(), timeline_graph: nx.MultiDiGraph=nx.MultiDiGraph(), verbose: int=1):
