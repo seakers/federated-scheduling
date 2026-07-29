@@ -1254,6 +1254,9 @@ def ilp_schedule_workflow(
                         gurobi_var_map = {ort_vars[i].name(): grb_vars[i].X for i in range(len(ort_vars))}
                     else:
                         print("    [Scheduler] WARNING: Variable counts do not match between OR-Tools and Gurobi!")
+                                # Safe check: if m is None, it took 0.0 seconds
+                gurobi_time = m.Runtime if m is not None else 0.0
+                print(f"    [Scheduler] Problem solved with Native Gurobi (RunTime: {gurobi_time:.2f}s)")
 
             finally:
                 # Safely dispose C++ objects only if they were initialized
@@ -1334,13 +1337,16 @@ def ilp_schedule_workflow(
 
         # Clean up timeline impacts - remove unpicklable solver objects (OR-Tools and Gurobi)
         for timeline in timeline_graph.nodes():
-            if type(timeline) == Timeline:
+            if isinstance(timeline, Timeline):
                 _new_impact_container = []
                 for impact in timeline.impact_container:
-                    impact_module = getattr(impact.value, '__module__', None)
-                    # Remove both OR-Tools and Gurobi objects (they can't be pickled/deepcopied)
-                    if (not (impact_module is not None and (impact_module.startswith('ortools') or impact_module.startswith('gurobipy')))):
-                        _new_impact_container.append(impact)
+                    try:
+                        # Keep only realized numerical values (floats/ints)
+                        if isinstance(impact.value, (int, float, np.number, bool)):
+                            _new_impact_container.append(impact)
+                    except Exception:
+                        # Dead or freed C++ solver pointer — safely discard it
+                        pass
                 timeline.impact_container = _new_impact_container
 
         if (verbose>2):
@@ -1349,10 +1355,6 @@ def ilp_schedule_workflow(
                 print(f"    [Scheduler] Problem solved in {solver.wall_time():d} milliseconds")
                 print(f"    [Scheduler] Problem solved in {solver.iterations():d} iterations")
                 print(f"    [Scheduler] Problem solved in {solver.nodes():d} branch-and-bound nodes")
-            else:
-                # Safe check: if m is None, it took 0.0 seconds
-                gurobi_time = m.Runtime if m is not None else 0.0
-                print(f"    [Scheduler] Problem solved with Native Gurobi (RunTime: {gurobi_time:.2f}s)")
     else:
         # (Keep your existing 'else' print block here for NOT_SOLVED statuses)
         if verbose>0:
