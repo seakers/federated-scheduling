@@ -178,7 +178,8 @@ def propagate_distribution_from_observations(
         ):
 
     query_times.sort()
-    completed_requests = [r for r in observation_requests if r.completed == True]
+    completed_requests = [r for r in observation_requests
+                          if r.completed == True and r.observation_opportunity is not None]
     # Walk from most recent backward to find the most recent time we saw the ship
     completed_requests.sort(key=lambda x: x.observation_opportunity.time, reverse=True)
     found_latest_request = False

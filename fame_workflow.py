@@ -1271,12 +1271,12 @@ def ilp_schedule_workflow(
     # RECONSTRUCT THE SOLUTION
     # ==========================================
     if status == pywraplp.Solver.OPTIMAL or status == pywraplp.Solver.FEASIBLE:
-        if (verbose>0):
-                if solver_engine == "GUROBI":
-                    # Safe check: if m is None (empty problem), objective is 0.0
-                    obj_val = m.ObjVal if m is not None else 0.0
-                else:
-                    obj_val = solver.Objective().Value()
+        # if (verbose>0):
+        #         if solver_engine == "GUROBI":
+        #             # Safe check: if m is None (empty problem), objective is 0.0
+        #             obj_val = m.ObjVal if m is not None else 0.0
+        #         else:
+        #             obj_val = solver.Objective().Value()
                     
         for constrained_request in workflow_graph.nodes():
             if ((constrained_request.dispatched == True) or (constrained_request.completed == True)):

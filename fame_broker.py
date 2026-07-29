@@ -853,6 +853,8 @@ class Broker():
                         plt.savefig(figure_path, bbox_inches='tight')
                     else:
                         plot_axes[0].get_figure().savefig(figure_path, bbox_inches='tight')
+                    plt.close()
+
 
             # Step 4: Dispatch scheduled tasks
             local_workflow_schedule_epoch_when_dispatching_started = self._workflow_schedule_epoch
