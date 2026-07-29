@@ -79,7 +79,7 @@ TAX_RATE = 0.0              # Legacy per-booking tax (disabled)
 SUBMISSION_COST = 0.05      # Unconditional booking submission overhead
 EXEC_COST = 0.2             # Conditional execution cost if accepted
 
-SCHEDULERS = ['stochastic_log','deterministic', 'greedy']
+SCHEDULERS = ['deterministic','stochastic_log', 'greedy']
 
 
 def load_volcano_locations_from_database() -> list[Location]:
