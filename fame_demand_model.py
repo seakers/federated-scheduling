@@ -84,8 +84,8 @@ class DemandFieldConfig:
     horizon_s  : total horizon to precompute (seconds).
     """
     # --- probability band ---
-    p_min: float = 0.30
-    p_max: float = 0.90
+    p_min: float = 0.70
+    p_max: float = 0.95
 
     # --- sigmoid ---
     # The demand field lives on a scale of roughly [-3, +3].

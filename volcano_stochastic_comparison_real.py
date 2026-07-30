@@ -41,6 +41,8 @@ from typing import Callable
 
 import numpy as np
 import matplotlib
+
+from fame_workflow_stochastic import StochasticTimeline
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -59,8 +61,15 @@ from fame_broker import Broker
 from fame_workflow import *
 from fame_demand_model import DemandField, DemandFieldConfig
 
+# Import Volcano Domain Machinery
+from volcano_utils import (
+    load_volcano_locations_from_database,
+    create_volcano_workflow,
+    register_volcano_phenomena,
+)
+
 # demand-based metrics + paired analysis + frontier
-from fame_metrics import compute_metrics_v2, paired_summary, plot_cost_frontier
+from fame_metrics import compute_metrics_v3, paired_summary, plot_cost_frontier
 
 # ============================ Configuration =================================
 # SIMULATION_START is a module global because the geometry helpers below read
@@ -68,46 +77,19 @@ from fame_metrics import compute_metrics_v2, paired_summary, plot_cost_frontier
 # it, so all processes in a campaign share identical orbital geometry.
 SIMULATION_START = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 
-lookahead_horizon_h = 18
+lookahead_horizon_h = 9
 FOLLOW_UP_INTERVAL_H = 3
 MAX_SOLVER_TIME_S = 70
 MAX_NUM_INSTANCES = 5
-NUM_MC_RUNS = 2
+NUM_MC_RUNS = 1
 
 # === COST CONFIGURATION ===
 TAX_RATE = 0.0              # Legacy per-booking tax (disabled)
-SUBMISSION_COST = 0.05      # Unconditional booking submission overhead
+SUBMISSION_COST = 0.1      # Unconditional booking submission overhead
 EXEC_COST = 0.2             # Conditional execution cost if accepted
 
-SCHEDULERS = ['deterministic','stochastic_log', 'greedy']
-
-
-def load_volcano_locations_from_database() -> list[Location]:
-    """
-    Reads the global GVP Holocene databases, merges the eruption catalogs,
-    and isolates high-priority target positions (VEI > 4, Start Year > 1900).
-    """
-    print("[Data] Reading GVP Volcano and Eruption database files...")
-    volcano_df = pd.read_excel('data/GVP_Volcano_List_Holocene_202606021456.xlsx', header=1)
-    eruption_df = pd.read_excel('data/GVP_Eruption_List_Holocene_20260424.xlsx',
-                                sheet_name="Eruption List", header=1)
-
-    eruptions = eruption_df.merge(volcano_df, on='Volcano Name', how='left')
-
-    filtered_volcanoes = [
-        Location(
-            lon_deg=row['Longitude'],
-            lat_deg=row['Latitude'],
-            alt_km=float(row['Elevation (m)']) / 1e3,
-            name=row['Volcano Name'],
-        )
-        for ix, row in eruptions.iterrows()
-        if row['VEI'] > 4 and row['Start Year'] > 1900
-    ]
-
-    unique_locations = list(set(filtered_volcanoes))
-    print(f"[Data] Loaded {len(unique_locations)} high-VEI target volcanoes into workspace context.")
-    return unique_locations
+SCHEDULERS = ['deterministic', 'stochastic_log', 'greedy']
+#SCHEDULERS = ['stochastic_log','greedy']
 
 
 def load_satellites_once() -> list[Satellite]:
@@ -128,14 +110,15 @@ def load_satellites_once() -> list[Satellite]:
         "SKYSAT-C13": 5.9,
         "PELICAN-1 3001": 8, "PELICAN-2 3009": 8, "PELICAN-3 300A": 8,
         "PELICAN-4 300B": 8, "PELICAN-5 300C": 8, "PELICAN-6 300D": 8,
-        "TANAGER-4001": 18,
+        "TANAGER-1 4001": 18,
         "UMBRA-07": 8, "UMBRA-09": 8, "UMBRA-10": 8, "UMBRA-11": 8,
         "CAPELLA-11 (ACADIA)": 10, "CAPELLA-13 (ACADIA)": 10, "CAPELLA-14 (ACADIA)": 10,
         "CAPELLA-15 (ACADIA)": 10, "CAPELLA-16 (ACADIA)": 10, "CAPELLA-17 (ACADIA)": 10,
-        "LOFT YAM-6": 19.8,
-        "Ubotica CogniSat-6 HAMMER": 20, "Ubotica ACCENTURE-1 SUAC": 20,
+        "YAM-6": 19.8, "YAM-7": 70, "YAM-8": 19.8,
+        "HAMMER": 20, "ACCENTURE-1": 20,
         "Mission Control Persistence": 100,
         "AEROCUBE 18A": 80, "AEROCUBE 18B": 80,
+        "LEMUR": 17.5
     }
 
     flock_names = []
@@ -223,12 +206,21 @@ def load_satellites_once() -> list[Satellite]:
 
 
 def create_world_and_constellations(cached_satellites: list[Satellite],
-                                    demand_field: DemandField = None):
-    """Creates fresh simulation scopes using copied pre-cached orbital models."""
-    #local_satellites = copy.deepcopy(cached_satellites)
+                                     volcano_locations: list[Location] = None,
+                                     demand_field: DemandField = None):
+    """
+    Creates fresh simulation scopes using copied pre-cached orbital models.
+    Registers ground-truth physical Eruption and dynamic Plume phenomena in the world.
+    """
     local_satellites = load_satellites_once()
     world = World(satellites=local_satellites)
     world.time = SIMULATION_START
+
+    # ✅ REGISTER PHYSICAL PHENOMENA FOR OBSERVATION DATA PRODUCTS
+    if volcano_locations is not None:
+        min_time = SIMULATION_START
+        max_time = SIMULATION_START + dt.timedelta(hours=lookahead_horizon_h)
+        register_volcano_phenomena(world, volcano_locations, min_time, max_time)
 
     ground_stations = [
         Location(-79.55, 8.9833, 0.028, "KSAT Panama"),
@@ -286,97 +278,6 @@ def create_world_and_constellations(cached_satellites: list[Satellite],
         world.add_constellation(constellation)
 
     return world, all_constellations
-
-
-def create_volcano_workflow(volcano_locations, min_time, max_time):
-    """Generates detection + follow-up risk chains."""
-    constrained_requests = []
-    timelines = {}
-
-    def success_declarer_eruption(data_product):
-        return len(data_product) > 0
-
-    def rewarder_observation(opportunity: ObservationOpportunity, preferred_zenith_angle_deg=45):
-        static_reward = 50
-        look_angle_reward = abs(90. - opportunity.look_angle_dec_deg) / 90.
-        zenith_angle_reward = abs(preferred_zenith_angle_deg - opportunity.sun_zenith_angle_deg) / 90
-        range_reward = 1 / (opportunity.range_km / 1000)
-        return look_angle_reward + zenith_angle_reward + range_reward + static_reward
-
-    for volcano in volcano_locations:
-        timeline = Timeline(
-            name=volcano.name,
-            initial_time=min_time,
-            initial_value=1.0,
-            initial_rate=-1.0 / (3600 * 24),
-            min_value=-30,
-            max_value=30
-        )
-        timelines[volcano] = timeline
-
-        detection_request = ObservationRequest(
-            lon_deg=volcano.lon_deg, lat_deg=volcano.lat_deg, alt_km=volcano.alt_km,
-            min_time=min_time, max_time=min_time + dt.timedelta(hours=12),
-            instrument=InstrumentType.RGB, request_name=f"{volcano.name}_detection",
-            min_elevation_deg=20.0
-        )
-
-        detection_task = ConstrainedObservationRequest(
-            name=f"{volcano.name}_detection",
-            observation_request=detection_request,
-            is_mandatory=True,
-            timeline_impacts=[
-                TaskTimelineImpact(
-                    timeline=timeline, time=TaskImpactTime.POST,
-                    type=ImpactType.ADDITION, value=1.0
-                )
-            ],
-            rewarder=rewarder_observation,
-            success_declarer=success_declarer_eruption,
-            request_group=volcano.name,
-            max_num_instances=MAX_NUM_INSTANCES
-        )
-        constrained_requests.append(detection_task)
-
-        for follow_up_ix in range(0, lookahead_horizon_h, FOLLOW_UP_INTERVAL_H):
-            follow_up_request = ObservationRequest(
-                lon_deg=volcano.lon_deg, lat_deg=volcano.lat_deg, alt_km=volcano.alt_km,
-                min_time=min_time + dt.timedelta(hours=follow_up_ix), max_time=max_time,
-                instrument=InstrumentType.RGB,
-                request_name=f"{volcano.name}_followup_{follow_up_ix}h",
-                min_elevation_deg=20.0
-            )
-
-            follow_up_task = ConstrainedObservationRequest(
-                name=f"{volcano.name}_followup_{follow_up_ix}h",
-                observation_request=follow_up_request,
-                is_mandatory=False,
-                task_constraints=[
-                    Constraint(
-                        ConstraintClass.TEMPORAL, TemporalConstraintType.START_AFTER_OFFSET,
-                        detection_task, {'offset': dt.timedelta(hours=follow_up_ix)}
-                    ),
-                ],
-                timeline_constraints=[
-                    TaskTimelineConstraint(
-                        timeline=timeline, time=TaskImpactTime.PRE,
-                        type=TimelineConstraintType.GREATER_OR_EQUAL, value=0.1
-                    )
-                ],
-                rewarder=rewarder_observation,
-                success_declarer=success_declarer_eruption,
-                request_group=volcano.name,
-                max_num_instances=MAX_NUM_INSTANCES
-            )
-            constrained_requests.append(follow_up_task)
-
-    workflow = Workflow(
-        constrained_observation_requests=constrained_requests,
-        timelines=list(timelines.values()),
-        timeline_updater=lambda c, r, t: t,
-        request_updater=lambda c, r, t: None
-    )
-    return workflow
 
 
 # ======================= shared run-time helpers ============================
@@ -451,10 +352,6 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
     """
     Build world + workflow + broker for ONE scheduler and ONE seed, run the
     simulation, compute metrics, and write run_seed<seed>_<scheduler>.json.
-
-    Scheduling behaviour is identical to the previous in-process version: the
-    RNG is reset to `seed` first, so every scheduler faces the same draws.
-    Returns the metrics dict (or None on error).
     """
     plots_dir = os.path.join(results_dir, "plots", scheduler)
     os.makedirs(plots_dir, exist_ok=True)
@@ -465,9 +362,16 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
     random.seed(seed)
     np.random.seed(seed)
 
-    world, constellations = create_world_and_constellations(cached_satellites,
-                                                            demand_field=demand_field)
+    # ✅ PASS VOLCANO LOCATIONS TO REGISTER ERUPTIONS & PLUMES IN WORLD
+    world, constellations = create_world_and_constellations(
+        cached_satellites,
+        volcano_locations=volcano_db_locations,
+        demand_field=demand_field
+    )
+    
+    # ✅ CREATE VOLCANO WORKFLOW WITH DUAL BRANCHES AND PLUME RETARGETING
     workflow = create_volcano_workflow(volcano_db_locations, min_time, max_time)
+    
     broker = Broker(constellations=constellations, world=world,
                     name=f"Broker-{scheduler}")
     broker.add_workflow(workflow)
@@ -486,7 +390,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 tax_rate=TAX_RATE,
                 max_solver_time_s=MAX_SOLVER_TIME_S, solver_engine="GUROBI",
                 update_timelines=False, update_requests=False,
-                max_reschedule_depth=1,
+                max_reschedule_depth=100,
                 plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
                 results_path=plots_dir
             )
@@ -495,7 +399,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 current_time=world.time, use_ilp=True, use_stochastic=False,
                 max_solver_time_s=MAX_SOLVER_TIME_S, solver_engine="GUROBI",
                 update_timelines=False, update_requests=False, tax_rate=TAX_RATE,
-                max_reschedule_depth=1,
+                max_reschedule_depth=100,
                 plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
                 results_path=plots_dir,
                 submission_cost_rate=SUBMISSION_COST,
@@ -506,7 +410,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 current_time=world.time, use_ilp=False, use_stochastic=False,
                 max_solver_time_s=MAX_SOLVER_TIME_S,
                 update_timelines=False, update_requests=False, tax_rate=TAX_RATE,
-                max_reschedule_depth=1,
+                max_reschedule_depth=100,
                 plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
                 results_path=plots_dir
             )
@@ -515,7 +419,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
 
         run_simulation_forward(world)
 
-        m = compute_metrics_v2(
+        m = compute_metrics_v3(
             broker._workflow_graph, broker, ObservationStatus,
             submission_cost_rate=SUBMISSION_COST, execution_cost_rate=EXEC_COST,
             verbose=True,
@@ -533,9 +437,6 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
     except Exception as e:
         print(f"    Broker Error ({scheduler}, seed {seed}): {e}")
 
-    # Release everything this run allocated. (In single-run mode the process
-    # exits right after, which is the real guarantee; this helps the legacy
-    # in-process loop.)
     try:
         del broker, workflow, world, constellations
     except Exception:
@@ -563,8 +464,6 @@ def plot_utility(records, schedulers, out_path, baseline='deterministic'):
       (a) mean net utility per scheduler with bootstrap 95% CI
       (b) paired per-seed utility (each line = one seed across schedulers)
       (c) paired utility differences vs baseline, per seed, with mean +/- CI
-    Panels (b) and (c) are the ones that support a claim: they remove the
-    seed-to-seed variance that otherwise swamps the mean in panel (a).
     """
     df = pd.DataFrame(records)
     if df.empty or 'utility' not in df.columns:

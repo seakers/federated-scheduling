@@ -338,7 +338,7 @@ def create_volcano_workflow(volcano_locations, min_time, max_time):
         )
         constrained_requests.append(detection_task)
 
-        for follow_up_ix in range(0, lookahead_horizon_h, FOLLOW_UP_INTERVAL_H):
+        for follow_up_ix in range(FOLLOW_UP_INTERVAL_H, lookahead_horizon_h, FOLLOW_UP_INTERVAL_H):
             follow_up_request = ObservationRequest(
                 lon_deg=volcano.lon_deg, lat_deg=volcano.lat_deg, alt_km=volcano.alt_km,
                 min_time=min_time + dt.timedelta(hours=follow_up_ix), max_time=max_time,
@@ -486,7 +486,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 tax_rate=TAX_RATE,
                 max_solver_time_s=MAX_SOLVER_TIME_S, solver_engine="GUROBI",
                 update_timelines=False, update_requests=False,
-                max_reschedule_depth=1,
+                max_reschedule_depth=100,
                 plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
                 results_path=plots_dir
             )
@@ -495,7 +495,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 current_time=world.time, use_ilp=True, use_stochastic=False,
                 max_solver_time_s=MAX_SOLVER_TIME_S, solver_engine="GUROBI",
                 update_timelines=False, update_requests=False, tax_rate=TAX_RATE,
-                max_reschedule_depth=1,
+                max_reschedule_depth=100,
                 plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
                 results_path=plots_dir,
                 submission_cost_rate=SUBMISSION_COST,
@@ -506,7 +506,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 current_time=world.time, use_ilp=False, use_stochastic=False,
                 max_solver_time_s=MAX_SOLVER_TIME_S,
                 update_timelines=False, update_requests=False, tax_rate=TAX_RATE,
-                max_reschedule_depth=1,
+                max_reschedule_depth=100,
                 plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
                 results_path=plots_dir
             )

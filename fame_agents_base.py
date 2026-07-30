@@ -125,6 +125,8 @@ class World():
 
     def add_satellite(self, satellite):
         self.satellite.append(satellite)
+    def add_phenomenon(self,phenomenon):
+        self.phenomena.append(phenomenon)
 
     def add_constellation(self, constellation):
         self.constellations.append(constellation)

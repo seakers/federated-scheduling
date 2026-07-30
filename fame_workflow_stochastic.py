@@ -34,9 +34,9 @@ class StochasticTimeline(Timeline):
         name: str,
         initial_time: dt.datetime,
         initial_value: float = 1.0,
-        half_life_s: float = 10800.0,  # 3 hours default memory
-        min_value: float = -100.0,
-        max_value: float = 100.0,
+        half_life_s: float = 86400.0,  # 24 hours
+        min_value: float = -30.0,
+        max_value: float = 30.0,
     ):
         decay_rate = -1.0 / half_life_s
         super().__init__(
@@ -51,20 +51,34 @@ class StochasticTimeline(Timeline):
 
     def refresh_if_observed(self, current_time: dt.datetime, requests: list) -> bool:
         """
-        Scans requests for any successful observation within the half-life window.
-        Returns True if state is active (known), False if decayed/unknown.
+        Scans requests for observations matching this timeline's volcano group.
+        Maintains initial active state (True) while detection is pending/in-flight.
         """
-        is_active = False
-        for r in requests:
-            if getattr(r, 'completed', False) and getattr(r, 'successful_execution', False):
-                # Find actual executed pass time (primary or backup)
-                exec_time = getattr(r, 'execution_time', None)
-                if exec_time is None and getattr(r, 'observation_opportunity', None):
-                    exec_time = r.observation_opportunity.time
-                
-                if exec_time and (current_time - exec_time) <= self.half_life:
-                    is_active = True
-                    break
+        volcano_prefix = self.name.replace("_active", "")
+        group_requests = [
+            r for r in requests 
+            if getattr(r, 'request_group', '').startswith(volcano_prefix)
+        ]
+
+        # Check if any observation for this volcano succeeded recently
+        recent_success = any(
+            getattr(r, 'completed', False) and getattr(r, 'successful_execution', False)
+            and (current_time - (getattr(r, 'execution_time', None) or r.observation_opportunity.time)) <= self.half_life
+            for r in group_requests
+            if hasattr(r, 'observation_opportunity') and r.observation_opportunity is not None
+        )
+
+        if recent_success:
+            is_active = True
+        else:
+            # Check if root detection has completed and failed
+            detection_failed = any(
+                getattr(r, 'completed', False) and not getattr(r, 'successful_execution', False)
+                and 'detection' in getattr(r, 'name', '')
+                for r in group_requests
+            )
+            # If detection completed & failed -> inactive. Otherwise keep active while pending.
+            is_active = not detection_failed
 
         new_value = 1.0 if is_active else 0.0
         _, current_rate = self._get_value_and_rate_at(current_time, print_debug=False)
@@ -244,7 +258,7 @@ def _solve_with_gurobi(
             model.setParam('MIPGap', mip_gap)
             model.setParam('FuncNonlinear', 0)
             model.setParam('Cuts', 1) 
-            model.setParam('Threads', 128)                
+            model.setParam('Threads', 10)                
             model.setParam('OutputFlag', 1)
             if results_dir:
                 model.setParam('LogFile', os.path.join(results_dir, "gurobi_stochastic.log"))
@@ -1048,8 +1062,8 @@ def _build_scip_log_linearized_formulation(
 
             # Expected reward
             objective.SetCoefficient(w_abs, quality * theta)
-            # Costs
-            objective.SetCoefficient(x_var, -c_sub - c_canc * theta_acc - c_tax)
+            # Costs: execution cost is conditional on full execution (theta), not just acceptance.
+            objective.SetCoefficient(x_var, -c_sub - c_canc * theta - c_tax)
 
 def _add_scip_workflow_constraints(
         solver,
@@ -1385,9 +1399,9 @@ def _build_non_convex_formulation(
             # Expected Reward
             objective_terms.append(quality * theta * w_abs)
 
-            # Costs
+            # Costs: execution cost conditional on full execution (theta), not just acceptance.
             objective_terms.append(-c_sub * x_var)
-            objective_terms.append(-c_canc * theta_acc * x_var)
+            objective_terms.append(-c_canc * theta * x_var)
             objective_terms.append(-c_tax * x_var)
 
     model.setObjective(gp.quicksum(objective_terms), GRB.MAXIMIZE)
@@ -1826,10 +1840,11 @@ def _build_log_linearized_formulation(
             objective_terms.append(quality * theta * w_abs)
             # Unconditional submission overhead.
             objective_terms.append(-c_sub * x_var)
-            # Execution/cancellation cost, conditional on acceptance.
-            objective_terms.append(-c_canc * theta_acc * x_var)
-            # Legacy per-booking tax (now applied consistently with the
-            # non-convex formulation; previously dead code in this path).
+            # Execution cost, conditional on full execution success (p_acc * p_exec).
+            # The simulator charges this at DATA_RECEIVED, so the correct probability
+            # is theta (end-to-end), not theta_acc (acceptance only).
+            objective_terms.append(-c_canc * theta * x_var)
+            # Legacy per-booking tax.
             if c_tax:
                 objective_terms.append(-c_tax * x_var)
 
