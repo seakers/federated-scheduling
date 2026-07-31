@@ -17,7 +17,7 @@ import gurobipy as gp
 import os
 from astral import sun, Observer
 
-# import random
+import random
 
 
 # # What is a workflow?
@@ -750,6 +750,224 @@ def greedy_schedule_workflow(
     return workflow_graph
 
 
+def random_schedule_workflow(
+        workflow_graph: nx.MultiDiGraph,
+        timeline_graph: nx.MultiDiGraph,
+        satellites: list,
+        feasibility_screener = lambda satellite, observation_pass: True,
+        current_time: dt.datetime=None,
+        verbose: int=0,
+        receding_horizon_duration: dt.timedelta=dt.timedelta(weeks=52),
+        seed: int=None,
+        ):
+    """Random feasible scheduler — picks a uniformly random feasible pass per task.
+    Produces valid (conflict-free, constraint-respecting) solutions with no quality
+    optimisation, suitable as a lower-bound baseline."""
+
+    rng = random.Random(seed)
+
+    if verbose>2:
+        print(f"   [RandomScheduler] WG: {workflow_graph}")
+
+    for node_id in workflow_graph.nodes():
+        if ((node_id.dispatched == False) and (node_id.completed == False)):
+            node_id.scheduled = False
+            node_id.feasible = True
+
+    nodes_to_visit = [node for node, in_degree in workflow_graph.in_degree() if in_degree == 0]
+
+    while len(nodes_to_visit):
+        constrained_request = nodes_to_visit.pop(0)
+
+        for child_request in workflow_graph.successors(constrained_request):
+            if child_request.scheduled == False and child_request not in nodes_to_visit:
+                nodes_to_visit.append(child_request)
+
+        if ((constrained_request.dispatched == True) or (constrained_request.completed == True)):
+            if verbose>1:
+                print(f"   [RandomScheduler] Request {constrained_request} already dispatched/completed, skipping")
+            continue
+        else:
+            if constrained_request in timeline_graph.nodes():
+                for _timeline in timeline_graph.successors(constrained_request):
+                    _timeline.remove_impacts_from_owner(constrained_request)
+
+        _constraints_are_resolvable = True
+        for parent_request in workflow_graph.predecessors(constrained_request):
+            inedges = workflow_graph.get_edge_data(parent_request, constrained_request)
+            for constraint_key, constraint in inedges.items():
+                _constraint_class = constraint['constraint_class']
+                if (
+                    constrained_request.schedule_policy[_constraint_class] == False and
+                    parent_request.completed == False
+                ):
+                    _constraints_are_resolvable = False
+                    break
+        if not _constraints_are_resolvable:
+            if verbose>1:
+                print(f"   [RandomScheduler] Request {constrained_request} has unresolved predecessors; skipping")
+            continue
+
+        min_time = constrained_request.observation_request.min_time
+        max_time = constrained_request.observation_request.max_time
+
+        if current_time is not None:
+            min_time = max(min_time, current_time)
+            max_time = min(max_time, current_time + receding_horizon_duration)
+
+        if (current_time is not None) and (max_time < current_time):
+            constrained_request.scheduled = True
+            constrained_request.feasible = False
+            if verbose>1:
+                print(f"   [RandomScheduler] Request {constrained_request} max time in the past; skipping")
+            continue
+
+        for child_request in workflow_graph.successors(constrained_request):
+            if (child_request.scheduled == True) and (child_request.feasible == True):
+                outedges = workflow_graph.get_edge_data(constrained_request, child_request)
+                for constraint_key, constraint in outedges.items():
+                    match constraint['constraint_class']:
+                        case ConstraintClass.TEMPORAL:
+                            match constraint['constraint_type']:
+                                case TemporalConstraintType.START_AFTER:
+                                    max_time = min(max_time, child_request.observation_opportunity.time)
+                                case TemporalConstraintType.START_AFTER_OFFSET:
+                                    offset = constraint['parameters']['offset']
+                                    max_time = min(max_time, child_request.observation_opportunity.time - offset)
+                                case TemporalConstraintType.START_BEFORE:
+                                    min_time = max(min_time, child_request.observation_opportunity.time)
+                                case TemporalConstraintType.START_BEFORE_OFFSET:
+                                    offset = constraint['parameters']['offset']
+                                    min_time = max(min_time, child_request.observation_opportunity.time - offset)
+                        case ConstraintClass.SUCCESS:
+                            max_time = min(max_time, child_request.observation_opportunity.time)
+                        case ConstraintClass.GEOMETRY:
+                            max_time = min(max_time, child_request.observation_opportunity.time)
+
+        for parent_request in workflow_graph.predecessors(constrained_request):
+            if (parent_request.scheduled == True) and (parent_request.feasible == True):
+                inedges = workflow_graph.get_edge_data(parent_request, constrained_request)
+                for constraint_key, constraint in inedges.items():
+                    match constraint['constraint_class']:
+                        case ConstraintClass.TEMPORAL:
+                            match constraint['constraint_type']:
+                                case TemporalConstraintType.START_AFTER:
+                                    min_time = max(min_time, parent_request.observation_opportunity.time)
+                                case TemporalConstraintType.START_AFTER_OFFSET:
+                                    offset = constraint['parameters']['offset']
+                                    min_time = max(min_time, parent_request.observation_opportunity.time + offset)
+                                case TemporalConstraintType.START_BEFORE:
+                                    max_time = min(max_time, parent_request.observation_opportunity.time)
+                                case TemporalConstraintType.START_BEFORE_OFFSET:
+                                    offset = constraint['parameters']['offset']
+                                    max_time = min(max_time, parent_request.observation_opportunity.time + offset)
+                        case ConstraintClass.SUCCESS:
+                            min_time = max(min_time, parent_request.observation_opportunity.time)
+                            if parent_request.completed is True:
+                                if (
+                                    (constraint['constraint_type'] == SuccessConstraintType.START_IF_FAILED and
+                                     parent_request.successful_execution == True) or
+                                    (constraint['constraint_type'] == SuccessConstraintType.START_IF_SUCCESSFUL and
+                                     parent_request.successful_execution == False)
+                                ):
+                                    constrained_request.scheduled = True
+                                    constrained_request.feasible = False
+                                    break
+                        case ConstraintClass.GEOMETRY:
+                            min_time = max(min_time, parent_request.observation_opportunity.time)
+
+        if constrained_request.feasible == False:
+            if verbose>1:
+                print(f"   [RandomScheduler] Request {constrained_request} is infeasible")
+            continue
+
+        trimmed_request = ObservationRequest(
+            lon_deg=constrained_request.observation_request.lon_deg,
+            lat_deg=constrained_request.observation_request.lat_deg,
+            min_time=min_time,
+            max_time=max_time,
+            alt_km=constrained_request.observation_request.alt_km,
+            instrument=constrained_request.observation_request.instrument,
+            request_name=constrained_request.observation_request.name + "_trimmed",
+            min_elevation_deg=constrained_request.observation_request.min_elevation_deg,
+        )
+        observation_opportunities = find_observation_opportunities([trimmed_request,], satellites)
+        constrained_request.observation_opportunities = observation_opportunities[trimmed_request]
+
+        if trimmed_request not in observation_opportunities.keys():
+            raise ValueError("Could not schedule {}".format(constrained_request))
+        passes = observation_opportunities[trimmed_request]
+
+        if len(passes) == 0:
+            constrained_request.scheduled = True
+            constrained_request.feasible = False
+            if verbose>0:
+                print(f"   [RandomScheduler] Could not schedule {constrained_request} (no passes)")
+            continue
+
+        # Collect all feasible (satellite, pass) pairs then pick one at random
+        allsatpasses = [
+            (satellite, satpass)
+            for satellite, satpasses in passes.items()
+            for satpass in satpasses
+        ]
+        rng.shuffle(allsatpasses)
+
+        chosen_satellite = None
+        chosen_pass = None
+        for (satellite, satpass) in allsatpasses:
+            if not feasibility_screener(satellite, satpass):
+                continue
+            there_is_overlap = False
+            for existing_request in workflow_graph:
+                if (existing_request.scheduled == True and
+                        existing_request.feasible == True and
+                        existing_request.observation_opportunity is not None):
+                    if (
+                        existing_request.observation_opportunity.satellite == satellite and
+                        existing_request.observation_opportunity.time <= satpass.highest.time + satpass.highest.duration and
+                        existing_request.observation_opportunity.time + existing_request.observation_opportunity.duration > satpass.highest.time
+                    ):
+                        there_is_overlap = True
+                        break
+            if not there_is_overlap:
+                chosen_satellite = satellite
+                chosen_pass = satpass
+                break
+
+        if chosen_pass is None:
+            constrained_request.scheduled = True
+            constrained_request.feasible = False
+            if verbose>0:
+                print(f"   [RandomScheduler] Could not schedule {constrained_request} (all conflicts)")
+            continue
+
+        constrained_request.observation_opportunity_pass = chosen_pass
+        constrained_request.observation_opportunity = chosen_pass.highest
+        constrained_request.observation_opportunity_satellite = chosen_satellite
+        constrained_request.scheduled = True
+
+        if constrained_request in timeline_graph.nodes():
+            for _timeline in timeline_graph.successors(constrained_request):
+                tl_edges = timeline_graph.get_edge_data(constrained_request, _timeline)
+                for impact_key, impact in tl_edges.items():
+                    if impact['edge_type'] == TaskTimelineImpact:
+                        _time = chosen_pass.highest.time
+                        if impact['impact_time'] == TaskImpactTime.POST:
+                            _time = chosen_pass.highest.time + chosen_pass.highest.duration
+                        tl_impact = Impact(
+                            time=_time,
+                            type=impact['impact_type'],
+                            value=impact['impact_value'],
+                            owner=constrained_request,
+                        )
+                        _timeline.add_impact(impact=tl_impact)
+
+        if verbose>0:
+            print(f"   [RandomScheduler] Scheduled {constrained_request} on {chosen_satellite} at {chosen_pass.highest}")
+
+    return workflow_graph
+
 
 def ilp_schedule_workflow(
         workflow_graph: nx.MultiDiGraph,
@@ -941,7 +1159,8 @@ def ilp_schedule_workflow(
                 print("   [Scheduler] Could not schedule {} (all conflicts)".format(constrained_request))
 
         # At most max_num_instances observation per request are assigned
-        solver.Add(sum([solution_holder[constrained_request][_satellite][_satpass] for _satellite, _satpasses in solution_holder[constrained_request].items() for _satpass in _satpasses.keys()]) <= constrained_request.max_num_instances)
+        # solver.Add(sum([solution_holder[constrained_request][_satellite][_satpass] for _satellite, _satpasses in solution_holder[constrained_request].items() for _satpass in _satpasses.keys()]) <= constrained_request.max_num_instances)
+        solver.Add(sum([solution_holder[constrained_request][_satellite][_satpass] for _satellite, _satpasses in solution_holder[constrained_request].items() for _satpass in _satpasses.keys()]) <= 1) #We hardcoded to 1 because otherwise ILP just books everything
 
         if verbose>3:
             print(f"   [Scheduler] This request has {len(list(workflow_graph.predecessors(constrained_request)))} parents: {list(workflow_graph.predecessors(constrained_request))}")

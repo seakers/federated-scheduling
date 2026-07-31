@@ -88,7 +88,7 @@ TAX_RATE = 0.0              # Legacy per-booking tax (disabled)
 SUBMISSION_COST = 0.1      # Unconditional booking submission overhead
 EXEC_COST = 0.2             # Conditional execution cost if accepted
 
-SCHEDULERS = ['deterministic', 'stochastic_log', 'greedy']
+SCHEDULERS = ['deterministic', 'stochastic_log', 'greedy', 'random']
 #SCHEDULERS = ['stochastic_log','greedy']
 
 
@@ -390,7 +390,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 tax_rate=TAX_RATE,
                 max_solver_time_s=MAX_SOLVER_TIME_S, solver_engine="GUROBI",
                 update_timelines=False, update_requests=False,
-                max_reschedule_depth=100,
+                max_reschedule_depth=10000,
                 plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
                 results_path=plots_dir
             )
@@ -399,7 +399,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 current_time=world.time, use_ilp=True, use_stochastic=False,
                 max_solver_time_s=MAX_SOLVER_TIME_S, solver_engine="GUROBI",
                 update_timelines=False, update_requests=False, tax_rate=TAX_RATE,
-                max_reschedule_depth=100,
+                max_reschedule_depth=10000,
                 plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
                 results_path=plots_dir,
                 submission_cost_rate=SUBMISSION_COST,
@@ -410,9 +410,22 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 current_time=world.time, use_ilp=False, use_stochastic=False,
                 max_solver_time_s=MAX_SOLVER_TIME_S,
                 update_timelines=False, update_requests=False, tax_rate=TAX_RATE,
-                max_reschedule_depth=100,
+                max_reschedule_depth=10000,
                 plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
                 results_path=plots_dir
+            )
+        elif scheduler == 'random':
+            broker.schedule_workflow_redundant(
+                current_time=world.time, use_ilp=False, use_stochastic=False,
+                max_solver_time_s=MAX_SOLVER_TIME_S,
+                update_timelines=False, update_requests=False, tax_rate=TAX_RATE,
+                submission_cost_rate=SUBMISSION_COST,
+                execution_cost_rate=EXEC_COST,
+                max_reschedule_depth=10000,
+                plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
+                results_path=plots_dir,
+                use_random=True,
+                random_seed=seed,
             )
         else:
             raise ValueError(f"Unknown scheduler: {scheduler}")

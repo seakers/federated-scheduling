@@ -813,7 +813,7 @@ def _constellation_name_from_satellite(sat_name: str) -> str:
     Returns the constellation name used in DemandFieldConfig.constellation_popularity.
     """
     u = sat_name.upper()
-    if any(x in u for x in ["SKYSAT", "PELICAN", "TANAGER"]):
+    if any(x in u for x in ["SKYSAT", "PELICAN", "TANAGER", "FLOCK"]):
         return "Planet"
     if "UMBRA" in u:
         return "Umbra"

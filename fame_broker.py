@@ -353,7 +353,9 @@ class Broker():
             submission_cost_rate: float = 0.0,  # c_sub: unconditional per-booking submission overhead
             cancellation_cost_rate: float = 0.0,  # c_canc: conditional cancellation cost if accepted
             max_reschedule_depth: int = 10,  # Maximum recursive rescheduling depth to prevent infinite loops
-            results_path: str = ""
+            results_path: str = "",
+            use_random: bool = False,  # Use random scheduler as lower-bound baseline
+            random_seed: int = None,
     ):
         # Prevent infinite rescheduling loops (rejection/timeout triggering more rescheduling)
         if self._reschedule_depth >= max_reschedule_depth:
@@ -411,15 +413,26 @@ class Broker():
                     tax_rate=tax_rate
                     )
         else:
-            _ = greedy_schedule_workflow(
-                workflow_graph=self._workflow_graph,
-                timeline_graph=self._timeline_graph,
-                satellites=self._known_satellites,
-                feasibility_screener=self._screen_pass_for_feasibility,
-                current_time=current_time,
-                verbose=1,
+            if use_random:
+                _ = random_schedule_workflow(
+                    workflow_graph=self._workflow_graph,
+                    timeline_graph=self._timeline_graph,
+                    satellites=self._known_satellites,
+                    feasibility_screener=self._screen_pass_for_feasibility,
+                    current_time=current_time,
+                    verbose=1,
+                    seed=random_seed,
                 )
-                
+            else:
+                _ = greedy_schedule_workflow(
+                    workflow_graph=self._workflow_graph,
+                    timeline_graph=self._timeline_graph,
+                    satellites=self._known_satellites,
+                    feasibility_screener=self._screen_pass_for_feasibility,
+                    current_time=current_time,
+                    verbose=1,
+                )
+
         self._workflow_schedule_epoch += 1
 
         if plot_schedule:
@@ -556,7 +569,9 @@ class Broker():
                         tax_rate=tax_rate,
                         submission_cost_rate=submission_cost_rate,
                         cancellation_cost_rate=cancellation_cost_rate,
-                        results_path=results_path
+                        results_path=results_path,
+                        use_random=use_random,
+                        random_seed=random_seed,
                     )
                     self._reschedule_depth -= 1
                     return
@@ -605,7 +620,9 @@ class Broker():
                             tax_rate=tax_rate,
                             submission_cost_rate=submission_cost_rate,
                             cancellation_cost_rate=cancellation_cost_rate,
-                            results_path=results_path
+                            results_path=results_path,
+                            use_random=use_random,
+                            random_seed=random_seed,
                         )
                         self._reschedule_depth -= 1
                     return
@@ -661,7 +678,9 @@ class Broker():
                         tax_rate=tax_rate,
                         submission_cost_rate=submission_cost_rate,
                         cancellation_cost_rate=cancellation_cost_rate,
-                        results_path=results_path
+                        results_path=results_path,
+                        use_random=use_random,
+                        random_seed=random_seed,
                     )
                     return
 
@@ -756,7 +775,9 @@ class Broker():
                 submission_cost_rate: float = 0.0,
                 cancellation_cost_rate: float = 0.0,
                 max_reschedule_depth: int = 10,
-                results_path: str = ""
+                results_path: str = "",
+                use_random: bool = False,
+                random_seed: int = None,
         ):
             """
             Full redundant workflow scheduling and dispatching method for Broker.
@@ -822,14 +843,25 @@ class Broker():
                         execution_cost_rate=execution_cost_rate
                     )
             else:
-                _ = greedy_schedule_workflow(
-                    workflow_graph=self._workflow_graph,
-                    timeline_graph=self._timeline_graph,
-                    satellites=self._known_satellites,
-                    feasibility_screener=self._screen_pass_for_feasibility,
-                    current_time=current_time,
-                    verbose=1,
-                )
+                if use_random:
+                    _ = random_schedule_workflow(
+                        workflow_graph=self._workflow_graph,
+                        timeline_graph=self._timeline_graph,
+                        satellites=self._known_satellites,
+                        feasibility_screener=self._screen_pass_for_feasibility,
+                        current_time=current_time,
+                        verbose=1,
+                        seed=random_seed,
+                    )
+                else:
+                    _ = greedy_schedule_workflow(
+                        workflow_graph=self._workflow_graph,
+                        timeline_graph=self._timeline_graph,
+                        satellites=self._known_satellites,
+                        feasibility_screener=self._screen_pass_for_feasibility,
+                        current_time=current_time,
+                        verbose=1,
+                    )
 
             self._workflow_schedule_epoch += 1
 
@@ -943,7 +975,9 @@ class Broker():
                             tax_rate=tax_rate,
                             submission_cost_rate=submission_cost_rate,
                             cancellation_cost_rate=cancellation_cost_rate,
-                            results_path=results_path
+                            results_path=results_path,
+                            use_random=use_random,
+                            random_seed=random_seed,
                         )
                         self._reschedule_depth -= 1
                         return
@@ -990,7 +1024,9 @@ class Broker():
                                 tax_rate=tax_rate,
                                 submission_cost_rate=submission_cost_rate,
                                 cancellation_cost_rate=cancellation_cost_rate,
-                                results_path=results_path
+                                results_path=results_path,
+                                use_random=use_random,
+                                random_seed=random_seed,
                             )
                             self._reschedule_depth -= 1
                         return
@@ -1044,7 +1080,9 @@ class Broker():
                             tax_rate=tax_rate,
                             submission_cost_rate=submission_cost_rate,
                             cancellation_cost_rate=cancellation_cost_rate,
-                            results_path=results_path
+                            results_path=results_path,
+                            use_random=use_random,
+                            random_seed=random_seed,
                         )
                         return
 
