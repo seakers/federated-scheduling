@@ -91,6 +91,11 @@ EXEC_COST = 0.2             # Conditional execution cost if accepted
 SCHEDULERS = ['deterministic', 'stochastic_log', 'greedy', 'random']
 #SCHEDULERS = ['stochastic_log','greedy']
 
+# Set to True to cancel inferior pending passes once a better/sufficient one succeeds.
+# Only applies to stochastic_log (redundant scheduling). Saves execution cost at the
+# price of reduced quality diversity. Has no effect on greedy/deterministic/random.
+ENABLE_CANCELLATIONS = False
+
 
 def load_satellites_once() -> list[Satellite]:
     """Dynamically loads all LEO satellites from TLE files using notebook approach."""
@@ -392,7 +397,8 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 update_timelines=False, update_requests=False,
                 max_reschedule_depth=10000,
                 plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
-                results_path=plots_dir
+                results_path=plots_dir,
+                enable_cancellations=ENABLE_CANCELLATIONS,
             )
         elif scheduler == 'deterministic':
             broker.schedule_workflow_redundant(

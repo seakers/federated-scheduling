@@ -491,33 +491,128 @@ class ConstellationGroundScheduler():
             callback_request_scheduled(_best_pass.highest)
         return 0
 
+    def cancel_request(
+            self,
+            request: ObservationRequest,
+            target_satellite,
+            target_pass,
+            current_time: dt.datetime,
+    ) -> bool:
+        """
+        Attempt to cancel a specific (request, satellite, pass) booking.
+
+        Cancellation is feasible only if the pass has not yet started AND either:
+          - The satellite has continuous ISL (can always be commanded), OR
+          - The uplink command window has not yet fired (uplink.highest.time > current_time).
+
+        On success: removes ObservationEvent + uplink CommunicationEvent from world.events,
+        releases satellite busy-timeline slots, marks status CANCELLED, returns True.
+        On failure: no state change, returns False.
+        """
+        if target_pass.highest.time <= current_time:
+            print(f"   [{self.name}] Cannot cancel {request.name} on {target_satellite.name}: "
+                  f"pass at {target_pass.highest.time} already started/past.")
+            return False
+
+        mask = self._requests['request'] == request
+        sat_match = self._requests['satellite'] == target_satellite
+        matching = self._requests[mask & sat_match]
+        if len(matching) == 0:
+            return False
+
+        row = matching.iloc[0]
+        uplink = row['uplink']
+        downlink = row['downlink']
+        status = row['status']
+
+        if status != ObservationStatus.SCHEDULED:
+            return False
+
+        # Feasibility check: can we still send the cancel command?
+        if target_satellite.has_continuous_isl_to_ground or uplink == "ISL":
+            cancellable = True
+        elif uplink is None:
+            cancellable = False
+        else:
+            uplink_cmd_time = uplink.highest.time if hasattr(uplink, 'highest') else uplink.rise.time
+            cancellable = uplink_cmd_time > current_time
+
+        if not cancellable:
+            print(f"   [{self.name}] Cannot cancel {request.name} on {target_satellite.name}: "
+                  f"uplink already sent.")
+            return False
+
+        print(f"   [{self.name}] CANCELLING {request.name} on {target_satellite.name} "
+              f"(pass at {target_pass.highest.time})")
+
+        # Remove ObservationEvent and its uplink CommunicationEvent from world.events
+        events_to_remove = []
+        for ev in self.world.events:
+            if isinstance(ev, ObservationEvent):
+                if ev.satellite == target_satellite and ev.opportunity is target_pass.highest:
+                    events_to_remove.append(ev)
+            elif isinstance(ev, CommunicationEvent):
+                if ev.satellite == target_satellite and uplink not in (None, "ISL"):
+                    ev_comm = getattr(ev, 'comm_pass', None)
+                    if ev_comm is not None and ev_comm is not None:
+                        if hasattr(ev_comm, 'highest') and hasattr(uplink, 'highest'):
+                            if ev_comm.highest.time == uplink.highest.time:
+                                events_to_remove.append(ev)
+        for ev in events_to_remove:
+            try:
+                self.world.events.remove(ev)
+            except ValueError:
+                pass
+
+        # Remove from satellite.scheduled_observations
+        target_satellite.scheduled_observations = [
+            o for o in target_satellite.scheduled_observations
+            if o is not target_pass.highest
+        ]
+
+        # Release obs busy-timeline
+        tl_obs = self._satellite_busy_timelines_obs.get(target_satellite)
+        if tl_obs is not None:
+            obs_start = target_pass.highest.time
+            obs_end = target_pass.highest.time + target_pass.highest.duration
+            tl_obs.impact_container = [
+                imp for imp in tl_obs.impact_container
+                if imp.time != obs_start and imp.time != obs_end
+            ]
+
+        # Release comm busy-timeline (uplink + downlink)
+        tl_comm = self._satellite_busy_timelines_comm.get(target_satellite)
+        if tl_comm is not None:
+            times_to_free = set()
+            if uplink not in (None, "ISL"):
+                if hasattr(uplink, 'rise'):
+                    times_to_free.add(uplink.rise.time)
+                    times_to_free.add(uplink.fall.time)
+            if downlink not in (None, "ISL"):
+                if hasattr(downlink, 'rise'):
+                    times_to_free.add(downlink.rise.time)
+                    times_to_free.add(downlink.fall.time)
+            if times_to_free:
+                tl_comm.impact_container = [
+                    imp for imp in tl_comm.impact_container
+                    if imp.time not in times_to_free
+                ]
+
+        self._requests.loc[mask & sat_match, 'status'] = ObservationStatus.CANCELLED
+        return True
+
     def unschedule_request(
             self,
             request: ObservationRequest,
             current_time: dt.datetime=dt.datetime.now(dt.timezone.utc).replace(tzinfo=None),
             callback_opportunity_unscheduled=lambda status: None,
     ):
-        # We unschedule all opportunities for a given observation request.
-
-        # Check that the request is indeed something in our list
+        # Legacy stub — use cancel_request() for targeted cancellation.
         matching_observations = self._requests[self._requests['request']==request]
         if len(matching_observations) == 0:
             print("[{}]: no matching observations for unschedule request {}".format(self.name, request))
             return None
-
-        raise NotImplemented("TODO")
-
-        # for obs in matching_observations.iterrows:
-        #     if obs['status'] == "Scheduled"
-
-        # For every matching request
-        # Find the observation
-        # Find the uplink for that observation
-        # If the uplink has not yet elapsed, remove that event.
-        # Optional: If the uplink has already gone out
-        # Optional: See if there is a pass between the current time and the observation
-        # Optional: If there is no pass, too bad.
-        # Optional: If there is a pass, schedule a new uplink to cancel that observation.
+        raise NotImplementedError("Use cancel_request() for targeted cancellation.")
 
     def schedule_downlinks(
         self,

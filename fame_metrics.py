@@ -17,6 +17,7 @@ def _status_names(ObservationStatus):
         'rejected': getattr(ObservationStatus, 'CONSTELLATION_REJECTED', None) or getattr(ObservationStatus, 'REJECTED', None),
         'scheduled': ObservationStatus.SCHEDULED,
         'received': ObservationStatus.DATA_RECEIVED,
+        'cancelled': getattr(ObservationStatus, 'CANCELLED', None),
     }
 
 
@@ -44,6 +45,7 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
     n_accepted = 0
     n_executed = 0
     n_rejected = 0
+    n_cancelled = 0
 
     total_submission_cost = 0.0
     total_execution_cost = 0.0
@@ -72,6 +74,9 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
 
         if status == S['rejected']:
             n_rejected += 1
+        if S['cancelled'] is not None and status == S['cancelled']:
+            n_cancelled += 1
+            # Submission cost already counted above; no execution cost for cancelled passes
         if status in (S['scheduled'], S['received']):
             n_accepted += 1
         if status == S['received']:
@@ -182,6 +187,7 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
         'n_accepted': n_accepted,
         'n_executed': n_executed,
         'n_rejected': n_rejected,
+        'n_cancelled': n_cancelled,
 
         # ---- REDUNDANCY & EFFICIENCY ----
         'submitted_passes_per_task': submitted_passes_per_task,
@@ -201,7 +207,8 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
               f"(sub {total_submission_cost:.1f} + exec {total_execution_cost:.1f}), "
               f"utility {utility:.1f}")
         print(f"   [Metrics] Bookings: {n_submissions} submitted, {n_accepted} accepted, "
-              f"{n_executed} executed, {n_rejected} rejected ({100*rejection_rate:.0f}% rej)")
+              f"{n_executed} executed, {n_rejected} rejected ({100*rejection_rate:.0f}% rej), "
+              f"{n_cancelled} cancelled")
         print(f"   [Metrics] TRUE passes/task: {submitted_passes_per_task:.2f} submitted, "
               f"{exec_passes_per_completed:.2f} executed among completed")
 

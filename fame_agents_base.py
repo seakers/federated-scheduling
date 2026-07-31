@@ -28,6 +28,7 @@ class ObservationStatus(Enum):
     DATA_RECEIVED=6
     TIMEOUT = 7
     CONSTELLATION_REJECTED = 8  # Constellation manager rejected broker request
+    CANCELLED = 9               # Broker cancelled pass after a better/sufficient pass succeeded
 
 requests_data_frame_columns = ['request', 'satellite', 'observation', 'uplink', 'downlink', 'status', 'data_product', 'scheduled_callback', 'unscheduled_callback', 'ready_callback']
 

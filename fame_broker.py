@@ -147,6 +147,69 @@ class Broker():
         # return True
 
 
+    def _try_cancel_inferior_passes(
+        self,
+        dispatchable_task,
+        winning_pass,
+        current_time: dt.datetime,
+    ) -> int:
+        """
+        After a pass succeeds for `dispatchable_task`, cancel all other SCHEDULED
+        passes for the same task whose quality is <= the winning pass quality AND
+        whose observation has not yet started (cancellation window still open).
+
+        Returns the number of passes successfully cancelled.
+        """
+        winning_quality = dispatchable_task.rewarder(winning_pass.highest)
+
+        # All submitted/scheduled rows for this task that are NOT DATA_RECEIVED
+        task_rows = self._requests.loc[
+            (self._requests['request'] == dispatchable_task.observation_request) &
+            (self._requests['status'] == ObservationStatus.SCHEDULED)
+        ]
+
+        n_cancelled = 0
+        for idx, row in task_rows.iterrows():
+            candidate_pass = row['requested_pass']
+            candidate_sat  = row['requested_satellite']
+            constellation  = row['requested_constellation']
+
+            if candidate_pass is None or candidate_sat is None or constellation is None:
+                continue
+
+            candidate_quality = dispatchable_task.rewarder(candidate_pass.highest)
+
+            # Only cancel if quality is NOT strictly better than the winner
+            if candidate_quality > winning_quality:
+                continue
+
+            if not hasattr(constellation, 'cancel_request'):
+                continue
+
+            success = constellation.cancel_request(
+                request=row['request'],
+                target_satellite=candidate_sat,
+                target_pass=candidate_pass,
+                current_time=current_time,
+            )
+            if success:
+                self._requests.loc[idx, 'status'] = ObservationStatus.CANCELLED
+                # Release broker-side satellite busy timeline
+                tl = self._satellite_busy_timelines.get(candidate_sat)
+                if tl is not None:
+                    obs_start = candidate_pass.highest.time
+                    obs_end   = candidate_pass.highest.time + candidate_pass.highest.duration
+                    tl.impact_container = [
+                        imp for imp in tl.impact_container
+                        if imp.time != obs_start and imp.time != obs_end
+                    ]
+                n_cancelled += 1
+                print(f" [{self.name}] Cancelled inferior pass for {dispatchable_task.name} "
+                      f"on {candidate_sat.name} (quality {candidate_quality:.2f} <= "
+                      f"winner {winning_quality:.2f})")
+
+        return n_cancelled
+
     # Broadly, look at the ephemerides, find the best option, find the corresponding constellation, give them a window around that.
     def schedule_request(
             self,
@@ -778,6 +841,7 @@ class Broker():
                 results_path: str = "",
                 use_random: bool = False,
                 random_seed: int = None,
+                enable_cancellations: bool = False,
         ):
             """
             Full redundant workflow scheduling and dispatching method for Broker.
@@ -978,6 +1042,7 @@ class Broker():
                             results_path=results_path,
                             use_random=use_random,
                             random_seed=random_seed,
+                            enable_cancellations=enable_cancellations,
                         )
                         self._reschedule_depth -= 1
                         return
@@ -1027,6 +1092,7 @@ class Broker():
                                 results_path=results_path,
                                 use_random=use_random,
                                 random_seed=random_seed,
+                                enable_cancellations=enable_cancellations,
                             )
                             self._reschedule_depth -= 1
                         return
@@ -1048,6 +1114,14 @@ class Broker():
                         _dispatchable_task.completed = True
                         _dispatchable_task.data_product = data_product
                         _dispatchable_task.successful_execution = _dispatchable_task.success_declarer(data_product)
+
+                        # --- Cancellation of inferior pending passes ---
+                        if enable_cancellations:
+                            self._try_cancel_inferior_passes(
+                                dispatchable_task=_dispatchable_task,
+                                winning_pass=__best_pass,
+                                current_time=self.world.time,
+                            )
 
                         try:
                             for child_task_id in self._workflow_graph.successors(_dispatchable_task):
@@ -1083,6 +1157,7 @@ class Broker():
                             results_path=results_path,
                             use_random=use_random,
                             random_seed=random_seed,
+                            enable_cancellations=enable_cancellations,
                         )
                         return
 
