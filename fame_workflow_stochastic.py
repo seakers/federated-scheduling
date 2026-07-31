@@ -1837,13 +1837,13 @@ def _build_log_linearized_formulation(
             w_abs = effective_pass_realization[(constrained_request, satellite, satpass)]
 
             # Expected best-success quality credit for this pass.
-            objective_terms.append(quality * theta * w_abs)
+            objective_terms.append(quality * theta_acc * w_abs) #For now just consider the acceptance probability because execution failure is yet not implemented in the simulation
             # Unconditional submission overhead.
             objective_terms.append(-c_sub * x_var)
             # Execution cost, conditional on full execution success (p_acc * p_exec).
             # The simulator charges this at DATA_RECEIVED, so the correct probability
             # is theta (end-to-end), not theta_acc (acceptance only).
-            objective_terms.append(-c_canc * theta * x_var)
+            objective_terms.append(-c_canc * theta_acc * x_var)
             # Legacy per-booking tax.
             if c_tax:
                 objective_terms.append(-c_tax * x_var)

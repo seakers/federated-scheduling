@@ -77,24 +77,24 @@ from fame_metrics import compute_metrics_v3, paired_summary, plot_cost_frontier
 # it, so all processes in a campaign share identical orbital geometry.
 SIMULATION_START = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 
-lookahead_horizon_h = 9
+lookahead_horizon_h = 18
 FOLLOW_UP_INTERVAL_H = 3
 MAX_SOLVER_TIME_S = 70
 MAX_NUM_INSTANCES = 5
-NUM_MC_RUNS = 1
+NUM_MC_RUNS = 5
 
 # === COST CONFIGURATION ===
 TAX_RATE = 0.0              # Legacy per-booking tax (disabled)
-SUBMISSION_COST = 0.1      # Unconditional booking submission overhead
+SUBMISSION_COST = 0.05      # Unconditional booking submission overhead
 EXEC_COST = 0.2             # Conditional execution cost if accepted
 
-SCHEDULERS = ['deterministic', 'stochastic_log', 'greedy', 'random']
+SCHEDULERS = ['stochastic_log', 'deterministic', 'greedy', 'random']
 #SCHEDULERS = ['stochastic_log','greedy']
 
 # Set to True to cancel inferior pending passes once a better/sufficient one succeeds.
 # Only applies to stochastic_log (redundant scheduling). Saves execution cost at the
 # price of reduced quality diversity. Has no effect on greedy/deterministic/random.
-ENABLE_CANCELLATIONS = False
+ENABLE_CANCELLATIONS = True
 
 
 def load_satellites_once() -> list[Satellite]:
@@ -123,7 +123,7 @@ def load_satellites_once() -> list[Satellite]:
         "HAMMER": 20, "ACCENTURE-1": 20,
         "Mission Control Persistence": 100,
         "AEROCUBE 18A": 80, "AEROCUBE 18B": 80,
-        "LEMUR": 17.5
+        "LEMUR 2 KRISH": 17.5
     }
 
     flock_names = []

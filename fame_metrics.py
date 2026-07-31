@@ -192,7 +192,7 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
         # ---- REDUNDANCY & EFFICIENCY ----
         'submitted_passes_per_task': submitted_passes_per_task,
         'exec_passes_per_completed': exec_passes_per_completed,
-        'replans': n_rejected,
+        'replans': getattr(broker, '_n_replans', 0),
         'completions_per_cost': completions_per_cost,
         'acceptance_rate': acceptance_rate,
         'rejection_rate': rejection_rate,
@@ -208,7 +208,7 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
               f"utility {utility:.1f}")
         print(f"   [Metrics] Bookings: {n_submissions} submitted, {n_accepted} accepted, "
               f"{n_executed} executed, {n_rejected} rejected ({100*rejection_rate:.0f}% rej), "
-              f"{n_cancelled} cancelled")
+              f"{n_cancelled} cancelled, {getattr(broker, '_n_replans', 0)} replans")
         print(f"   [Metrics] TRUE passes/task: {submitted_passes_per_task:.2f} submitted, "
               f"{exec_passes_per_completed:.2f} executed among completed")
 

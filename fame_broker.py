@@ -73,7 +73,7 @@ class Broker():
         self.constellations = constellations
         # self.known_satellites = known_satellites
         self.world = world
-        self._requests = pd.DataFrame(columns=['request', 'requested_pass', 'requested_constellation', 'requested_satellite', 'constellation', 'satellite', 'assigned_pass', 'assigned_downlink', 'status', 'data_product', 'scheduled_callback', 'unscheduled_callback', 'ready_callback'])
+        self._requests = pd.DataFrame(columns=['request', 'constellation_request', 'requested_pass', 'requested_constellation', 'requested_satellite', 'constellation', 'satellite', 'assigned_pass', 'assigned_downlink', 'status', 'data_product', 'scheduled_callback', 'unscheduled_callback', 'ready_callback'])
         
 
         _known_satellites = []
@@ -173,8 +173,9 @@ class Broker():
             candidate_pass = row['requested_pass']
             candidate_sat  = row['requested_satellite']
             constellation  = row['requested_constellation']
+            constellation_req = row['constellation_request']
 
-            if candidate_pass is None or candidate_sat is None or constellation is None:
+            if candidate_pass is None or candidate_sat is None or constellation is None or constellation_req is None:
                 continue
 
             candidate_quality = dispatchable_task.rewarder(candidate_pass.highest)
@@ -187,7 +188,7 @@ class Broker():
                 continue
 
             success = constellation.cancel_request(
-                request=row['request'],
+                request=constellation_req,
                 target_satellite=candidate_sat,
                 target_pass=candidate_pass,
                 current_time=current_time,
@@ -248,6 +249,7 @@ class Broker():
             # self.requests[request]['status'] = "No observation opportunities";
             _request_dict = {
                 'request': request,
+                'constellation_request': None,
                 'requested_pass' : None,
                 'requested_constellation' : None,
                 'requested_satellite' : None,
@@ -317,7 +319,7 @@ class Broker():
                     print(" [{}: ] data ready for request {}, pass {}, from {}".format(self.name, _request, __best_pass, __best_constellation.name))
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = ObservationStatus.DATA_RECEIVED
                     for _ix, __dp in self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'data_product'].items():
-                        self._requests.loc[_ix, 'data_product'] = data_product
+                        self._requests.at[_ix, 'data_product'] = data_product
                     follow_up_action_success(data_product)
                     # TODO Attempt to cancel other requests for this observation
                     return
@@ -335,6 +337,7 @@ class Broker():
 
                 _request_dict = {
                     'request': request,
+                    'constellation_request': _constellation_request,
                     'requested_pass' : _best_pass,
                     'requested_constellation' : _best_constellation,
                     'requested_satellite' :_best_satellite,
@@ -368,6 +371,7 @@ class Broker():
             # self.requests[request]['status'] = "No observation opportunities";
             _request_dict = {
                 'request': request,
+                'constellation_request': None,
                 'requested_pass' : None,
                 'requested_constellation' : None,
                 'requested_satellite' : None,
@@ -389,6 +393,7 @@ class Broker():
         self._workflow_graph, self._timeline_graph = build_workflow_graph(self.workflow)
         self._workflow_schedule_epoch = 0 # We use this to keep track of whether we rescheduled during dispatch
         self._reschedule_depth = 0  # Track recursive rescheduling to prevent infinite loops
+        self._n_replans = 0         # Cumulative count of replan triggers
 
     def schedule_workflow(
             self,
@@ -610,6 +615,7 @@ class Broker():
                     _dispatchable_task.scheduled = False
                     _dispatchable_task.dispatched = False
                     follow_up_action_failure(reason)
+                    self._n_replans += 1
                     self._reschedule_depth += 1
                     self.schedule_workflow(
                         current_time=self.world.time,
@@ -661,6 +667,7 @@ class Broker():
                         _dispatchable_task.scheduled = False
                         _dispatchable_task.dispatched = False
                         follow_up_action_failure(ObservationStatus.TIMEOUT)
+                        self._n_replans += 1
                         self._reschedule_depth += 1
                         self.schedule_workflow(
                             current_time=self.world.time,
@@ -694,7 +701,7 @@ class Broker():
                     print(" [{}: ] data ready for request {}, pass {}, from {}".format(self.name, _request, __best_pass, __best_constellation.name))
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = ObservationStatus.DATA_RECEIVED
                     for _ix, __dp in self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'data_product'].items():
-                        self._requests.loc[_ix, 'data_product'] = data_product
+                        self._requests.at[_ix, 'data_product'] = data_product
 
                     # If another backup pass already completed this task, just record
                     # the data received status — do not double-count or double-recurse.
@@ -753,6 +760,7 @@ class Broker():
 
                 _request_dict = {
                     'request': request,
+                    'constellation_request': None,  # filled in phase 2 after _constellation_request is built
                     'requested_pass': _pass_obj,
                     'requested_constellation': _pass_constellation,
                     'requested_satellite': _pass_satellite,
@@ -792,6 +800,12 @@ class Broker():
                     request_name=request.name,
                     min_elevation_deg=request.min_elevation_deg
                 )
+                # Back-fill constellation_request now that it's been built
+                self._requests.loc[
+                    (self._requests['request'] == request) &
+                    (self._requests['requested_pass'] == _pass_obj),
+                    'constellation_request'
+                ] = _constellation_request
 
                 _pass_constellation.schedule_request(
                     request=_constellation_request,
@@ -1017,6 +1031,7 @@ class Broker():
                         _dispatchable_task.scheduled = False
                         _dispatchable_task.dispatched = False
                         follow_up_action_failure(reason)
+                        self._n_replans += 1
                         self._reschedule_depth += 1
                         self.schedule_workflow_redundant(
                             current_time=self.world.time,
@@ -1067,6 +1082,7 @@ class Broker():
                             _dispatchable_task.scheduled = False
                             _dispatchable_task.dispatched = False
                             follow_up_action_failure(ObservationStatus.TIMEOUT)
+                            self._n_replans += 1
                             self._reschedule_depth += 1
                             self.schedule_workflow_redundant(
                                 current_time=self.world.time,
@@ -1101,7 +1117,7 @@ class Broker():
                         print(f" [{self.name}: ] data ready for request {_request}, pass {__best_pass}, from {__best_constellation.name}")
                         self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'status'] = ObservationStatus.DATA_RECEIVED
                         for _ix, __dp in self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'data_product'].items():
-                            self._requests.loc[_ix, 'data_product'] = data_product
+                            self._requests.at[_ix, 'data_product'] = data_product
 
                         if _dispatchable_task.completed:
                             print(f" [{self.name}] Task {_request.name} already completed by a prior pass, skipping follow-up for {__best_pass}.")
@@ -1167,6 +1183,7 @@ class Broker():
 
                     _request_dict = {
                         'request': request,
+                        'constellation_request': None,  # filled in phase 2 after _constellation_request is built
                         'requested_pass': _pass_obj,
                         'requested_constellation': _pass_constellation,
                         'requested_satellite': _pass_satellite,
@@ -1203,6 +1220,12 @@ class Broker():
                         request_name=request.name,
                         min_elevation_deg=request.min_elevation_deg
                     )
+                    # Back-fill constellation_request now that it's been built
+                    self._requests.loc[
+                        (self._requests['request'] == request) &
+                        (self._requests['requested_pass'] == _pass_obj),
+                        'constellation_request'
+                    ] = _constellation_request
 
                     # Invoke target-specific schedule_request_redundant method on the constellation
                     if hasattr(_pass_constellation, 'schedule_request_redundant'):
