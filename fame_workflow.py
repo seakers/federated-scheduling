@@ -1094,13 +1094,6 @@ def ilp_schedule_workflow(
         allsatpasses = [(satellite, satpass, constrained_request.rewarder(satpass.highest)) for satellite, satpasses in passes.items() for satpass in satpasses]
         allsatpasses.sort(key=lambda x: x[2], reverse=True) # Sort by observation quality
 
-        # Compute max quality across all feasible passes for this request, used to compute tax
-        _max_quality_for_request = max([q for (_, _, q) in allsatpasses]) if len(allsatpasses) > 0 else 0.0
-        _tax = tax_rate * _max_quality_for_request
-        _submission_cost = submission_cost_rate* _max_quality_for_request
-        _execution_cost = execution_cost_rate*_max_quality_for_request
-    
-
         for (satellite, satpass, _quality) in allsatpasses:
             if feasibility_screener(satellite, satpass):
                 _found_a_pass = True
@@ -1116,8 +1109,12 @@ def ilp_schedule_workflow(
 
                 flat_boolean_solution_holder.append(solution_holder[constrained_request][satellite][satpass])
 
-                # Net coefficient = quality - tax (tax=0 disables the cost penalty)
-                objective.SetCoefficient(solution_holder[constrained_request][satellite][satpass], _quality - _submission_cost-_execution_cost)
+                # Costs scaled by pass-specific quality q_k (not Q_max) to match
+                # what compute_metrics_v3 charges in the simulator.
+                _sub  = submission_cost_rate * _quality
+                _exec = execution_cost_rate * _quality
+                _tax_k = tax_rate * _quality
+                objective.SetCoefficient(solution_holder[constrained_request][satellite][satpass], _quality - _sub - _exec - _tax_k)
 
                 # TODO for each timeline impacted, add a variable for that timeline value at that time. Add an Impact with that timeline value times "do we do it".
                 if constrained_request in timeline_graph.nodes():

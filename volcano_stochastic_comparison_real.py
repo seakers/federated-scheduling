@@ -71,22 +71,42 @@ from volcano_utils import (
 # demand-based metrics + paired analysis + frontier
 from fame_metrics import compute_metrics_v3, paired_summary, plot_cost_frontier
 
+# Shared benchmarking utilities (satellite loading, simulation runner, memory)
+from benchmarking_utils import (
+    GROUND_STATIONS,
+    load_satellites_once as _load_satellites_once_shared,
+    run_simulation_forward as _run_simulation_forward_shared,
+    rss_gb,
+)
+
 # ============================ Configuration =================================
 # SIMULATION_START is a module global because the geometry helpers below read
 # it. In single-run mode it is overwritten from --start BEFORE anything uses
 # it, so all processes in a campaign share identical orbital geometry.
 SIMULATION_START = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 
-lookahead_horizon_h = 18
+lookahead_horizon_h = 9
 FOLLOW_UP_INTERVAL_H = 3
 MAX_SOLVER_TIME_S = 70
 MAX_NUM_INSTANCES = 5
-NUM_MC_RUNS = 5
+NUM_MC_RUNS = 3
 
 # === COST CONFIGURATION ===
 TAX_RATE = 0.0              # Legacy per-booking tax (disabled)
 SUBMISSION_COST = 0.05      # Unconditional booking submission overhead
 EXEC_COST = 0.2             # Conditional execution cost if accepted
+
+# === PROBABILITY CONFIGURATION ===
+# Acceptance probability range: constellation rejects a booking when its demand
+# is high, accepts when quiet.  DemandField maps demand → p_accept in [P_ACC_MIN, P_ACC_MAX].
+P_ACC_MIN = 1.0            # Minimum acceptance probability (high-demand / congested)
+P_ACC_MAX = 1.0           # Maximum acceptance probability (low-demand / quiet)
+
+# Execution probability range: even an accepted pass may fail (cloud cover, sensor issue).
+# The function maps look-angle → p_exec in [P_EXEC_MIN, P_EXEC_MAX].
+# At nadir (best geometry) → P_EXEC_MAX; at worst geometry → P_EXEC_MIN.
+P_EXEC_MIN = 1.0           # Minimum execution probability (worst geometry)
+P_EXEC_MAX = 1.0           # Maximum execution probability (best geometry)
 
 SCHEDULERS = ['stochastic_log', 'deterministic', 'greedy', 'random']
 #SCHEDULERS = ['stochastic_log','greedy']
@@ -97,149 +117,27 @@ SCHEDULERS = ['stochastic_log', 'deterministic', 'greedy', 'random']
 ENABLE_CANCELLATIONS = True
 
 
-def load_satellites_once() -> list[Satellite]:
-    """Dynamically loads all LEO satellites from TLE files using notebook approach."""
-    from pyorbital.orbital import Orbital
-    import pyorbital
-
-    tle_files = glob.glob("tles/all_tles_*.txt")
-    if not tle_files:
-        raise FileNotFoundError("No text TLE files found in the tles/ folder context.")
-    tle_file_txt = sorted(tle_files)[-1]
-
-    swaths_at_nadir_km = {
-        "SKYSAT-A": 8, "SKYSAT-B": 8,
-        "SKYSAT-C1": 5.9, "SKYSAT-C2": 5.9, "SKYSAT-C3": 5.9, "SKYSAT-C4": 5.9,
-        "SKYSAT-C5": 5.9, "SKYSAT-C6": 5.9, "SKYSAT-C7": 5.9, "SKYSAT-C8": 5.9,
-        "SKYSAT-C9": 5.9, "SKYSAT-C10": 5.9, "SKYSAT-C11": 5.9, "SKYSAT-C12": 5.9,
-        "SKYSAT-C13": 5.9,
-        "PELICAN-1 3001": 8, "PELICAN-2 3009": 8, "PELICAN-3 300A": 8,
-        "PELICAN-4 300B": 8, "PELICAN-5 300C": 8, "PELICAN-6 300D": 8,
-        "TANAGER-1 4001": 18,
-        "UMBRA-07": 8, "UMBRA-09": 8, "UMBRA-10": 8, "UMBRA-11": 8,
-        "CAPELLA-11 (ACADIA)": 10, "CAPELLA-13 (ACADIA)": 10, "CAPELLA-14 (ACADIA)": 10,
-        "CAPELLA-15 (ACADIA)": 10, "CAPELLA-16 (ACADIA)": 10, "CAPELLA-17 (ACADIA)": 10,
-        "YAM-6": 19.8, "YAM-7": 70, "YAM-8": 19.8,
-        "HAMMER": 20, "ACCENTURE-1": 20,
-        "Mission Control Persistence": 100,
-        "AEROCUBE 18A": 80, "AEROCUBE 18B": 80,
-        "LEMUR 2 KRISH": 17.5
-    }
-
-    flock_names = []
-    iceye_names = []
-    with open(tle_file_txt, 'r') as file:
-        for line in file:
-            if line.startswith("FLOCK"):
-                flock_names.append(line.strip())
-            elif line.startswith("ICEYE"):
-                iceye_names.append(line.strip())
-
-    for dove_name in flock_names:
-        swaths_at_nadir_km[dove_name] = 16.4
-    for iceye_name in iceye_names:
-        swaths_at_nadir_km[iceye_name] = 100
-
-    tle_to_display = {
-        "SKYSAT 1": "SKYSAT-A", "SKYSAT 2": "SKYSAT-B",
-        "SKYSAT C1": "SKYSAT-C1", "SKYSAT C2": "SKYSAT-C2", "SKYSAT C3": "SKYSAT-C3",
-        "SKYSAT C4": "SKYSAT-C4", "SKYSAT C5": "SKYSAT-C5", "SKYSAT C6": "SKYSAT-C6",
-        "SKYSAT C7": "SKYSAT-C7", "SKYSAT C8": "SKYSAT-C8", "SKYSAT C9": "SKYSAT-C9",
-        "SKYSAT C10": "SKYSAT-C10", "SKYSAT C11": "SKYSAT-C11", "SKYSAT C12": "SKYSAT-C12",
-        "SKYSAT C13": "SKYSAT-C13",
-    }
-
-    sat_constellation_map = {
-        "SKYSAT": ("Planet", InstrumentType.RGB),
-        "PELICAN": ("Planet", InstrumentType.RGB),
-        "TANAGER": ("Planet", InstrumentType.HYPERSPECTRAL),
-        "FLOCK": ("Planet", InstrumentType.RGB),
-        "UMBRA": ("Umbra", InstrumentType.SAR),
-        "CAPELLA": ("Capella", InstrumentType.SAR),
-        "ACADIA": ("Capella", InstrumentType.SAR),
-        "YAM": ("LOFT", InstrumentType.HYPERSPECTRAL),
-        "LOFT": ("LOFT", InstrumentType.HYPERSPECTRAL),
-        "HAMMER": ("Ubotica", InstrumentType.HYPERSPECTRAL),
-        "ACCENTURE": ("Ubotica", InstrumentType.HYPERSPECTRAL),
-        "LEMUR": ("Mission Control", InstrumentType.RGB),
-        "KRISH": ("Mission Control", InstrumentType.RGB),
-        "PERSISTENCE": ("Mission Control", InstrumentType.RGB),
-        "AEROCUBE": ("Aerospace", InstrumentType.RGB),
-        "ICEYE": ("ICEYE", InstrumentType.SAR),
-    }
-
-    satellites = []
-    skipped_count = 0
-
-    min_time = SIMULATION_START
-    max_time = SIMULATION_START + dt.timedelta(seconds=3600 * lookahead_horizon_h)
-    display_to_tle = {v: k for k, v in tle_to_display.items()}
-    for display_name, swath_km in swaths_at_nadir_km.items():
-        tle_name = display_to_tle.get(display_name, display_name)
-        constellation = "Unknown"
-        instrument = InstrumentType.RGB
-        for key, (const, inst) in sat_constellation_map.items():
-            if key in display_name.upper():
-                constellation = const
-                instrument = inst
-                break
-
-        try:
-            orbit = Orbital(tle_name, tle_file=tle_file_txt)
-            try:
-                _ = orbit.get_lonlatalt(min_time)
-                _ = orbit.get_lonlatalt(max_time)
-            except (NotImplementedError, Exception):
-                print(f"[Skipped] {display_name} failed orbit propagation tests (decayed/deep space).")
-                skipped_count += 1
-                continue
-
-            sat = Satellite(display_name, orbit, instruments=[instrument],
-                            has_continuous_isl_to_ground=True)
-            _semi_major = sat.orbit.orbit_elements.semi_major_axis * pyorbital.orbital.A
-            _altitude = _semi_major - pyorbital.orbital.A
-            _fov = 2 * np.atan2(swath_km / 2, _altitude)
-            sat.instrument_fov_rad = {it: _fov for it in sat.instruments}
-            satellites.append(sat)
-        except Exception as e:
-            print(f"[Warning] Could not load {display_name} (TLE: {tle_name}): {e}")
-            skipped_count += 1
-            continue
-
-    print(f"[Init] Loaded {len(satellites)} satellites (skipped {skipped_count} decayed/invalid).\n")
-    return satellites
+def load_satellites_once() -> list:
+    """Load the full LEO fleet — delegated to benchmarking_utils for deduplication."""
+    return _load_satellites_once_shared(SIMULATION_START, lookahead_horizon_h)
 
 
 def create_world_and_constellations(cached_satellites: list[Satellite],
                                      volcano_locations: list[Location] = None,
-                                     demand_field: DemandField = None):
+                                     demand_field: DemandField = None,
+                                     execution_probability_function=None):
     """
     Creates fresh simulation scopes using copied pre-cached orbital models.
     Registers ground-truth physical Eruption and dynamic Plume phenomena in the world.
     """
-    local_satellites = load_satellites_once()
+    local_satellites = copy.deepcopy(cached_satellites)
     world = World(satellites=local_satellites)
     world.time = SIMULATION_START
 
-    # ✅ REGISTER PHYSICAL PHENOMENA FOR OBSERVATION DATA PRODUCTS
     if volcano_locations is not None:
         min_time = SIMULATION_START
         max_time = SIMULATION_START + dt.timedelta(hours=lookahead_horizon_h)
         register_volcano_phenomena(world, volcano_locations, min_time, max_time)
-
-    ground_stations = [
-        Location(-79.55, 8.9833, 0.028, "KSAT Panama"),
-        Location(-51.73363, 64.182789, 0, "KSAT Nuuk"),
-        Location(2.53219, -72.01243, 0, "KSAT Troll"),
-        Location(142.3689, 43.8, 0, "KSAT Hokkaido"),
-        Location(103.9915, 1.3661, 0, "KSAT Singapore"),
-        Location(-70.85021, -52.93279, 0, "KSAT Punta Arenas"),
-        Location(127.7766, 26.4055, 0, "KSAT Okinawa"),
-        Location(57.5565, -20.1142, 0, "KSAT Mauritius"),
-        Location(22.62216, 37.84604, 0, "KSAT Nemea"),
-        Location(31.12509, 70.36779, 0, "KSAT Vardo"),
-        Location(15.39964, 78.22875, 0, "KSAT Svalbard"),
-    ]
 
     planet_sats = [s for s in local_satellites if any(x in s.name.upper() for x in ["SKYSAT", "PELICAN", "TANAGER"])]
     umbra_sats = [s for s in local_satellites if "UMBRA" in s.name.upper()]
@@ -258,11 +156,12 @@ def create_world_and_constellations(cached_satellites: list[Satellite],
     def _make_scheduler(sats, name, legacy_p):
         return ConstellationGroundScheduler(
             satellites=sats,
-            ground_stations=ground_stations,
+            ground_stations=GROUND_STATIONS,
             world=world,
             name=name,
             acceptance_probability=legacy_p,
             acceptance_probability_function=_sim_acc_fn,
+            execution_probability_function=execution_probability_function,
         )
 
     scheduler_planet          = _make_scheduler(planet_sats,          "Planet",          0.40)
@@ -288,37 +187,19 @@ def create_world_and_constellations(cached_satellites: list[Satellite],
 # ======================= shared run-time helpers ============================
 
 def _rss_gb():
-    """Peak resident set size in GB (diagnostic only; no behaviour change)."""
-    try:
-        import resource
-        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        # macOS reports bytes, Linux reports kilobytes.
-        return rss / 1e9 if rss > 1e7 else rss / 1e6
-    except Exception:
-        return float('nan')
+    """Peak resident set size in GB — delegates to benchmarking_utils."""
+    return rss_gb()
 
 
 def run_simulation_forward(world, max_safety_limit=40000):
-    ticks = 0
-    last_progress_report = 0
-    while True:
-        retcode = world.tick(print_forbidden_prefixes=[
-            "Downlink", "End of downlink", "Unlock uplink", "Unlock satellite after obs"])
-        ticks += 1
-        if ticks - last_progress_report >= 5000:
-            print(f"  [Sim Progress] {ticks} ticks, Current time: {world.time}")
-            last_progress_report = ticks
-        if retcode == 0:
-            break
-        if ticks >= max_safety_limit:
-            print(f"  [Warning] Simulation safety cut-off invoked at {max_safety_limit} ticks.")
-            break
-    print(f"  [Sim] Event-loop finished. Total Ticks: {ticks}, Concluded Simulation Clock: {world.time}")
+    """Delegates to benchmarking_utils.run_simulation_forward."""
+    return _run_simulation_forward_shared(world, max_ticks=max_safety_limit)
 
 
 def build_demand_field(volcano_db_locations, min_time):
     """Demand field: single source of truth for simulator and planner."""
-    _demand_cfg = DemandFieldConfig(use_constant_probability=False)
+    _demand_cfg = DemandFieldConfig(use_constant_probability=False,
+                                    p_min=P_ACC_MIN, p_max=P_ACC_MAX)
     _horizon_s = lookahead_horizon_h * 3600.0
     demand_field = DemandField(config=_demand_cfg, reference_time=min_time, horizon_s=_horizon_s)
 
@@ -343,12 +224,63 @@ def make_probability_functions(demand_field):
     def acceptance_prob_function(constrained_request, satellite, obs_pass):
         return demand_field.make_acceptance_prob_function()(constrained_request, satellite, obs_pass)
 
-    def execution_prob_function(constrained_request, satellite, obs_pass):
-        look_angle = abs(90.0 - obs_pass.highest.look_angle_dec_deg)
-        execution_prob = 0.95 - (look_angle / 90.0) * 0.20
-        return max(0.7, min(0.99, execution_prob))
+    def execution_prob_function(constrained_request, satellite, obs_opp):
+        # obs_opp is an ObservationOpportunity when called from the simulator,
+        # and an ObservationPass when called from the MILP solver — handle both.
+        opp = obs_opp.highest if hasattr(obs_opp, 'highest') else obs_opp
+        look_angle = abs(90.0 - opp.look_angle_dec_deg)
+        # Linear interpolation: nadir (look_angle=0) → P_EXEC_MAX, worst (look_angle=90) → P_EXEC_MIN
+        t = look_angle / 90.0
+        execution_prob = P_EXEC_MAX - t * (P_EXEC_MAX - P_EXEC_MIN)
+        return max(P_EXEC_MIN, min(P_EXEC_MAX, execution_prob))
 
     return acceptance_prob_function, execution_prob_function
+
+
+def _compute_quality_rank_distribution(workflow_graph, broker, ObservationStatus):
+    """
+    For each completed task, rank all submitted passes by descending quality and
+    find the rank (1-indexed) of the pass that actually succeeded (DATA_RECEIVED).
+    Returns a dict {rank: count} for ranks 1..MAX_NUM_INSTANCES, plus 'unranked'.
+    """
+    tasks = list(workflow_graph.nodes())
+    obsreq_to_task = {t.observation_request: t for t in tasks}
+    reqs = broker._requests
+
+    rank_counts = {}
+    for task in tasks:
+        task_rows = reqs[reqs['request'] == task.observation_request].copy()
+        if task_rows.empty:
+            continue
+
+        # Find the successful pass
+        success_rows = task_rows[task_rows['status'] == ObservationStatus.DATA_RECEIVED]
+        if success_rows.empty:
+            continue
+
+        # Compute quality for each submitted pass and sort descending
+        def _q(row):
+            rp = row['requested_pass']
+            if rp is None:
+                return -1.0
+            try:
+                return task.rewarder(rp.highest)
+            except Exception:
+                return 0.0
+
+        task_rows = task_rows[task_rows['requested_pass'].notna()].copy()
+        task_rows['_q'] = task_rows.apply(_q, axis=1)
+        sorted_passes = task_rows.sort_values('_q', ascending=False)['requested_pass'].tolist()
+
+        winning_pass = success_rows.iloc[0]['requested_pass']
+        try:
+            rank = next(i + 1 for i, rp in enumerate(sorted_passes) if rp is winning_pass)
+        except StopIteration:
+            rank = 'unranked'
+
+        rank_counts[rank] = rank_counts.get(rank, 0) + 1
+
+    return rank_counts
 
 
 def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
@@ -371,7 +303,8 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
     world, constellations = create_world_and_constellations(
         cached_satellites,
         volcano_locations=volcano_db_locations,
-        demand_field=demand_field
+        demand_field=demand_field,
+        execution_probability_function=execution_prob_function,
     )
     
     # ✅ CREATE VOLCANO WORKFLOW WITH DUAL BRANCHES AND PLUME RETARGETING
@@ -416,6 +349,8 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 current_time=world.time, use_ilp=False, use_stochastic=False,
                 max_solver_time_s=MAX_SOLVER_TIME_S,
                 update_timelines=False, update_requests=False, tax_rate=TAX_RATE,
+                submission_cost_rate=SUBMISSION_COST,
+                execution_cost_rate=EXEC_COST,
                 max_reschedule_depth=10000,
                 plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
                 results_path=plots_dir
@@ -448,6 +383,12 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
         m['tax_rate'] = TAX_RATE
         m['max_num_instances'] = MAX_NUM_INSTANCES
         m['sim_start'] = SIMULATION_START.isoformat()
+
+        # Quality-rank distribution: for each completed task, find what rank (1=best)
+        # the pass that actually succeeded was among all submitted passes for that task.
+        m['quality_rank_distribution'] = _compute_quality_rank_distribution(
+            broker._workflow_graph, broker, ObservationStatus
+        )
 
         run_file = os.path.join(results_dir, f"run_seed{seed:04d}_{scheduler}.json")
         with open(run_file, 'w') as f:
@@ -613,16 +554,41 @@ def aggregate(results_dir, records=None):
         print(f"  Realized quality     : {sub['realized_quality'].mean():.1f}")
         print(f"  Net utility          : {sub['utility'].mean():.1f} ± {sub['utility'].std():.1f}")
         print(f"  Total cost           : {sub['total_cost'].mean():.1f}")
+        n_exec_fail = sub['n_execution_failed'].mean() if 'n_execution_failed' in sub.columns else float('nan')
+        n_cancelled = sub['n_cancelled'].mean() if 'n_cancelled' in sub.columns else float('nan')
         print(f"  Bookings submitted   : {sub['n_submissions'].mean():.1f} "
-              f"(accepted {sub['n_accepted'].mean():.1f}, executed {sub['n_executed'].mean():.1f})")
+              f"(accepted {sub['n_accepted'].mean():.1f}, executed ok {sub['n_executed'].mean():.1f}, "
+              f"exec-failed {n_exec_fail:.1f}, cancelled {n_cancelled:.1f})")
         print(f"  TRUE passes/task     : {sub['submitted_passes_per_task'].mean():.2f} submitted, "
               f"{sub['exec_passes_per_completed'].mean():.2f} executed/completed")
         print(f"  Rejection rate (diag): {100 * sub['rejection_rate'].mean():.1f}%")
+        n_replans = sub['replans'].mean() if 'replans' in sub.columns else float('nan')
+        print(f"  Replans / cancels    : {n_replans:.1f} replans, {n_cancelled:.1f} cancellations")
+
+        # Quality-rank distribution (mean counts across runs)
+        if 'quality_rank_distribution' in sub.columns:
+            all_rank_dicts = sub['quality_rank_distribution'].dropna().tolist()
+            merged = {}
+            for rd in all_rank_dicts:
+                if not isinstance(rd, dict):
+                    continue
+                for rank, cnt in rd.items():
+                    merged[rank] = merged.get(rank, 0) + cnt
+            n_runs = max(len(all_rank_dicts), 1)
+            total = sum(merged.values())
+            if total > 0:
+                rank_parts = []
+                for rank in sorted((r for r in merged if r != 'unranked'), key=lambda x: int(x) if str(x).isdigit() else 999):
+                    rank_parts.append(f"rank {rank}: {merged[rank]/n_runs:.1f} ({100*merged[rank]/total:.0f}%)")
+                if 'unranked' in merged:
+                    rank_parts.append(f"unranked: {merged['unranked']/n_runs:.1f}")
+                print(f"  Quality rank dist    : {', '.join(rank_parts)}")
 
     summary_cols = [c for c in [
         'task_completion_rate', 'group_completion_rate', 'realized_quality',
         'utility', 'total_cost', 'n_submissions', 'n_accepted', 'n_executed',
-        'n_rejected', 'submitted_passes_per_task', 'exec_passes_per_completed',
+        'n_execution_failed', 'n_cancelled', 'n_rejected', 'replans',
+        'submitted_passes_per_task', 'exec_passes_per_completed',
         'rejection_rate'] if c in df.columns]
     summary_df = df.groupby('scheduler')[summary_cols].mean().reset_index()
     summary_csv = os.path.join(results_dir, "summary_v2.csv")

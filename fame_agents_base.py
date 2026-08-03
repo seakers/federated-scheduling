@@ -18,6 +18,10 @@ from matplotlib import colormaps as cmap
 
 MIN_HORIZON_ANGLE_FOR_PASS_DEG = 15
 
+# Sentinel passed to broker ready_callbacks when execution fails (coin-flip).
+# Distinct from [] (empty but successful observation with no phenomena detected).
+EXECUTION_FAILED_SENTINEL = object()
+
 class ObservationStatus(Enum):
     UNKNOWN = 0
     ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING=1
@@ -29,6 +33,7 @@ class ObservationStatus(Enum):
     TIMEOUT = 7
     CONSTELLATION_REJECTED = 8  # Constellation manager rejected broker request
     CANCELLED = 9               # Broker cancelled pass after a better/sufficient pass succeeded
+    EXECUTION_FAILED = 10       # Accepted and executed but execution failed (p_exec coin flip)
 
 requests_data_frame_columns = ['request', 'satellite', 'observation', 'uplink', 'downlink', 'status', 'data_product', 'scheduled_callback', 'unscheduled_callback', 'ready_callback']
 
@@ -204,21 +209,24 @@ def do_downlink(spacecraft: Satellite, scheduler, comm_pass: ObservationPass): #
     for _observation, data_product in spacecraft.data_products.items():
         print("  Downlinked {}".format(_observation))
         _downlinked.append(_observation)
-        
-        # TODO here we assume the DP is for a given observation
+
+        # Detect execution failure: a [None] sentinel means the coin flip failed
+        execution_failed = (isinstance(data_product, list) and len(data_product) == 1 and data_product[0] is None)
+
         matching_requests = scheduler._requests[scheduler._requests['observation']==_observation]
-        # print(scheduler._requests)
-        # print(matching_requests)
         if len(matching_requests)>=1:
-            # print(data_product)
-            # try:
-            scheduler._requests.loc[scheduler._requests['observation']==_observation, 'status'] = ObservationStatus.DATA_RECEIVED
-            # scheduler._requests.loc[scheduler._requests['observation']==_observation, 'data_product'] = data_product
+            if execution_failed:
+                print("   Execution FAILED for observation {} — marking EXECUTION_FAILED, full cost applies".format(_observation))
+                scheduler._requests.loc[scheduler._requests['observation']==_observation, 'status'] = ObservationStatus.EXECUTION_FAILED
+                # Pass the sentinel so broker callbacks can distinguish failure from
+                # a real (but zero-phenomena) successful observation.
+                effective_product = EXECUTION_FAILED_SENTINEL
+            else:
+                scheduler._requests.loc[scheduler._requests['observation']==_observation, 'status'] = ObservationStatus.DATA_RECEIVED
+                effective_product = data_product
             for _ix, _ready_callback in scheduler._requests.loc[scheduler._requests['observation']==_observation, 'ready_callback'].items():
-                scheduler._requests.loc[_ix, 'data_product'] = data_product
-                _ready_callback(data_product)
-            # except Exception as e:
-            #     import pdb; pdb.set_trace()
+                scheduler._requests.at[_ix, 'data_product'] = effective_product
+                _ready_callback(effective_product)
         else:
             print("   Could not find matching request for observation {}".format(_observation))
         if len(matching_requests)>1:

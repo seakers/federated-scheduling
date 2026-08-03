@@ -317,11 +317,15 @@ class Broker():
                 
                 def callback_request_ready(data_product,  _request=request, __best_pass=_best_pass, __best_constellation=_best_constellation):
                     print(" [{}: ] data ready for request {}, pass {}, from {}".format(self.name, _request, __best_pass, __best_constellation.name))
-                    self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = ObservationStatus.DATA_RECEIVED
+                    from fame_agents_base import EXECUTION_FAILED_SENTINEL
+                    execution_failed = (data_product is EXECUTION_FAILED_SENTINEL)
+                    _new_status = ObservationStatus.EXECUTION_FAILED if execution_failed else ObservationStatus.DATA_RECEIVED
+                    self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = _new_status
+                    effective_dp = [] if execution_failed else data_product
                     for _ix, __dp in self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'data_product'].items():
-                        self._requests.at[_ix, 'data_product'] = data_product
-                    follow_up_action_success(data_product)
-                    # TODO Attempt to cancel other requests for this observation
+                        self._requests.at[_ix, 'data_product'] = effective_dp
+                    if not execution_failed:
+                        follow_up_action_success(data_product)
                     return
 
                 _constellation_request = ObservationRequest(
@@ -415,6 +419,7 @@ class Broker():
             success_probability_function = None,  # DEPRECATED: use acceptance + execution functions
             acceptance_probability_function = None,  # p_acc: prob constellation accepts booking
             execution_probability_function = None,   # p_exec: prob accepted booking executes successfully
+            detection_probability_function = None,   # p_det: prob target present / in footprint (only used by "general_logical_dag")
             epsilon: float = 1e-3,
             pwl_tolerance: float = 1e-1,
             tax_rate: float = 0.0,  # Cost per scheduled obs as fraction of max quality. 0 = disabled.
@@ -458,6 +463,7 @@ class Broker():
                     success_probability_function=success_probability_function,
                     acceptance_probability_function=acceptance_probability_function,
                     execution_probability_function=execution_probability_function,
+                    detection_probability_function=detection_probability_function,
                     epsilon=epsilon,
                     pwl_tolerance=pwl_tolerance,
                     solver_engine=solver_engine,
@@ -633,6 +639,7 @@ class Broker():
                         success_probability_function=success_probability_function,
                         acceptance_probability_function=acceptance_probability_function,
                         execution_probability_function=execution_probability_function,
+                        detection_probability_function=detection_probability_function,
                         epsilon=epsilon,
                         pwl_tolerance=pwl_tolerance,
                         tax_rate=tax_rate,
@@ -699,9 +706,16 @@ class Broker():
 
                 def callback_request_ready(data_product, _request=request, __best_pass=_pass_obj, __best_constellation=_pass_constellation, _dispatchable_task=dispatchable_task):
                     print(" [{}: ] data ready for request {}, pass {}, from {}".format(self.name, _request, __best_pass, __best_constellation.name))
-                    self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = ObservationStatus.DATA_RECEIVED
+                    from fame_agents_base import EXECUTION_FAILED_SENTINEL
+                    execution_failed = (data_product is EXECUTION_FAILED_SENTINEL)
+                    _new_status = ObservationStatus.EXECUTION_FAILED if execution_failed else ObservationStatus.DATA_RECEIVED
+                    self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = _new_status
+                    effective_dp = [] if execution_failed else data_product
                     for _ix, __dp in self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'data_product'].items():
-                        self._requests.at[_ix, 'data_product'] = data_product
+                        self._requests.at[_ix, 'data_product'] = effective_dp
+
+                    if execution_failed:
+                        return
 
                     # If another backup pass already completed this task, just record
                     # the data received status — do not double-count or double-recurse.
@@ -743,6 +757,7 @@ class Broker():
                         success_probability_function=success_probability_function,
                         acceptance_probability_function=acceptance_probability_function,
                         execution_probability_function=execution_probability_function,
+                        detection_probability_function=detection_probability_function,
                         epsilon=epsilon,
                         pwl_tolerance=pwl_tolerance,
                         tax_rate=tax_rate,
@@ -846,6 +861,7 @@ class Broker():
                 success_probability_function = None,
                 acceptance_probability_function = None,
                 execution_probability_function = None,
+                detection_probability_function = None,   # p_det: prob target present / in footprint (only used by "general_logical_dag")
                 epsilon: float = 1e-3,
                 pwl_tolerance: float = 1e-1,
                 tax_rate: float = 0.0,
@@ -897,6 +913,7 @@ class Broker():
                         success_probability_function=success_probability_function,
                         acceptance_probability_function=acceptance_probability_function,
                         execution_probability_function=execution_probability_function,
+                        detection_probability_function=detection_probability_function,
                         epsilon=epsilon,
                         pwl_tolerance=pwl_tolerance,
                         solver_engine=solver_engine,
@@ -1115,9 +1132,16 @@ class Broker():
 
                     def callback_request_ready(data_product, _request=request, __best_pass=_pass_obj, __best_constellation=_pass_constellation, _dispatchable_task=dispatchable_task):
                         print(f" [{self.name}: ] data ready for request {_request}, pass {__best_pass}, from {__best_constellation.name}")
-                        self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'status'] = ObservationStatus.DATA_RECEIVED
+                        from fame_agents_base import EXECUTION_FAILED_SENTINEL
+                        execution_failed = (data_product is EXECUTION_FAILED_SENTINEL)
+                        _new_status = ObservationStatus.EXECUTION_FAILED if execution_failed else ObservationStatus.DATA_RECEIVED
+                        self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'status'] = _new_status
+                        effective_dp = [] if execution_failed else data_product
                         for _ix, __dp in self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'data_product'].items():
-                            self._requests.at[_ix, 'data_product'] = data_product
+                            self._requests.at[_ix, 'data_product'] = effective_dp
+
+                        if execution_failed:
+                            return
 
                         if _dispatchable_task.completed:
                             print(f" [{self.name}] Task {_request.name} already completed by a prior pass, skipping follow-up for {__best_pass}.")

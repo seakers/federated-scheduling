@@ -23,7 +23,7 @@ from fame_workflow import AssignmentTimeline, Impact, ImpactType
 from fame_agents_base import *
 
 class ConstellationGroundScheduler():
-    def __init__(self, satellites: list, ground_stations: list, world, name="Constellation", ack_probability_if_scheduled: float=1., ack_probability_if_unscheduled: float=1., acceptance_probability: float=1.0, acceptance_probability_function=None):
+    def __init__(self, satellites: list, ground_stations: list, world, name="Constellation", ack_probability_if_scheduled: float=1., ack_probability_if_unscheduled: float=1., acceptance_probability: float=1.0, acceptance_probability_function=None, execution_probability_function=None):
         self.name = name
         self.satellites = satellites
         self.ground_stations = ground_stations
@@ -34,6 +34,7 @@ class ConstellationGroundScheduler():
         self.ack_probability_if_unscheduled = ack_probability_if_unscheduled
         self.acceptance_probability = acceptance_probability
         self.acceptance_probability_function = acceptance_probability_function
+        self.execution_probability_function = execution_probability_function
         self._satellite_busy_timelines_obs  = {ks: AssignmentTimeline(name=ks.name, initial_time=world.time, initial_value=False) for ks in self.satellites}
         self._satellite_busy_timelines_comm = {ks: AssignmentTimeline(name=ks.name, initial_time=world.time, initial_value=False) for ks in self.satellites}
 
@@ -52,6 +53,7 @@ class ConstellationGroundScheduler():
             ack_probability_if_unscheduled=self.ack_probability_if_unscheduled,
             acceptance_probability=self.acceptance_probability,
             acceptance_probability_function=self.acceptance_probability_function,
+            execution_probability_function=self.execution_probability_function,
         )
         new_constellation._requests = copy.deepcopy(self._requests, memo)
         new_constellation._satellite_busy_timelines_obs = copy.deepcopy(self._satellite_busy_timelines_obs, memo)
@@ -223,9 +225,9 @@ class ConstellationGroundScheduler():
         print(f"   [{self.name}] ACCEPTED request {request.name} on {target_satellite.name} (acceptance prob={theta_accept:.2f})")
 
         if earliest_ul_opportunity == "ISL":
-            schedule_observation(self.world, target_pass.highest, phenomenon_processor=phenomenon_processor)
+            schedule_observation(self.world, target_pass.highest, phenomenon_processor=phenomenon_processor, execution_probability_function=self.execution_probability_function)
         else:
-            schedule_observation_uplink(self.world, earliest_ul_opportunity, target_pass.highest, earliest_ul_opportunity_station, phenomenon_processor=phenomenon_processor)
+            schedule_observation_uplink(self.world, earliest_ul_opportunity, target_pass.highest, earliest_ul_opportunity_station, phenomenon_processor=phenomenon_processor, execution_probability_function=self.execution_probability_function)
 
         if dl_pass == "ISL":
             schedule_isl_downlink(_world=self.world, satellite=target_satellite, time=target_pass.highest.time, constellation_scheduler=self)
@@ -453,9 +455,9 @@ class ConstellationGroundScheduler():
         assert _best_sat_object == _best_pass.highest.satellite, "ERROR: something wrong with selecting the best satellite"
 
         if _best_uplink_comm_opportunity == "ISL":
-            schedule_observation(self.world, _best_pass.highest, phenomenon_processor=phenomenon_processor)
+            schedule_observation(self.world, _best_pass.highest, phenomenon_processor=phenomenon_processor, execution_probability_function=self.execution_probability_function)
         else:
-            schedule_observation_uplink(self.world, _best_uplink_comm_opportunity, _best_pass.highest, _best_uplink_comm_opportunity_station, phenomenon_processor=phenomenon_processor)
+            schedule_observation_uplink(self.world, _best_uplink_comm_opportunity, _best_pass.highest, _best_uplink_comm_opportunity_station, phenomenon_processor=phenomenon_processor, execution_probability_function=self.execution_probability_function)
         
         if _best_downlink_comm_opportunity == "ISL":
             schedule_isl_downlink(_world=self.world, satellite=_best_sat_object, time = _best_pass.highest.time, constellation_scheduler=self)
@@ -641,9 +643,9 @@ class ConstellationGroundScheduler():
     def get_request_status(self, request: ObservationRequest):
         return self._requests[self._requests['request'] == request].status
 
-def schedule_observation(_world, obs_opportunity: ObservationOpportunity, phenomenon_processor= lambda o, s, p: p):
+def schedule_observation(_world, obs_opportunity: ObservationOpportunity, phenomenon_processor= lambda o, s, p: p, execution_probability_function=None):
     # An observation fires at the time of the observation. It adds known events to the satellite's known_phenomena store.
-    # TODO it also adds an observation product to the satellite's 
+    # TODO it also adds an observation product to the satellite's
 
     # This first bit is quite redundant. What you want is to maintain events for individual agents and then a global copy, right?
 
@@ -672,6 +674,20 @@ def schedule_observation(_world, obs_opportunity: ObservationOpportunity, phenom
             action_callable = lambda _sate=_satellite: unlock_satellite(_sate)
         )
         _world.add_event(_unlock_event)
+
+        # Execution failure coin flip: if p_exec < 1 and we lose the draw,
+        # store an empty data product so do_downlink still fires ready_callback
+        # but marks the row EXECUTION_FAILED with zero quality.
+        if execution_probability_function is not None:
+            p_exec = execution_probability_function(None, _satellite, _obs_opportunity)
+            if random.random() > p_exec:
+                print(f"   [Execution] FAILED for {_satellite.name} at {_obs_opportunity.time} (p_exec={p_exec:.2f})")
+                if _obs_opportunity not in _satellite.data_products:
+                    _satellite.data_products[_obs_opportunity] = []
+                # Sentinel: None entry signals execution failure to do_downlink
+                _satellite.data_products[_obs_opportunity].append(None)
+                return False
+
         return __world.do_observation(_obs_opportunity, phenomenon_processor=phenomenon_processor)
     
     _event = ObservationEvent(
@@ -686,7 +702,7 @@ def schedule_observation(_world, obs_opportunity: ObservationOpportunity, phenom
 
     return 0
 
-def schedule_observation_uplink(_world: World, comm_opportunity: ObservationPass, obs_opportunity: ObservationOpportunity, station: Location, phenomenon_processor=lambda o, s, p: p):
+def schedule_observation_uplink(_world: World, comm_opportunity: ObservationPass, obs_opportunity: ObservationOpportunity, station: Location, phenomenon_processor=lambda o, s, p: p, execution_probability_function=None):
     # An observation uplink fires at the time of the uplink. It adds an event that will trigger the observation at the appropriate time. 
     if comm_opportunity.highest.satellite != obs_opportunity.satellite:
         raise ValueError(f"Comm opportunity and obs opportunity refer to different satellites! (Comm: {comm_opportunity.highest.satellite}, obs: {obs_opportunity.satellite})")
@@ -720,7 +736,7 @@ def schedule_observation_uplink(_world: World, comm_opportunity: ObservationPass
             action_callable = lambda _sate=__satellite: unlock_satellite(_sate)
         )
         __world.add_event(_unlock_event)
-        return schedule_observation(__world, __obsopp, phenomenon_processor=phenomenon_processor)
+        return schedule_observation(__world, __obsopp, phenomenon_processor=phenomenon_processor, execution_probability_function=execution_probability_function)
 
     _event = CommunicationEvent(
         name="Uplink, station {} to sat {}".format(station.name, satellite.name),

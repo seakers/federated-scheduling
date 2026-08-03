@@ -24,6 +24,237 @@ from fame_workflow import ConstrainedObservationRequest, TaskTimelineImpact, Tas
 
 # Load environment variables from .env file
 load_dotenv()
+
+# =============================================================================
+# GENERAL AND/OR GATE ALGEBRA  (stochastic_milp_formulation.tex, Sec. "Generalization
+# to Arbitrary AND/OR Dependencies")
+# =============================================================================
+#
+# A task's prerequisite is a Boolean function G_r over the *local successes* T_i
+# of its ancestors. The pure-AND base formulation hardcodes
+# A_parents_r = prod_{i in ancestors} S_i, which cannot express OR/NOT gates
+# (e.g. the MSA multiplexer "image if tracked ELSE search"). Here we represent
+# the gate explicitly as a small expression tree and compile it to a Disjoint
+# Sum Of Products (DSOP) via Shannon expansion, so that
+#     A_parents_r = P(G_r) = sum_k P(D_k)          (linear, by disjointness)
+#     P(D_k)      = prod_{i in pos} S_i * prod_{j in neg} (1 - S_j)
+# with each path an independent product of literals. See _compile_gate_to_dsop.
+#
+# Literals reference NODES: either an observation ConstrainedObservationRequest
+# (its local success S_r) or a LogicNode (a derived belief-state variable, e.g.
+# the MSA "ship tracked?" state K_w, which has a gate but no observation passes).
+
+
+class Gate:
+    """Base class for the Boolean prerequisite expression tree."""
+    def literals(self) -> set:
+        """Return the set of leaf nodes (literals) referenced by this gate."""
+        raise NotImplementedError
+
+
+class Lit(Gate):
+    """A single literal: the local success T_node (probability S_node)."""
+    __slots__ = ("node",)
+
+    def __init__(self, node):
+        self.node = node
+
+    def literals(self) -> set:
+        return {self.node}
+
+    def __repr__(self):
+        return f"Lit({_node_name(self.node)})"
+
+
+class And(Gate):
+    """Conjunction of sub-gates (all must be true)."""
+    __slots__ = ("operands",)
+
+    def __init__(self, *operands):
+        self.operands = tuple(operands)
+
+    def literals(self) -> set:
+        out = set()
+        for g in self.operands:
+            out |= g.literals()
+        return out
+
+    def __repr__(self):
+        return "And(" + ", ".join(repr(g) for g in self.operands) + ")"
+
+
+class Or(Gate):
+    """Disjunction of sub-gates (at least one true)."""
+    __slots__ = ("operands",)
+
+    def __init__(self, *operands):
+        self.operands = tuple(operands)
+
+    def literals(self) -> set:
+        out = set()
+        for g in self.operands:
+            out |= g.literals()
+        return out
+
+    def __repr__(self):
+        return "Or(" + ", ".join(repr(g) for g in self.operands) + ")"
+
+
+class Not(Gate):
+    """Negation of a sub-gate."""
+    __slots__ = ("operand",)
+
+    def __init__(self, operand):
+        self.operand = operand
+
+    def literals(self) -> set:
+        return self.operand.literals()
+
+    def __repr__(self):
+        return f"Not({self.operand!r})"
+
+
+class ExclusiveOr(Gate):
+    """A group of MUTUALLY EXCLUSIVE literals (at most one can be true).
+
+    Semantics differ from a general OR: because the events are disjoint by
+    construction (e.g. the ship is in at most one H3 search hex), the gate
+    probability is the plain linear SUM of the member local successes,
+        P = sum_j S_j    (automatically <= 1),
+    with NO DSOP expansion and NO exp() constraint. This is the aggregation
+    trick from the design discussion: it turns N search tasks into a single
+    literal U_w and removes an exp constraint rather than adding paths.
+    """
+    __slots__ = ("members",)
+
+    def __init__(self, *members):
+        # members are Lit gates (or raw nodes, normalized to Lit)
+        self.members = tuple(m if isinstance(m, Gate) else Lit(m) for m in members)
+
+    def literals(self) -> set:
+        out = set()
+        for m in self.members:
+            out |= m.literals()
+        return out
+
+    def __repr__(self):
+        return "ExclusiveOr(" + ", ".join(repr(m) for m in self.members) + ")"
+
+
+class LogicNode:
+    """A derived belief-state node (e.g. the MSA "ship tracked?" state K_w).
+
+    It carries a prerequisite gate but has NO observation passes: it is never
+    dispatched and never appears in the broker's workflow_graph. Its local
+    success S equals the probability that its gate is satisfied,
+        S_{LogicNode} = P(gate) = A_parents_{LogicNode}.
+    The solver discovers LogicNodes by walking the gates of the observation
+    tasks (and recursively the gates of referenced LogicNodes).
+    """
+    __slots__ = ("name", "gate", "request_group")
+
+    def __init__(self, name: str, gate: Gate, request_group: str = None):
+        self.name = name
+        self.gate = gate
+        self.request_group = request_group if request_group is not None else name
+
+    def __repr__(self):
+        return f"LogicNode({self.name})"
+
+
+def _node_name(node) -> str:
+    """Human-readable name for a literal node (task or LogicNode)."""
+    if isinstance(node, LogicNode):
+        return node.name
+    obs = getattr(node, "observation_request", None)
+    if obs is not None:
+        return getattr(obs, "name", str(id(node)))
+    return getattr(node, "name", str(id(node)))
+
+
+# --- Shannon expansion -> Disjoint Sum Of Products --------------------------
+#
+# We evaluate the gate under a partial assignment {node: True/False}. Splitting
+# recursively on an unassigned literal produces disjoint branches (one assumes
+# the literal true, the other false), so the leaves are mutually exclusive
+# scenarios D_k. Each D_k is recorded as (frozenset positives, frozenset
+# negatives). See the worked example G_5 in the .tex.
+
+def _gate_eval(gate: Gate, assignment: dict):
+    """Evaluate a gate under a partial assignment.
+
+    Returns True, False, or None (undetermined). An ExclusiveOr is treated as a
+    plain OR for the purpose of Boolean satisfaction (its special probability
+    handling happens elsewhere); this only decides *whether* the gate can still
+    be satisfied under the partial assignment.
+    """
+    if isinstance(gate, Lit):
+        return assignment.get(gate.node, None)
+    if isinstance(gate, Not):
+        v = _gate_eval(gate.operand, assignment)
+        return None if v is None else (not v)
+    if isinstance(gate, And):
+        result = True
+        for g in gate.operands:
+            v = _gate_eval(g, assignment)
+            if v is False:
+                return False
+            if v is None:
+                result = None
+        return result
+    if isinstance(gate, (Or, ExclusiveOr)):
+        operands = gate.operands if isinstance(gate, Or) else gate.members
+        result = False
+        for g in operands:
+            v = _gate_eval(g, assignment)
+            if v is True:
+                return True
+            if v is None:
+                result = None
+        return result
+    raise TypeError(f"Unknown gate type: {type(gate)}")
+
+
+def _compile_gate_to_dsop(gate: Gate):
+    """Compile a Boolean gate into a Disjoint Sum Of Products.
+
+    Returns a list of paths, each a (positives, negatives) pair of frozensets of
+    literal nodes: the scenario "all positives succeeded AND all negatives
+    failed". Paths are pairwise mutually exclusive, so
+        P(gate) = sum_paths ( prod_{i in pos} S_i * prod_{j in neg} (1 - S_j) ).
+
+    ExclusiveOr sub-gates are NOT expanded here: they are handled upstream as a
+    single aggregated literal (their U node), so by the time a gate reaches this
+    compiler every leaf is an ordinary independent Lit. Implemented via Shannon
+    expansion (see .tex Sec. "Shannon Expansion").
+    """
+    variables = list(gate.literals())
+    paths = []
+
+    def recurse(assignment, remaining):
+        val = _gate_eval(gate, assignment)
+        if val is True:
+            pos = frozenset(n for n, b in assignment.items() if b)
+            neg = frozenset(n for n, b in assignment.items() if not b)
+            paths.append((pos, neg))
+            return
+        if val is False:
+            return
+        if not remaining:
+            # Undetermined with nothing left to assign: guard against infinite
+            # recursion on a malformed gate.
+            return
+        pivot = remaining[0]
+        rest = remaining[1:]
+        a_true = dict(assignment); a_true[pivot] = True
+        recurse(a_true, rest)
+        a_false = dict(assignment); a_false[pivot] = False
+        recurse(a_false, rest)
+
+    recurse({}, variables)
+    return paths
+
+
 class StochasticTimeline(Timeline):
     """
     A state timeline whose value decays over time unless refreshed
@@ -98,6 +329,7 @@ def ilp_schedule_workflow_stochastic(
         success_probability_function: Callable = lambda r, s, p: 1.0,  # DEPRECATED: use acceptance + execution functions
         acceptance_probability_function: Callable = None,  # p_acc: prob constellation accepts booking
         execution_probability_function: Callable = None,   # p_exec: prob accepted booking executes successfully
+        detection_probability_function: Callable = None,   # p_det: prob target present / in footprint (entry-boundary factor). None => 1.0. Only used by "general_logical_dag".
         epsilon: float = 1e-3,
         pwl_tolerance: float = 1e-1,  # SCIP path only; the Gurobi path now uses exact MINLP handling (FuncNonlinear=1)
         mip_gap: float = 0.05,
@@ -131,7 +363,9 @@ def ilp_schedule_workflow_stochastic(
     receding_horizon_duration : dt.timedelta
         Planning horizon window
     stochastic_formulation : str
-        "non_convex" (exact quadratic) or "log_linearized" (PWL approximation)
+        "non_convex" (exact quadratic), "log_linearized" (PWL approximation), or
+        "general_logical_dag" (arbitrary AND/OR/NOT prerequisite gates via DSOP,
+        with a p_det entry-boundary factor -- see _build_general_logical_formulation)
     success_probability_function : Callable
         Function(request, satellite, pass) -> float in [0,1]
         Returns probability of successful observation
@@ -165,7 +399,8 @@ def ilp_schedule_workflow_stochastic(
             stochastic_formulation, success_probability_function,
             acceptance_probability_function, execution_probability_function,
             epsilon, pwl_tolerance, tax_rate, submission_cost_rate, execution_cost_rate,
-            mip_gap=mip_gap, default_max_instances=default_max_instances, results_dir=results_dir
+            mip_gap=mip_gap, default_max_instances=default_max_instances, results_dir=results_dir,
+            detection_probability_function=detection_probability_function
         )
     elif solver_engine == "SCIP":
         return _solve_with_scip(
@@ -220,7 +455,8 @@ def _solve_with_gurobi(
         execution_cost_rate: float,
         mip_gap: float,
         default_max_instances: int,
-        results_dir: str
+        results_dir: str,
+        detection_probability_function: Callable = None
 ):
     """Solve stochastic scheduling problem using native Gurobi."""
     # Build Gurobi environment
@@ -256,9 +492,15 @@ def _solve_with_gurobi(
             # _build_log_linearized_formulation.
             model.setParam('TimeLimit', max_solver_time_s)
             model.setParam('MIPGap', mip_gap)
-            model.setParam('FuncNonlinear', 0)
-            model.setParam('Cuts', 1) 
-            model.setParam('Threads', 10)                
+            # general_logical_dag uses FuncNonlinear=1 (exact MINLP via outer
+            # approximation + spatial branching). The base log_linearized path
+            # relies on cuts/tightening that work best with PWL (FuncNonlinear=0).
+            if stochastic_formulation == "general_logical_dag":
+                model.setParam('FuncNonlinear', 1)
+            else:
+                model.setParam('FuncNonlinear', 0)
+            model.setParam('Cuts', 1)
+            model.setParam('Threads', 10)
             model.setParam('OutputFlag', 1)
             if results_dir:
                 model.setParam('LogFile', os.path.join(results_dir, "gurobi_stochastic.log"))
@@ -369,6 +611,7 @@ def _solve_with_gurobi(
                         print(f"[Stochastic Scheduler] All passes infeasible for {constrained_request.observation_request.name}")
 
             # Step 4: Build stochastic formulation
+            _general_logical_warm_start_fn = None
             if stochastic_formulation == "non_convex":
                 _build_non_convex_formulation(
                     model, workflow_graph, solution_holder, task_to_passes,
@@ -378,6 +621,13 @@ def _solve_with_gurobi(
                 _build_log_linearized_formulation(
                     model, workflow_graph, solution_holder, task_to_passes,
                     epsilon, pwl_tolerance, tax_rate, submission_cost_rate, execution_cost_rate, verbose
+                )
+            elif stochastic_formulation == "general_logical_dag":
+                _general_logical_warm_start_fn = _build_general_logical_formulation(
+                    model, workflow_graph, solution_holder, task_to_passes,
+                    epsilon, tax_rate, submission_cost_rate, execution_cost_rate, verbose,
+                    detection_probability_function=detection_probability_function,
+                    default_max_instances=default_max_instances
                 )
             else:
                 raise ValueError(f"Unknown stochastic_formulation: {stochastic_formulation}")
@@ -410,6 +660,7 @@ def _solve_with_gurobi(
             # or discards the start if constraints make it infeasible; no risk.
             try:
                 _busy = {}
+                _greedy_x = {}  # (req, sat, sp) -> 0.0 or 1.0 for warm-start propagation
                 for _req in sorted(
                         solution_holder.keys(),
                         key=lambda r: -(max((solution_holder[r][s][p]['quality']
@@ -422,10 +673,16 @@ def _solve_with_gurobi(
                         _e0 = _sp.highest.time + _sp.highest.duration
                         if (not _placed) and all(_e0 <= s or _s0 >= e for (s, e) in _busy.get(_sat, [])):
                             _x.Start = 1.0
+                            _greedy_x[(_req, _sat, _sp)] = 1.0
                             _busy.setdefault(_sat, []).append((_s0, _e0))
                             _placed = True
                         else:
                             _x.Start = 0.0
+                            _greedy_x[(_req, _sat, _sp)] = 0.0
+                # For general_logical_dag, propagate binary assignment through the
+                # continuous variable chain so the MIP start is feasible.
+                if _general_logical_warm_start_fn is not None:
+                    _general_logical_warm_start_fn(_greedy_x)
             except Exception as _e:
                 if verbose > 0:
                     print(f"[Stochastic Scheduler] MIP start skipped: {_e}")
@@ -1365,46 +1622,585 @@ def _build_non_convex_formulation(
             )
 
     # === STEP 4: OBJECTIVE COMPILER ===
-    # New objective: Maximize E[Quality] - (submission cost + cancellation cost)
+    # Costs use pass-specific quality q_k (not Q_max) to match simulator billing.
+    # Execution cost uses theta_acc = p_acc: charged on both DATA_RECEIVED and
+    # EXECUTION_FAILED in the simulator (both require acceptance).
     objective_terms = []
     for constrained_request in solution_holder.keys():
-        # Skip tasks with no feasible passes
         if not solution_holder[constrained_request]:
             continue
-
-        # Find max quality among all feasible passes for this request
-        all_qualities = [
-            solution_holder[constrained_request][sat][sp]['quality']
-            for sat in solution_holder[constrained_request].keys()
-            for sp in solution_holder[constrained_request][sat].keys()
-        ]
-
-        if not all_qualities:
-            continue  # Skip if no passes available
-
-        _max_quality_for_request = max(all_qualities)
-
-        # Compute costs as fractions of max quality for this request
-        c_sub = submission_cost_rate * _max_quality_for_request
-        c_canc = cancellation_cost_rate * _max_quality_for_request
-        c_tax = tax_rate * _max_quality_for_request  # Legacy tax
 
         for satellite, satpass in task_to_passes[constrained_request]:
             x_var = solution_holder[constrained_request][satellite][satpass]['x']
             quality = solution_holder[constrained_request][satellite][satpass]['quality']
-            theta = solution_holder[constrained_request][satellite][satpass]['theta']  # p_acc * p_exec
+            theta = solution_holder[constrained_request][satellite][satpass]['theta']
             theta_acc = solution_holder[constrained_request][satellite][satpass]['theta_acc']
             w_abs = w_abs_vars[(constrained_request, satellite, satpass)]
 
-            # Expected Reward
-            objective_terms.append(quality * theta * w_abs)
+            c_sub  = submission_cost_rate * quality
+            c_canc = cancellation_cost_rate * quality
+            c_tax  = tax_rate * quality
 
-            # Costs: execution cost conditional on full execution (theta), not just acceptance.
+            objective_terms.append(quality * theta * w_abs)
             objective_terms.append(-c_sub * x_var)
-            objective_terms.append(-c_canc * theta * x_var)
+            objective_terms.append(-c_canc * theta_acc * x_var)
             objective_terms.append(-c_tax * x_var)
 
     model.setObjective(gp.quicksum(objective_terms), GRB.MAXIMIZE)
+
+
+def _get_gate(node):
+    """Return the prerequisite Gate attached to a node, or None.
+
+    Observation tasks (ConstrainedObservationRequest) may carry an optional
+    `.gate` attribute set by a workflow builder; LogicNodes always carry `.gate`.
+    """
+    return getattr(node, "gate", None)
+
+
+def build_logical_dag(observation_tasks, workflow_graph=None):
+    """Collect the full node universe for the general logical formulation.
+
+    Starting from the observation tasks (the nodes that have candidate passes),
+    transitively discover every LogicNode referenced by their gates (and by the
+    gates of those LogicNodes, recursively). Returns
+
+        (ordered_nodes, dsop_of, is_logic)
+
+    where `ordered_nodes` is a dependency-topological order (every literal a
+    node's gate references appears before that node), `dsop_of[node]` is the
+    compiled DSOP path list for nodes that have a gate (None otherwise), and
+    `is_logic[node]` marks LogicNodes (no passes, no reward).
+
+    Backward compatibility: if NO node carries a gate, this returns the pure-AND
+    interpretation implicitly (dsop_of all None), and the caller falls back to
+    the AND-over-graph-ancestors entry boundary -- matching the base formulation.
+    """
+    # 1. Transitive discovery of every node reachable through gates: LogicNodes
+    #    AND observation tasks (the latter may be gate literals that are no longer
+    #    schedulable -- already dispatched/completed -- and hence absent from the
+    #    caller's observation_tasks list; they still need a local-success value so
+    #    downstream gates can reference them, handled as constants by the builder).
+    universe = list(observation_tasks)
+    seen = set(id(n) for n in universe)
+    frontier = list(observation_tasks)
+    while frontier:
+        node = frontier.pop()
+        gate = _get_gate(node)
+        if gate is None:
+            continue
+        for lit_node in gate.literals():
+            if id(lit_node) not in seen:
+                seen.add(id(lit_node))
+                universe.append(lit_node)
+                frontier.append(lit_node)
+
+    # 2. Dependency edges: literal -> node (literal must be built first).
+    #    Build a dependency graph over the universe and topologically sort it.
+    dep = nx.DiGraph()
+    for node in universe:
+        dep.add_node(id(node))
+    id_to_node = {id(n): n for n in universe}
+    for node in universe:
+        gate = _get_gate(node)
+        if gate is None:
+            continue
+        for lit_node in gate.literals():
+            if id(lit_node) in id_to_node:  # only intra-universe deps
+                dep.add_edge(id(lit_node), id(node))
+    if not nx.is_directed_acyclic_graph(dep):
+        cycle = nx.find_cycle(dep)
+        raise ValueError(f"Logical-DAG gate dependencies contain a cycle: {cycle}")
+    ordered_nodes = [id_to_node[i] for i in nx.topological_sort(dep)]
+
+    # 3. Compile each gate to DSOP once. ExclusiveOr gates are NOT compiled --
+    #    they are disjoint groups handled as a linear sum by the builder (the
+    #    DSOP compiler would wrongly treat them as an independent OR). A node
+    #    with an ExclusiveOr gate gets dsop_of == None but is still gated (the
+    #    builder distinguishes it by inspecting the gate type).
+    dsop_of = {}
+    is_logic = {}
+    for node in ordered_nodes:
+        is_logic[node] = isinstance(node, LogicNode)
+        gate = _get_gate(node)
+        if gate is None or isinstance(gate, ExclusiveOr):
+            dsop_of[node] = None
+        else:
+            dsop_of[node] = _compile_gate_to_dsop(gate)
+    return ordered_nodes, dsop_of, is_logic
+
+
+def _gate_eval_bool(gate: Gate, realized: dict) -> bool:
+    """Evaluate a gate to a definite bool under a TOTAL success assignment.
+
+    `realized[node]` gives each literal node's realized success (True/False).
+    Missing literals are treated as False (never succeeded). Unlike `_gate_eval`
+    (which returns None for partial assignments during DSOP compilation), this
+    assumes every literal is decided, so it always returns True/False.
+    """
+    if isinstance(gate, Lit):
+        return bool(realized.get(gate.node, False))
+    if isinstance(gate, Not):
+        return not _gate_eval_bool(gate.operand, realized)
+    if isinstance(gate, And):
+        return all(_gate_eval_bool(g, realized) for g in gate.operands)
+    if isinstance(gate, Or):
+        return any(_gate_eval_bool(g, realized) for g in gate.operands)
+    if isinstance(gate, ExclusiveOr):
+        return any(_gate_eval_bool(m, realized) for m in gate.members)
+    raise TypeError(f"Unknown gate type: {type(gate)}")
+
+
+def compute_gate_reachability(observation_tasks, success_of):
+    """Gate-aware reachability for a logical (gate-based) workflow.
+
+    A task is REACHABLE iff the branch that leads to it was actually taken in
+    simulation -- i.e. its prerequisite gate evaluates True under the realized
+    per-task success outcomes. This is the fair denominator for the MSA workflow,
+    whose windows are mutually exclusive (image XOR search) and whose search
+    hexes are disjoint (ExclusiveOr): only ~one branch per window is ever live,
+    so counting all 1 + W*(1+N) tasks as the denominator is misleading.
+
+    Args:
+        observation_tasks: the schedulable observation tasks (workflow_graph
+            nodes). Their gates transitively reference LogicNodes and each other.
+        success_of: callable(task) -> bool, the realized successful execution of
+            an OBSERVATION task (LogicNodes are derived from their gates).
+
+    Returns:
+        (reachable_obs_tasks, realized) where reachable_obs_tasks is the set of
+        observation tasks whose gate fired, and realized maps every node
+        (observation tasks AND LogicNodes) to its realized boolean success.
+        A gate-free (root) task is always reachable.
+    """
+    ordered_nodes, _dsop, is_logic = build_logical_dag(list(observation_tasks))
+
+    # Forward pass in dependency order: each node's realized success is known
+    # before any node whose gate references it (topological guarantee).
+    realized = {}
+    for node in ordered_nodes:
+        gate = _get_gate(node)
+        if is_logic[node]:
+            # Belief-state node: its "success" is the truth of its gate.
+            realized[node] = _gate_eval_bool(gate, realized) if gate is not None else False
+        else:
+            # Observation task: realized success comes from the simulation.
+            realized[node] = bool(success_of(node))
+
+    obs_set = set(observation_tasks)
+    reachable = set()
+    for node in ordered_nodes:
+        if is_logic[node] or node not in obs_set:
+            continue
+        gate = _get_gate(node)
+        if gate is None or _gate_eval_bool(gate, realized):
+            reachable.add(node)
+    return reachable, realized
+
+
+def _build_general_logical_formulation(
+        model: gp.Model,
+        workflow_graph: nx.MultiDiGraph,
+        solution_holder: dict,
+        task_to_passes: dict,
+        epsilon: float,
+        tax_rate: float,
+        submission_cost_rate: float,
+        cancellation_cost_rate: float,
+        verbose: int,
+        detection_probability_function: Callable = None,
+        default_max_instances: int = 3
+):
+    """General AND/OR/NOT stochastic formulation (paper Sec. "Generalization to
+    Arbitrary AND/OR Dependencies").
+
+    Differences from `_build_log_linearized_formulation` (the pure-AND base):
+
+    1. ENTRY BOUNDARY FROM AN EXPLICIT GATE. Instead of A_parents = prod over
+       graph-ancestors, each node's prerequisite is a Boolean gate compiled to a
+       Disjoint Sum Of Products. With ln S_i and ln F_i = ln(1 - S_i) available
+       for every ancestor literal,
+           ln P(D_k) = sum_{i in pos} ln S_i + sum_{j in neg} ln F_j
+           P(D_k)    = exp(ln P(D_k))                    (one exp per path)
+           A_parents = sum_k P(D_k)                      (linear, disjoint paths)
+       Nodes with NO gate fall back to the AND-over-graph-ancestors boundary, so
+       gate-free workflows (e.g. volcano) reproduce the base formulation.
+
+    2. TWO-SIDED LOG PROTECTION. Negative literals need ln(1 - S), so S is
+       contracted into the OPEN interval: S_prot = S*(1 - 2 eps) + eps in
+       [eps, 1 - eps], giving finite ln S and ln F for any feasible schedule.
+
+    3. p_det ENTRY FACTOR. The horizontal timeline starts at
+           Y_0 = A_parents * p_det
+       where p_det (target present / in footprint) is a per-task CONSTANT from
+       detection_probability_function (default 1.0). This is the correct place
+       for a factor shared across a task's passes -- moving it out of the per-pass
+       recurrence stops the redundancy machinery from over-crediting backup
+       passes for a target that may simply be absent. p_det = 1 reproduces the
+       base behavior exactly.
+
+    4. LOGIC NODES. Belief-state nodes (e.g. MSA K_w) carry a gate but no passes.
+       Their local success S equals their gate probability A_parents; they emit
+       no reward and no bookings. They exist only to be referenced as literals by
+       downstream gates.
+
+    Everything else (McCormick horizontal recurrence, instance caps, conflicts,
+    temporal constraints via _add_workflow_constraints, extraction) is shared
+    with the base path.
+    """
+    import math
+
+    ln_eps = math.log(epsilon)
+    LN_FLOOR = -1000.0
+
+    observation_tasks = list(solution_holder.keys())
+    ordered_nodes, dsop_of, is_logic = build_logical_dag(observation_tasks, workflow_graph)
+
+    any_gate = any(dsop_of[n] is not None for n in ordered_nodes)
+    if verbose > 0:
+        n_logic = sum(1 for n in ordered_nodes if is_logic[n])
+        n_paths = sum(len(dsop_of[n]) for n in ordered_nodes if dsop_of[n] is not None)
+        print(f"[General-Logical] {len(ordered_nodes)} nodes "
+              f"({n_logic} logic/state, {len(observation_tasks)} observation); "
+              f"{n_paths} DSOP paths; "
+              f"{'GATES present' if any_gate else 'no gates -> pure-AND fallback'}.")
+
+    # Per-node continuous variables.
+    A_parents = {}   # gate probability P(G_r)  (entry boundary, pre-p_det)
+    S_local = {}     # LOCAL success S_r = P(r fulfilled | parents reached).
+                     #   This is the literal probability used by downstream gates.
+                     #   For observation nodes S_r = p_det * (1 - y_{K_r}) from the
+                     #   UNSCALED local track (linear, exact -- see .tex footnote).
+                     #   For logic nodes S_r == A_parents (== gate probability).
+    ln_S = {}        # ln S_prot (positive literal)
+    ln_F = {}        # ln(1 - S_prot) (negative literal)
+    Y = {}           # SCALED remaining risk (for reward): Y_0 = A_parents * p_det
+    W_abs = {}       # linearized x*Y per pass (reward-carrying mass)
+
+    # Ancestor closure over the workflow graph (for the pure-AND fallback only).
+    def _graph_ancestors(node):
+        if workflow_graph is not None and node in workflow_graph:
+            return [a for a in nx.ancestors(workflow_graph, node) if a in solution_holder]
+        return []
+
+    def _p_det_for(node):
+        if detection_probability_function is None:
+            return 1.0
+        if task_to_passes.get(node):
+            _sat0, _sp0 = task_to_passes[node][0]
+            v = float(detection_probability_function(node, _sat0, _sp0))
+        else:
+            v = float(detection_probability_function(node, None, None))
+        return min(1.0, max(0.0, v))
+
+    # Helper: two-sided protected logs of a local-success source (var or const).
+    def _emit_logs(node, name, s_source):
+        s_prot = model.addVar(lb=epsilon, ub=1.0 - epsilon,
+                              vtype=GRB.CONTINUOUS, name=f"S_prot_{name}")
+        model.addConstr(s_prot == s_source * (1.0 - 2.0 * epsilon) + epsilon,
+                        name=f"prot_{name}")
+        lnS = model.addVar(lb=ln_eps, ub=math.log(1.0 - epsilon),
+                           vtype=GRB.CONTINUOUS, name=f"ln_S_{name}")
+        model.addGenConstrLog(s_prot, lnS, name=f"log_S_{name}")
+        one_minus = model.addVar(lb=epsilon, ub=1.0 - epsilon,
+                                 vtype=GRB.CONTINUOUS, name=f"F_prot_{name}")
+        model.addConstr(one_minus == 1.0 - s_prot, name=f"Fprot_{name}")
+        lnF = model.addVar(lb=ln_eps, ub=math.log(1.0 - epsilon),
+                           vtype=GRB.CONTINUOUS, name=f"ln_F_{name}")
+        model.addGenConstrLog(one_minus, lnF, name=f"log_F_{name}")
+        ln_S[node] = lnS
+        ln_F[node] = lnF
+
+    for node in ordered_nodes:
+        name = _node_name(node)
+        gate = _get_gate(node)
+        gate_paths = dsop_of[node]
+
+        # === Resolved observation tasks (constant literal) ====================
+        # A gate may reference an observation task that is already dispatched or
+        # completed and hence NOT in solution_holder (it has no decision vars this
+        # solve). Its local success is a CONSTANT read from the realized outcome:
+        # 1.0 if it executed successfully, else 0.0. It contributes no reward and
+        # no A_parents machinery -- only ln_S / ln_F for downstream gate literals.
+        if not is_logic[node] and node not in solution_holder:
+            realized = 1.0 if getattr(node, 'successful_execution', False) else 0.0
+            S_local[node] = realized
+            _emit_logs(node, name, realized)
+            continue
+
+        # === Entry boundary A_parents = P(gate) ===============================
+        A_parents[node] = model.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS,
+                                       name=f"A_parents_{name}")
+        if isinstance(gate, ExclusiveOr):
+            # Disjoint group: P = sum_j S_j (linear, <= 1 automatically). No DSOP,
+            # no exp. Members are Lit gates over already-built literal nodes.
+            member_nodes = [m.node for m in gate.members]
+            model.addConstr(
+                A_parents[node] == gp.quicksum(S_local[m] for m in member_nodes),
+                name=f"Aparents_xor_{name}")
+        elif gate_paths is not None:
+            # DSOP: A_parents = sum_k P(D_k), each path an exp of a linear log sum.
+            path_prob_vars = []
+            for k, (pos, neg) in enumerate(gate_paths):
+                if not pos and not neg:
+                    pk = model.addVar(lb=1.0, ub=1.0, vtype=GRB.CONTINUOUS,
+                                      name=f"D_{name}_{k}")
+                    path_prob_vars.append(pk)
+                    continue
+                ln_pk = model.addVar(lb=LN_FLOOR, ub=0.0, vtype=GRB.CONTINUOUS,
+                                     name=f"lnD_{name}_{k}")
+                model.addConstr(
+                    ln_pk == gp.quicksum(ln_S[i] for i in pos)
+                             + gp.quicksum(ln_F[j] for j in neg),
+                    name=f"lnD_def_{name}_{k}")
+                pk = model.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS,
+                                  name=f"D_{name}_{k}")
+                model.addGenConstrExp(ln_pk, pk, name=f"exp_D_{name}_{k}")
+                path_prob_vars.append(pk)
+            model.addConstr(A_parents[node] == gp.quicksum(path_prob_vars),
+                            name=f"Aparents_dsop_{name}")
+        else:
+            # No gate: pure-AND fallback over graph ancestors (base-formulation
+            # parity for gate-free workflows such as volcano).
+            ancs = _graph_ancestors(node)
+            if not ancs:
+                model.addConstr(A_parents[node] == 1.0, name=f"root_Ap_{name}")
+            else:
+                ln_ap = model.addVar(lb=LN_FLOOR, ub=0.0, vtype=GRB.CONTINUOUS,
+                                     name=f"ln_A_parents_{name}")
+                model.addConstr(ln_ap == gp.quicksum(ln_S[a] for a in ancs),
+                                name=f"join_lnAp_{name}")
+                model.addGenConstrExp(ln_ap, A_parents[node], name=f"exp_Ap_{name}")
+
+        # === Local success S_r ================================================
+        if is_logic[node]:
+            # Logic/state node: no passes, no reward. Local success == gate prob.
+            S_local[node] = A_parents[node]
+        else:
+            p_det = _p_det_for(node)
+            passes = task_to_passes[node]
+            K_r = len(passes)
+
+            # --- UNSCALED local track: y_0 = 1, y_{k+1} = y_k - theta_k*(x_k*y_k)
+            #     recovers S_r = p_det * (1 - y_{K_r}), the LOCAL success used as a
+            #     downstream literal. Linear/exact via McCormick; independent of
+            #     A_parents so it never double-counts ancestor probability.
+            y = {0: model.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS,
+                                 name=f"y_{name}_k0")}
+            model.addConstr(y[0] == 1.0, name=f"y0_{name}")
+            for k in range(1, K_r + 1):
+                y[k] = model.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS,
+                                    name=f"y_{name}_k{k}")
+
+            # --- SCALED reward track: Y_0 = A_parents * p_det (entry factor). ---
+            Y[(node, 0)] = model.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS,
+                                        name=f"Y_{name}_k0")
+            model.addConstr(Y[(node, 0)] == p_det * A_parents[node],
+                            name=f"inject_{name}")
+            for k in range(1, K_r + 1):
+                Y[(node, k)] = model.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS,
+                                            name=f"Y_{name}_k{k}")
+
+            for k, (satellite, satpass) in enumerate(passes):
+                x_var = solution_holder[node][satellite][satpass]['x']
+                theta_k = solution_holder[node][satellite][satpass]['theta']
+                x_var.BranchPriority = 10
+
+                # unscaled McCormick w_loc = x * y_k
+                w_loc = model.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS,
+                                     name=f"wloc_{name}_k{k}")
+                model.addConstr(w_loc <= x_var, name=f"mcl1_{name}_k{k}")
+                model.addConstr(w_loc <= y[k], name=f"mcl2_{name}_k{k}")
+                model.addConstr(w_loc >= y[k] - (1.0 - x_var), name=f"mcl3_{name}_k{k}")
+                model.addConstr(y[k + 1] == y[k] - theta_k * w_loc,
+                                name=f"recl_{name}_k{k}")
+
+                # scaled McCormick W_abs = x * Y_k  (reward-carrying)
+                w = model.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS,
+                                 name=f"w_abs_{name}_k{k}")
+                W_abs[(node, satellite, satpass)] = w
+                Y_cur = Y[(node, k)]
+                model.addConstr(w <= x_var, name=f"mc1_{name}_k{k}")
+                model.addConstr(w <= Y_cur, name=f"mc2_{name}_k{k}")
+                model.addConstr(w >= Y_cur - (1.0 - x_var), name=f"mc3_{name}_k{k}")
+                model.addConstr(Y[(node, k + 1)] == Y_cur - theta_k * w,
+                                name=f"rec_{name}_k{k}")
+
+            # Local success S_r = p_det * (1 - y_{K_r}).
+            S_local[node] = model.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS,
+                                         name=f"S_{name}")
+            model.addConstr(S_local[node] == p_det * (1.0 - y[K_r]),
+                            name=f"Sdef_{name}")
+
+        # === Two-sided protected logs of the LOCAL success ====================
+        # Needed for downstream literals: ln S (positive) and ln F = ln(1 - S)
+        # (negative). Contract S into [eps, 1 - eps] so both logs stay finite.
+        _emit_logs(node, name, S_local[node])
+
+    # === OBJECTIVE — only observation nodes contribute reward. =================
+    # Costs use pass-specific quality q_k (not Q_max) to match simulator billing.
+    # Execution cost uses theta_acc = p_acc: charged on both DATA_RECEIVED and
+    # EXECUTION_FAILED in the simulator (both require acceptance).
+    objective_terms = []
+    for node in observation_tasks:
+        if not solution_holder[node]:
+            continue
+        for satellite, satpass in task_to_passes[node]:
+            x_var = solution_holder[node][satellite][satpass]['x']
+            quality = solution_holder[node][satellite][satpass]['quality']
+            theta = solution_holder[node][satellite][satpass]['theta']
+            theta_acc = solution_holder[node][satellite][satpass]['theta_acc']
+            w = W_abs[(node, satellite, satpass)]
+
+            c_sub  = submission_cost_rate * quality
+            c_canc = cancellation_cost_rate * quality
+            c_tax  = tax_rate * quality
+
+            objective_terms.append(quality * theta * w)
+            objective_terms.append(-c_sub * x_var)
+            objective_terms.append(-c_canc * theta_acc * x_var)
+            if c_tax:
+                objective_terms.append(-c_tax * x_var)
+
+    model.setObjective(gp.quicksum(objective_terms), GRB.MAXIMIZE)
+
+    # === Return a warm-start closure ==========================================
+    # Captures all variable handles so the caller can propagate a binary x
+    # assignment through the entire continuous chain before calling optimize().
+    # All per-node state dicts (A_parents, S_local, Y, W_abs, ln_S, ln_F) are
+    # captured by closure; the caller passes x_vals: {(req,sat,sp)->0|1}.
+    _ws_ordered_nodes = ordered_nodes
+    _ws_is_logic = is_logic
+    _ws_dsop_of = dsop_of
+    _ws_A_parents = A_parents
+    _ws_S_local = S_local
+    _ws_ln_S = ln_S
+    _ws_ln_F = ln_F
+    _ws_Y = Y
+    _ws_W_abs = W_abs
+    _ws_solution_holder = solution_holder
+    _ws_task_to_passes = task_to_passes
+    _ws_epsilon = epsilon
+
+    def _warm_start_fn(x_vals: dict) -> None:
+        """Set .Start on all continuous vars given a binary x assignment.
+
+        x_vals: {(req, sat, sp) -> 0.0 or 1.0}
+        Works by a forward numerical pass in topological order.
+        """
+        import math as _math
+
+        # Numerical S_local values (same meaning as the Gurobi S_local vars).
+        _S_num: dict = {}
+
+        for node in _ws_ordered_nodes:
+            # Resolved (dispatched/completed) obs task: constant.
+            if not _ws_is_logic[node] and node not in _ws_solution_holder:
+                realized = 1.0 if getattr(node, 'successful_execution', False) else 0.0
+                _S_num[node] = realized
+                # Set S_prot, ln_S, ln_F .Start for this constant node.
+                _s_prot_v = realized * (1.0 - 2.0 * _ws_epsilon) + _ws_epsilon
+                _s_prot_v = max(_ws_epsilon, min(1.0 - _ws_epsilon, _s_prot_v))
+                _ln_s_v = _math.log(_s_prot_v)
+                _ln_f_v = _math.log(1.0 - _s_prot_v)
+                if _ws_ln_S.get(node) is not None:
+                    _ws_ln_S[node].Start = _ln_s_v
+                    _ws_ln_F[node].Start = _ln_f_v
+                continue
+
+            gate = _get_gate(node)
+            gate_paths = _ws_dsop_of[node]
+
+            # --- Numerical A_parents ---
+            if isinstance(gate, ExclusiveOr):
+                _ap_num = sum(_S_num.get(m.node, 0.0) for m in gate.members)
+            elif gate_paths is not None:
+                _ap_num = 0.0
+                for pos, neg in gate_paths:
+                    _lnpk = sum(_math.log(max(_ws_epsilon, _S_num.get(i, _ws_epsilon)))
+                                for i in pos)
+                    _lnpk += sum(_math.log(max(_ws_epsilon, 1.0 - _S_num.get(j, 1.0 - _ws_epsilon)))
+                                 for j in neg)
+                    _ap_num += _math.exp(_lnpk)
+            else:
+                # Pure-AND fallback: product over graph-ancestor S_num.
+                _ap_num = 1.0
+                if workflow_graph is not None and node in workflow_graph:
+                    for anc in nx.ancestors(workflow_graph, node):
+                        if anc in _ws_solution_holder and anc in _S_num:
+                            _ap_num *= max(_ws_epsilon, _S_num[anc])
+
+            _ap_num = max(0.0, min(1.0, _ap_num))
+            if _ws_A_parents.get(node) is not None:
+                _ws_A_parents[node].Start = _ap_num
+
+            if _ws_is_logic[node]:
+                _S_num[node] = _ap_num
+            else:
+                p_det = 1.0
+                if detection_probability_function is not None:
+                    _passes = _ws_task_to_passes.get(node, [])
+                    if _passes:
+                        _sat0, _sp0 = _passes[0]
+                        p_det = float(detection_probability_function(node, _sat0, _sp0))
+                        p_det = max(0.0, min(1.0, p_det))
+
+                passes = _ws_task_to_passes.get(node, [])
+                K_r = len(passes)
+
+                # Forward pass through unscaled y[] track (y[0] = 1).
+                _y_num = {0: 1.0}
+                for k, (sat, sp) in enumerate(passes):
+                    xv = x_vals.get((node, sat, sp), 0.0)
+                    theta_k = _ws_solution_holder[node][sat][sp]['theta']
+                    w_loc_num = xv * _y_num[k]
+                    _y_num[k + 1] = _y_num[k] - theta_k * w_loc_num
+
+                s_num = p_det * (1.0 - _y_num[K_r])
+                _S_num[node] = max(0.0, min(1.0, s_num))
+
+                # Forward pass through scaled Y[] track (Y[0] = A_parents * p_det).
+                _Y_num = {0: _ap_num * p_det}
+                for k, (sat, sp) in enumerate(passes):
+                    xv = x_vals.get((node, sat, sp), 0.0)
+                    theta_k = _ws_solution_holder[node][sat][sp]['theta']
+                    w_abs_num = xv * _Y_num[k]
+                    _Y_num[k + 1] = _Y_num[k] - theta_k * w_abs_num
+                    # Set .Start on Y vars and W_abs vars if accessible by name.
+                    _yvar_k = model.getVarByName(f"Y_{_node_name(node)}_k{k}")
+                    if _yvar_k is not None:
+                        _yvar_k.Start = max(0.0, min(1.0, _Y_num[k]))
+                    _wabs_var = _ws_W_abs.get((node, sat, sp))
+                    if _wabs_var is not None:
+                        _wabs_var.Start = max(0.0, min(1.0, w_abs_num))
+                    _y0var = model.getVarByName(f"y_{_node_name(node)}_k{k}")
+                    if _y0var is not None:
+                        _y0var.Start = max(0.0, min(1.0, _y_num[k]))
+                _yvar_Kr = model.getVarByName(f"Y_{_node_name(node)}_k{K_r}")
+                if _yvar_Kr is not None:
+                    _yvar_Kr.Start = max(0.0, min(1.0, _Y_num[K_r]))
+                _y0var_Kr = model.getVarByName(f"y_{_node_name(node)}_k{K_r}")
+                if _y0var_Kr is not None:
+                    _y0var_Kr.Start = max(0.0, min(1.0, _y_num[K_r]))
+                _y0var_0 = model.getVarByName(f"y_{_node_name(node)}_k0")
+                if _y0var_0 is not None:
+                    _y0var_0.Start = 1.0
+                _Y0var = model.getVarByName(f"Y_{_node_name(node)}_k0")
+                if _Y0var is not None:
+                    _Y0var.Start = max(0.0, min(1.0, _ap_num * p_det))
+                _svar = model.getVarByName(f"S_{_node_name(node)}")
+                if _svar is not None:
+                    _svar.Start = _S_num[node]
+
+            # Set .Start on ln_S / ln_F vars.
+            _s_v = max(_ws_epsilon, min(1.0 - _ws_epsilon, _S_num[node]))
+            _s_prot_v = _s_v * (1.0 - 2.0 * _ws_epsilon) + _ws_epsilon
+            _s_prot_v = max(_ws_epsilon, min(1.0 - _ws_epsilon, _s_prot_v))
+            if _ws_ln_S.get(node) is not None:
+                _ws_ln_S[node].Start = _math.log(_s_prot_v)
+                _ws_ln_F[node].Start = _math.log(1.0 - _s_prot_v)
+
+    return _warm_start_fn
 
 
 def _build_log_linearized_formulation(
@@ -1809,25 +2605,23 @@ def _build_log_linearized_formulation(
                 == ln_A_vars[constrained_request] - ln_A_parents_vars[constrained_request],
                 name=f"lnS_{req_name}")
 
-    # === OBJECTIVE (paper Eq. 34) ==============================================
-    # Maximize sum_k Q_k * p_k * W_abs_k  -  sum_k (c_sub + c_exec * p_acc + c_tax) * x_k
+    # === OBJECTIVE =============================================================
+    # Maximize sum_k Q_k * theta_k * W_abs_k
+    #         - sum_k (c_sub_k + c_exec_k * theta_acc_k + c_tax_k) * x_k
+    #
+    # Costs are scaled by the PASS-SPECIFIC quality q_k (not Q_max) so that the
+    # planning objective exactly matches what compute_metrics_v3 charges in the
+    # simulator: c_sub * q_k unconditionally, c_exec * q_k if accepted.
+    # Using Q_max for every pass would over-penalise low-quality backup passes
+    # and make the planner more conservative than optimal.
+    #
+    # Execution cost uses theta_acc (= p_acc), NOT theta (= p_acc * p_exec):
+    # the simulator bills execution cost for both DATA_RECEIVED and
+    # EXECUTION_FAILED — both require acceptance, so expected cost = p_acc.
     objective_terms = []
     for constrained_request in topo:
         if not solution_holder[constrained_request]:
             continue
-
-        all_qualities = [
-            solution_holder[constrained_request][sat][sp]['quality']
-            for sat in solution_holder[constrained_request].keys()
-            for sp in solution_holder[constrained_request][sat].keys()
-        ]
-        if not all_qualities:
-            continue
-
-        _max_quality_for_request = max(all_qualities)
-        c_sub = submission_cost_rate * _max_quality_for_request
-        c_canc = cancellation_cost_rate * _max_quality_for_request
-        c_tax = tax_rate * _max_quality_for_request  # legacy tax; set tax_rate=0 for paper-exact objective
 
         for satellite, satpass in task_to_passes[constrained_request]:
             x_var = solution_holder[constrained_request][satellite][satpass]['x']
@@ -1836,15 +2630,17 @@ def _build_log_linearized_formulation(
             theta_acc = solution_holder[constrained_request][satellite][satpass]['theta_acc']
             w_abs = effective_pass_realization[(constrained_request, satellite, satpass)]
 
+            c_sub  = submission_cost_rate * quality
+            c_canc = cancellation_cost_rate * quality
+            c_tax  = tax_rate * quality
+
             # Expected best-success quality credit for this pass.
-            objective_terms.append(quality * theta_acc * w_abs) #For now just consider the acceptance probability because execution failure is yet not implemented in the simulation
-            # Unconditional submission overhead.
+            objective_terms.append(quality * theta * w_abs)
+            # Unconditional submission overhead (paid regardless of acceptance).
             objective_terms.append(-c_sub * x_var)
-            # Execution cost, conditional on full execution success (p_acc * p_exec).
-            # The simulator charges this at DATA_RECEIVED, so the correct probability
-            # is theta (end-to-end), not theta_acc (acceptance only).
+            # Execution cost, conditional on acceptance (theta_acc = p_acc).
+            # Charged on both DATA_RECEIVED and EXECUTION_FAILED in the simulator.
             objective_terms.append(-c_canc * theta_acc * x_var)
-            # Legacy per-booking tax.
             if c_tax:
                 objective_terms.append(-c_tax * x_var)
 

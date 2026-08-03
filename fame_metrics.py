@@ -18,6 +18,7 @@ def _status_names(ObservationStatus):
         'scheduled': ObservationStatus.SCHEDULED,
         'received': ObservationStatus.DATA_RECEIVED,
         'cancelled': getattr(ObservationStatus, 'CANCELLED', None),
+        'execution_failed': getattr(ObservationStatus, 'EXECUTION_FAILED', None),
     }
 
 
@@ -46,6 +47,7 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
     n_executed = 0
     n_rejected = 0
     n_cancelled = 0
+    n_execution_failed = 0
 
     total_submission_cost = 0.0
     total_execution_cost = 0.0
@@ -53,6 +55,10 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
     best_success_quality_by_task = {}     # task -> float
     executed_count_by_task = {}           # task -> int
     submitted_count_by_task = {}          # task -> int
+
+    _accepted_statuses = {S['scheduled'], S['received']}
+    if S['execution_failed'] is not None:
+        _accepted_statuses.add(S['execution_failed'])
 
     for _, row in reqs.iterrows():
         rp = row['requested_pass']
@@ -77,14 +83,18 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
         if S['cancelled'] is not None and status == S['cancelled']:
             n_cancelled += 1
             # Submission cost already counted above; no execution cost for cancelled passes
-        if status in (S['scheduled'], S['received']):
+        if S['execution_failed'] is not None and status == S['execution_failed']:
+            n_execution_failed += 1
+            # Accepted + executed but failed: pay full execution cost, zero quality
+            total_execution_cost += execution_cost_rate * q
+        if status in _accepted_statuses:
             n_accepted += 1
         if status == S['received']:
             n_executed += 1
             executed_count_by_task[task] = executed_count_by_task.get(task, 0) + 1
             total_execution_cost += execution_cost_rate * q
 
-            # Track best execution quality per task
+            # Track best execution quality per task (only successful executions)
             prev = best_success_quality_by_task.get(task, -np.inf)
             if q > prev:
                 best_success_quality_by_task[task] = q
@@ -188,6 +198,7 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
         'n_executed': n_executed,
         'n_rejected': n_rejected,
         'n_cancelled': n_cancelled,
+        'n_execution_failed': n_execution_failed,
 
         # ---- REDUNDANCY & EFFICIENCY ----
         'submitted_passes_per_task': submitted_passes_per_task,
@@ -207,7 +218,8 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
               f"(sub {total_submission_cost:.1f} + exec {total_execution_cost:.1f}), "
               f"utility {utility:.1f}")
         print(f"   [Metrics] Bookings: {n_submissions} submitted, {n_accepted} accepted, "
-              f"{n_executed} executed, {n_rejected} rejected ({100*rejection_rate:.0f}% rej), "
+              f"{n_executed} executed ok, {n_execution_failed} exec-failed, "
+              f"{n_rejected} rejected ({100*rejection_rate:.0f}% rej), "
               f"{n_cancelled} cancelled, {getattr(broker, '_n_replans', 0)} replans")
         print(f"   [Metrics] TRUE passes/task: {submitted_passes_per_task:.2f} submitted, "
               f"{exec_passes_per_completed:.2f} executed among completed")
