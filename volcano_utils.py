@@ -371,6 +371,7 @@ def create_volcano_workflow(
     max_time: dt.datetime,
     lookahead_horizon_h: int = 18,
     follow_up_interval_h: int = 3,
+    hours_to_detect: int = 6,
     max_num_instances: int = 5,
     wind_speed_kph: float = 40.0,
     wind_heading_deg: float = 45.0,
@@ -409,11 +410,11 @@ def create_volcano_workflow(
             max_value=30.0
         )
         timelines[volcano] = timeline
-
+        max_time_detection = min_time + dt.timedelta(hours=hours_to_detect)
         # 1. Root Eruption Detection Task (RGB, 0-6h window)
         detection_request = ObservationRequest(
             lon_deg=volcano.lon_deg, lat_deg=volcano.lat_deg, alt_km=volcano.alt_km,
-            min_time=min_time, max_time=min_time + dt.timedelta(hours=6),
+            min_time=min_time, max_time=max_time_detection,
             instrument=InstrumentType.RGB,
             request_name=f"{volcano.name}_detection",
             min_elevation_deg=20.0
@@ -436,7 +437,7 @@ def create_volcano_workflow(
 
         # 2. Follow-up Windows (Volume + Plume tasks per window)
         # Start at follow_up_interval_h, not 0, to avoid colliding with the detection task window.
-        for follow_up_ix in range(follow_up_interval_h, lookahead_horizon_h, follow_up_interval_h):
+        for follow_up_ix in range(hours_to_detect, lookahead_horizon_h, follow_up_interval_h):
             obs_task_constraints = [
                 Constraint(
                     ConstraintClass.TEMPORAL, TemporalConstraintType.START_AFTER_OFFSET,

@@ -85,7 +85,7 @@ from benchmarking_utils import (
 # it, so all processes in a campaign share identical orbital geometry.
 SIMULATION_START = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 
-lookahead_horizon_h = 9
+lookahead_horizon_h = 12
 FOLLOW_UP_INTERVAL_H = 3
 MAX_SOLVER_TIME_S = 70
 MAX_NUM_INSTANCES = 5
@@ -99,7 +99,7 @@ EXEC_COST = 0.2             # Conditional execution cost if accepted
 # === PROBABILITY CONFIGURATION ===
 # Acceptance probability range: constellation rejects a booking when its demand
 # is high, accepts when quiet.  DemandField maps demand → p_accept in [P_ACC_MIN, P_ACC_MAX].
-P_ACC_MIN = 1.0            # Minimum acceptance probability (high-demand / congested)
+P_ACC_MIN = 0.70            # Minimum acceptance probability (high-demand / congested)
 P_ACC_MAX = 1.0           # Maximum acceptance probability (low-demand / quiet)
 
 # Execution probability range: even an accepted pass may fail (cloud cover, sensor issue).
@@ -108,7 +108,7 @@ P_ACC_MAX = 1.0           # Maximum acceptance probability (low-demand / quiet)
 P_EXEC_MIN = 1.0           # Minimum execution probability (worst geometry)
 P_EXEC_MAX = 1.0           # Maximum execution probability (best geometry)
 
-SCHEDULERS = ['stochastic_log', 'deterministic', 'greedy', 'random']
+SCHEDULERS = ['greedy','stochastic_log', 'deterministic', 'random']
 #SCHEDULERS = ['stochastic_log','greedy']
 
 # Set to True to cancel inferior pending passes once a better/sufficient one succeeds.
@@ -308,7 +308,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
     )
     
     # ✅ CREATE VOLCANO WORKFLOW WITH DUAL BRANCHES AND PLUME RETARGETING
-    workflow = create_volcano_workflow(volcano_db_locations, min_time, max_time)
+    workflow = create_volcano_workflow(volcano_db_locations, min_time, max_time, lookahead_horizon_h=lookahead_horizon_h)
     
     broker = Broker(constellations=constellations, world=world,
                     name=f"Broker-{scheduler}")
