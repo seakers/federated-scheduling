@@ -86,11 +86,11 @@ from benchmarking_utils import (
 SIMULATION_START = dt.datetime(2026, 8, 1, 0, 0, 0)  # fixed for reproducibility; override with --start
 
 
-lookahead_horizon_h = 12
+lookahead_horizon_h = 36
 FOLLOW_UP_INTERVAL_H = 3
-MAX_SOLVER_TIME_S = 70
-MAX_NUM_INSTANCES = 5
-NUM_MC_RUNS = 3
+MAX_SOLVER_TIME_S = 120
+MAX_NUM_INSTANCES = 10
+NUM_MC_RUNS = 1
 
 # === COST CONFIGURATION ===
 TAX_RATE = 0.0              # Legacy per-booking tax (disabled)
@@ -378,6 +378,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
 
     m = None
     try:
+        _horizon = dt.timedelta(hours=lookahead_horizon_h)
         if scheduler == 'stochastic_log':
             broker.schedule_workflow_redundant(
                 current_time=world.time, use_ilp=True, use_stochastic=True,
@@ -389,6 +390,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 tax_rate=TAX_RATE,
                 max_solver_time_s=MAX_SOLVER_TIME_S, solver_engine="GUROBI",
                 update_timelines=False, update_requests=False,
+                receding_horizon_duration=_horizon,
                 max_reschedule_depth=10000,
                 plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
                 results_path=plots_dir,
@@ -399,6 +401,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 current_time=world.time, use_ilp=True, use_stochastic=False,
                 max_solver_time_s=MAX_SOLVER_TIME_S, solver_engine="GUROBI",
                 update_timelines=False, update_requests=False, tax_rate=TAX_RATE,
+                receding_horizon_duration=_horizon,
                 max_reschedule_depth=10000,
                 plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
                 results_path=plots_dir,
@@ -410,6 +413,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 current_time=world.time, use_ilp=False, use_stochastic=False,
                 max_solver_time_s=MAX_SOLVER_TIME_S,
                 update_timelines=False, update_requests=False, tax_rate=TAX_RATE,
+                receding_horizon_duration=_horizon,
                 submission_cost_rate=SUBMISSION_COST,
                 execution_cost_fn=execution_cost_fn,
                 max_reschedule_depth=10000,
@@ -421,6 +425,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 current_time=world.time, use_ilp=False, use_stochastic=False,
                 max_solver_time_s=MAX_SOLVER_TIME_S,
                 update_timelines=False, update_requests=False, tax_rate=TAX_RATE,
+                receding_horizon_duration=_horizon,
                 submission_cost_rate=SUBMISSION_COST,
                 execution_cost_fn=execution_cost_fn,
                 max_reschedule_depth=10000,
