@@ -9,7 +9,7 @@ Two formulations are supported:
 1. Non-convex: Uses quadratic constraints (exact, requires Gurobi NonConvex=2)
 2. Log-linearized: Uses piecewise-linear log/exp approximations (faster, approximate)
 """
-
+N_THREADS=64
 import numpy as np
 import networkx as nx
 import datetime as dt
@@ -504,7 +504,7 @@ def _solve_with_gurobi(
             else:
                 model.setParam('FuncNonlinear', 0)
             model.setParam('Cuts', 1)
-            model.setParam('Threads', 10)
+            model.setParam('Threads', N_THREADS)
             model.setParam('OutputFlag', 1)
             if results_dir:
                 model.setParam('LogFile', os.path.join(results_dir, "gurobi_stochastic.log"))
@@ -516,6 +516,7 @@ def _solve_with_gurobi(
             # Step 3: Find observation opportunities and create variables
             solution_holder = {}
             task_to_passes = {}
+
 
             for constrained_request in workflow_graph.nodes():
                 if (constrained_request.dispatched == True) or (constrained_request.completed == True):

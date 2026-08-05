@@ -435,7 +435,7 @@ def create_volcano_workflow(
 
         # 2. Follow-up Windows (Volume + Plume tasks per window)
         # Start at follow_up_interval_h, not 0, to avoid colliding with the detection task window.
-        for follow_up_ix in range(hours_to_detect, lookahead_horizon_h, follow_up_interval_h):
+        for follow_up_ix in range(follow_up_interval_h, lookahead_horizon_h, follow_up_interval_h):
             obs_task_constraints = [
                 Constraint(
                     ConstraintClass.TEMPORAL, TemporalConstraintType.START_AFTER_OFFSET,
@@ -454,10 +454,12 @@ def create_volcano_workflow(
             # Volume Follow-up Task (Targeted at vent location)
             # Full planning window: timing is enforced by START_AFTER/BEFORE_OFFSET
             # constraints relative to the actual detection pass time.
+            follow_up_start = min_time + dt.timedelta(hours=follow_up_ix)
+            follow_up_end = min_time + dt.timedelta(hours=follow_up_ix + follow_up_interval_h)
             vol_req = ObservationRequest(
                 lon_deg=volcano.lon_deg, lat_deg=volcano.lat_deg, alt_km=volcano.alt_km,
-                min_time=min_time,
-                max_time=max_time,
+                min_time=follow_up_start,
+                max_time=follow_up_end,
                 instrument=InstrumentType.RGB,
                 request_name=f"{volcano.name}_volume_followup_{follow_up_ix}h",
                 min_elevation_deg=20.0
@@ -491,8 +493,8 @@ def create_volcano_workflow(
 
             plume_req = ObservationRequest(
                 lon_deg=initial_plume_lon, lat_deg=initial_plume_lat, alt_km=plume_alt_km,
-                min_time=min_time,
-                max_time=max_time,
+                min_time=follow_up_start,
+                max_time=follow_up_end,
                 instrument=InstrumentType.RGB,
                 request_name=f"{volcano.name}_plume_followup_{follow_up_ix}h",
                 min_elevation_deg=20.0
