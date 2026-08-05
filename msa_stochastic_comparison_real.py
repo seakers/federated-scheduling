@@ -99,15 +99,15 @@ USE_DYNAMIC_DEMAND_FIELD = True
 # Acceptance probability range fed to DemandField (only used when USE_DYNAMIC_DEMAND_FIELD=True).
 # DemandField maps demand level → p_accept in [P_ACC_MIN, P_ACC_MAX].
 # Set both to 1.0 for deterministic acceptance (isolates scheduling quality from market noise).
-P_ACC_MIN = 0.70   # Minimum acceptance probability (high-demand / congested slot)
+P_ACC_MIN = 0.85   # Minimum acceptance probability (high-demand / congested slot)
 P_ACC_MAX = 0.95   # Maximum acceptance probability (low-demand / quiet slot)
 
 # Execution probability range: even an accepted pass may fail (cloud cover, sensor issue).
 # Maps look-angle → p_exec in [P_EXEC_MIN, P_EXEC_MAX].
 # At nadir (best geometry) → P_EXEC_MAX; at worst geometry → P_EXEC_MIN.
 # Set both to 1.0 for deterministic execution (isolates scheduling from sensor noise).
-P_EXEC_MIN = 0.90  # Minimum execution probability (worst geometry)
-P_EXEC_MAX = 1.0  # Maximum execution probability (best geometry)
+P_EXEC_MIN = 0.50  # Minimum execution probability (worst geometry)
+P_EXEC_MAX = 0.70  # Maximum execution probability (best geometry)
 
 # Cost model (fractions of quality score)
 SUBMISSION_COST = 0.05   # Paid per booking attempt (even if rejected)
@@ -217,13 +217,11 @@ def rewarder_search(opportunity):
 
 
 def success_declarer(data_product):
-    # Any executed observation counts as success for MSA ship tracking.
-    # Geometric quality is captured by the rewarder; we do NOT require the ship
-    # to appear in the data product (it may have moved out of the footprint, which
-    # is informative negative evidence, not a failure). Returning False here would
-    # cause successful_execution=False on all observations, making K_w=False in
-    # the gate-resolved replan and zeroing out valid_completed in compute_metrics.
-    return True
+    # Ship is "detected" if it appears in the data product (FOV check passed in simulator).
+    # This drives timeline_updater_msa (det/greedy/random) and K_w resolution on replan
+    # (stochastic). compute_metrics uses DATA_RECEIVED rows directly, not successful_execution,
+    # so quality accounting is unaffected by this value.
+    return len(data_product) > 0
 
 
 def build_msa_workflow(min_time, max_time, initial_toi_pose):
@@ -859,7 +857,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, demand_field,
             max_solver_time_s=MAX_SOLVER_TIME_S,
             solver_engine="GUROBI",
             update_timelines=False,
-            update_requests=use_stochastic,   # particle filter before first stochastic solve
+            update_requests=True,   # particle filter retargeting for all schedulers
             tax_rate=TAX_RATE,
             max_reschedule_depth=10000,
             plot_schedule=plot_schedule,

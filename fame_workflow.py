@@ -980,8 +980,9 @@ def ilp_schedule_workflow(
         receding_horizon_duration: dt.timedelta=dt.timedelta(weeks=52),
         solver_engine: str = "GUROBI",  # <-- ADD THIS (Options: "SCIP" or "GUROBI")
         tax_rate: float = 0.0,  # Cost per scheduled obs as fraction of max quality. Set to 0 to disable.
-        submission_cost_rate: float = 0.0,  # c_sub: unconditional per-booking submission overhead (as fraction of quality)
-        execution_cost_rate: float = 0.0  # c_canc: conditional cancellation cost if accepted (as fraction of quality)
+        submission_cost_rate: float = 0.0,  # c_sub: unconditional per-booking submission overhead (as fraction of Q_MAX_task)
+        execution_cost_rate: float = 0.0,   # fallback if execution_cost_fn is None
+        execution_cost_fn = None,           # callable(task, satellite, obs_pass, dispatch_time, q_max) -> float
 ):
     workflow_graph_request=workflow_graph
     print(f"Function ILP scheduler, the solver engine is {solver_engine}")
@@ -1094,6 +1095,12 @@ def ilp_schedule_workflow(
         allsatpasses = [(satellite, satpass, constrained_request.rewarder(satpass.highest)) for satellite, satpasses in passes.items() for satpass in satpasses]
         allsatpasses.sort(key=lambda x: x[2], reverse=True) # Sort by observation quality
 
+        # Q_MAX_task: constant across all passes of this task, used for cost billing.
+        _q_max_task = allsatpasses[0][2] if allsatpasses else 0.0
+
+        # Deterministic ILP: all tasks dispatched immediately at planning time.
+        _t_dispatch = current_time
+
         for (satellite, satpass, _quality) in allsatpasses:
             if feasibility_screener(satellite, satpass):
                 _found_a_pass = True
@@ -1109,11 +1116,17 @@ def ilp_schedule_workflow(
 
                 flat_boolean_solution_holder.append(solution_holder[constrained_request][satellite][satpass])
 
-                # Costs scaled by pass-specific quality q_k (not Q_max) to match
-                # what compute_metrics_v3 charges in the simulator.
-                _sub  = submission_cost_rate * _quality
-                _exec = execution_cost_rate * _quality
-                _tax_k = tax_rate * _quality
+                # Costs use Q_MAX_task (not per-pass quality) to decouple cost from
+                # pass geometry, matching the realized metrics billing.
+                _sub = submission_cost_rate * _q_max_task
+                if execution_cost_fn is not None:
+                    try:
+                        _exec = execution_cost_fn(constrained_request, satellite, satpass, _t_dispatch, q_max=_q_max_task)
+                    except Exception:
+                        _exec = execution_cost_rate * _q_max_task
+                else:
+                    _exec = execution_cost_rate * _q_max_task
+                _tax_k = tax_rate * _q_max_task
                 objective.SetCoefficient(solution_holder[constrained_request][satellite][satpass], _quality - _sub - _exec - _tax_k)
 
                 # TODO for each timeline impacted, add a variable for that timeline value at that time. Add an Impact with that timeline value times "do we do it".
@@ -1275,7 +1288,7 @@ def ilp_schedule_workflow(
                                             if parent_pass.highest.time>this_pass.highest.time:
                                                 solver.Add(this_decision_variable + parent_decision_variable <= 1)
                                 elif (parent_request.dispatched == True or parent_request.completed == True): # Dispatched
-                                    if parent_request.observation_opportunity.time>this_pass.highest.time:
+                                    if parent_request.observation_opportunity is not None and parent_request.observation_opportunity.time>this_pass.highest.time:
                                         solver.Add(this_decision_variable == 0)
                                 else:
                                     print(f"    [Scheduler] Ignoring parent {parent_request} (SUCCESS constraint), that's odd")
@@ -1293,7 +1306,7 @@ def ilp_schedule_workflow(
                                                 solver.Add(this_decision_variable + parent_decision_variable <= 1)
                                 elif ((parent_request.dispatched == True) or (parent_request.completed == True)):
                                     # This is already off, so we constrain with respect to what we scheduled.
-                                    if parent_request.observation_opportunity.time>this_pass.highest.time:
+                                    if parent_request.observation_opportunity is not None and parent_request.observation_opportunity.time>this_pass.highest.time:
                                         solver.Add(this_decision_variable == 0)
                                 else:
                                     print(f"    [Scheduler] Ignoring parent {parent_request} (GEOMETRY), that's odd")
@@ -1591,6 +1604,7 @@ def plot_workflow_schedule(
         show_night_location: Location= Location(-118,34, 0),
         save_schedule_plot: bool=False,
         save_name: str = "Schedule.pdf",
+        requests=None,
         ):
 
 
@@ -1702,19 +1716,88 @@ def plot_workflow_schedule(
                             min_time = max(min_time, parent_request.observation_opportunity.time)
                 ax_tasks.add_patch(plt.Rectangle((min_time, y_coordinate), max_time-min_time, line_height, color=request_group_colors[parent_request.request_group], alpha=.1/request_group_sizes[request.request_group]))
         
-        # Show where we actually ended up
+        # Draw constrained temporal window boundaries as dashed vertical lines.
+        # Only drawn when the parent actually completed (DATA_RECEIVED), so the
+        # boundary is anchored to the real execution time — not the planned pass.
+        for parent_request in workflow_graph.predecessors(request):
+            if not parent_request.completed:
+                continue
+            inedges = workflow_graph.get_edge_data(parent_request, request)
+            for _, constraint in inedges.items():
+                if constraint['constraint_class'] != ConstraintClass.TEMPORAL:
+                    continue
+                offset = constraint['parameters'].get('offset')
+                if offset is None:
+                    continue
+                boundary_time = parent_request.observation_opportunity.time + offset
+                ctype = constraint['constraint_type']
+                if ctype == TemporalConstraintType.START_AFTER_OFFSET:
+                    ax_tasks.axvline(boundary_time, color=request_group_colors[request.request_group],
+                                     linewidth=0.8, linestyle='--', alpha=0.7)
+                elif ctype == TemporalConstraintType.START_BEFORE_OFFSET:
+                    ax_tasks.axvline(boundary_time, color=request_group_colors[request.request_group],
+                                     linewidth=0.8, linestyle=':', alpha=0.7)
+
+        # Show where we actually ended up.
+        # If per-pass request table is available and the task has redundant bookings,
+        # draw one marker per booking coloured by its individual status.
+        # Rejected passes are drawn as an 'x' marker; others as vertical lines.
+        # Otherwise fall back to the legacy single-vline behaviour.
         if (request.scheduled and request.feasible):
-            if request.completed:
-                _task_color = 'k'
-                _task_width = 9
-            elif request.dispatched:
-                _task_color = 'm'
-                _task_width = 6
-            else:
-                _task_color = request_group_colors[request.request_group]
-                _task_width = 3
-            # Plot the time where the request was scheduled.
-            ax_tasks.vlines(request.observation_opportunity.time, y_coordinate, y_coordinate+line_height, color=_task_color, linewidth=_task_width)
+            bookings = getattr(request, 'scheduled_bookings', None) or []
+            drew_per_pass = False
+            _REJECTED = getattr(ObservationStatus, 'CONSTELLATION_REJECTED', None)
+
+            def _draw_pass_marker(t, status):
+                _yc = y_coordinate + line_height * 0.5
+                if status == ObservationStatus.DATA_RECEIVED:
+                    ax_tasks.vlines(t, y_coordinate, y_coordinate + line_height, color='k', linewidth=9)
+                elif status in (ObservationStatus.SCHEDULED, ObservationStatus.SUBMITTED):
+                    ax_tasks.vlines(t, y_coordinate, y_coordinate + line_height, color='m', linewidth=6)
+                elif status == ObservationStatus.CANCELLED:
+                    ax_tasks.vlines(t, y_coordinate, y_coordinate + line_height, color='gray', linewidth=3)
+                elif status == ObservationStatus.EXECUTION_FAILED:
+                    ax_tasks.vlines(t, y_coordinate, y_coordinate + line_height, color='r', linewidth=6)
+                elif _REJECTED is not None and status == _REJECTED:
+                    ax_tasks.plot(t, _yc, 'x', color='orange', markersize=8, markeredgewidth=2)
+                else:
+                    ax_tasks.vlines(t, y_coordinate, y_coordinate + line_height,
+                                    color=request_group_colors[request.request_group], linewidth=3)
+
+            if requests is not None:
+                obs_req = request.observation_request
+                task_rows = requests[requests['request'] == obs_req]
+                if bookings:
+                    # Stochastic/ILP: iterate over known redundant bookings
+                    for booking in bookings:
+                        b_pass = booking['pass']
+                        row = task_rows[task_rows['requested_pass'] == b_pass]
+                        if row.empty:
+                            continue
+                        _draw_pass_marker(b_pass.highest.time, row.iloc[0]['status'])
+                        drew_per_pass = True
+                elif not task_rows.empty:
+                    # Greedy/deterministic: no scheduled_bookings, read all rows directly
+                    for _, row in task_rows.iterrows():
+                        rp = row['requested_pass']
+                        if rp is None:
+                            continue
+                        _draw_pass_marker(rp.highest.time, row['status'])
+                        drew_per_pass = True
+
+            if not drew_per_pass:
+                # Final fallback: task-level state only (no requests table)
+                if request.completed:
+                    _task_color = 'k'
+                    _task_width = 9
+                elif request.dispatched:
+                    _task_color = 'm'
+                    _task_width = 6
+                else:
+                    _task_color = request_group_colors[request.request_group]
+                    _task_width = 3
+                ax_tasks.vlines(request.observation_opportunity.time, y_coordinate, y_coordinate + line_height,
+                                color=_task_color, linewidth=_task_width)
         # Plot other times where it could have been scheduled.
         for _sat, _opportunities in request.observation_opportunities.items():
             for _opportunity in _opportunities:
@@ -1763,6 +1846,25 @@ def plot_workflow_schedule(
     # Show time
     if time is not None:
         ax_tasks.axvline(time, color='k', linewidth=1)
+
+    # Legend
+    import matplotlib.lines as mlines
+    import matplotlib.patches as mpatches
+    legend_handles = [
+        mlines.Line2D([], [], color='k',  linewidth=4, label='Executed (DATA_RECEIVED)'),
+        mlines.Line2D([], [], color='m',  linewidth=3, label='Dispatched (in flight)'),
+        mlines.Line2D([], [], color='gray', linewidth=2, label='Cancelled'),
+        mlines.Line2D([], [], color='r',  linewidth=3, label='Execution failed'),
+        mlines.Line2D([], [], color='orange', marker='x', linestyle='None',
+                      markersize=7, markeredgewidth=2, label='Rejected by constellation'),
+        mlines.Line2D([], [], color='gray', linewidth=0.8, linestyle='--',
+                      label='Window open (START_AFTER_OFFSET)'),
+        mlines.Line2D([], [], color='gray', linewidth=0.8, linestyle=':',
+                      label='Window close (START_BEFORE_OFFSET)'),
+        mlines.Line2D([], [], color='k', linewidth=1, label='Simulation time'),
+    ]
+    ax_tasks.legend(handles=legend_handles, loc='upper right', fontsize=6,
+                    framealpha=0.8, ncol=2)
 
     if show_night:
         # List the days between all_requests_min_time and all_requests_max_time

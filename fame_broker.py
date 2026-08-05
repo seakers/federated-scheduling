@@ -73,7 +73,7 @@ class Broker():
         self.constellations = constellations
         # self.known_satellites = known_satellites
         self.world = world
-        self._requests = pd.DataFrame(columns=['request', 'constellation_request', 'requested_pass', 'requested_constellation', 'requested_satellite', 'constellation', 'satellite', 'assigned_pass', 'assigned_downlink', 'status', 'data_product', 'scheduled_callback', 'unscheduled_callback', 'ready_callback'])
+        self._requests = pd.DataFrame(columns=['request', 'constellation_request', 'requested_pass', 'requested_constellation', 'requested_satellite', 'constellation', 'satellite', 'assigned_pass', 'assigned_downlink', 'status', 'data_product', 'dispatch_time', 'scheduled_callback', 'unscheduled_callback', 'ready_callback'])
         
 
         _known_satellites = []
@@ -259,6 +259,7 @@ class Broker():
                 'assigned_downlink': None,
                 'status': ObservationStatus.NO_OBSERVATION_OPPORTUNITIES,
                 'data_product': None,
+                'dispatch_time': current_time,
                 'scheduled_callback': lambda x: None,
                 'unscheduled_callback': lambda x: None,
                 'ready_callback': lambda x: None,
@@ -304,12 +305,24 @@ class Broker():
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'satellite'] = __best_satellite
                     return
                 
-                def callback_request_unscheduled(reason, _request=request, __best_pass=_best_pass, __best_constellation=_best_constellation):
+                def callback_request_unscheduled(reason, _request=request, __best_pass=_best_pass, __best_constellation=_best_constellation, __best_satellite=_best_satellite):
                     print(" [{}] received UNscheduling of request {}, pass {}, from {}".format(self.name, request, _best_pass, _best_constellation.name))
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'assigned_pass'] = None
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = reason
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'constellation'] = None
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'satellite'] = None
+                    # Only release broker timeline on CONSTELLATION_REJECTED (acceptance roll).
+                    # For ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING the constellation slot
+                    # is occupied by something else; keeping the lock prevents re-trying the same slot.
+                    if reason == ObservationStatus.CONSTELLATION_REJECTED:
+                        _tl = self._satellite_busy_timelines.get(__best_satellite)
+                        if _tl is not None:
+                            _obs_start = __best_pass.highest.time
+                            _obs_end   = __best_pass.highest.time + __best_pass.highest.duration
+                            _tl.impact_container = [
+                                imp for imp in _tl.impact_container
+                                if imp.time != _obs_start and imp.time != _obs_end
+                            ]
                     follow_up_action_failure(reason)
                     # Also reschedule
 
@@ -351,6 +364,7 @@ class Broker():
                     'assigned_downlink': None,
                     'status': ObservationStatus.SUBMITTED,
                     'data_product': None,
+                    'dispatch_time': current_time,
                     'scheduled_callback': callback_request_scheduled,
                     'unscheduled_callback': callback_request_unscheduled,
                     'ready_callback': callback_request_ready,
@@ -385,6 +399,7 @@ class Broker():
                 'assigned_downlink': None,
                 'status': ObservationStatus.ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING,
                 'data_product': None,
+                'dispatch_time': current_time,
                 'scheduled_callback': lambda x: None,
                 'unscheduled_callback': lambda x: None,
                 'ready_callback': lambda x: None,
@@ -416,6 +431,7 @@ class Broker():
             use_stochastic: bool = False,
             stochastic_formulation: str = "log_linearized",
             execution_cost_rate: float = 0.0,
+            execution_cost_fn = None,
             success_probability_function = None,  # DEPRECATED: use acceptance + execution functions
             acceptance_probability_function = None,  # p_acc: prob constellation accepts booking
             execution_probability_function = None,   # p_exec: prob accepted booking executes successfully
@@ -470,6 +486,7 @@ class Broker():
                     tax_rate=tax_rate,
                     submission_cost_rate=submission_cost_rate,
                     execution_cost_rate=execution_cost_rate,
+                    execution_cost_fn=execution_cost_fn,
                     results_dir=results_path
                 )
             else:
@@ -519,6 +536,7 @@ class Broker():
                 plot_title=f"{self.name} at {self.world.time} (epoch {self._workflow_schedule_epoch})",
                 show_night=plot_night_in_schedule,
                 show_night_location=plot_location_for_night_in_schedule,
+                requests=self._requests,
                 # save_schedule_plot=save_schedule_plot,
                 # save_name = "Schedule_e{}_{}.pdf".format(self._workflow_schedule_epoch, self.world.time)
                 )
@@ -599,12 +617,24 @@ class Broker():
                     _dispatchable_task.dispatched = True
                     return
 
-                def callback_request_unscheduled(reason, _request=request, __best_pass=_pass_obj, __best_constellation=_pass_constellation, _dispatchable_task=dispatchable_task):
+                def callback_request_unscheduled(reason, _request=request, __best_pass=_pass_obj, __best_constellation=_pass_constellation, __best_satellite=_pass_satellite, _dispatchable_task=dispatchable_task):
                     print(" [{}] received UNscheduling of request {}, pass {}, from {}".format(self.name, _request, __best_pass, __best_constellation.name))
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'assigned_pass'] = None
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = reason
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'constellation'] = None
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'satellite'] = None
+                    # Only release broker timeline on CONSTELLATION_REJECTED (acceptance roll).
+                    # For ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING the constellation slot
+                    # is occupied by something else; keeping the lock prevents re-trying the same slot.
+                    if reason == ObservationStatus.CONSTELLATION_REJECTED:
+                        _tl = self._satellite_busy_timelines.get(__best_satellite)
+                        if _tl is not None:
+                            _obs_start = __best_pass.highest.time
+                            _obs_end   = __best_pass.highest.time + __best_pass.highest.duration
+                            _tl.impact_container = [
+                                imp for imp in _tl.impact_container
+                                if imp.time != _obs_start and imp.time != _obs_end
+                            ]
 
                     # If there are still other passes in flight for this same task (SUBMITTED
                     # or SCHEDULED), do not reschedule yet — those are the backup passes and
@@ -645,6 +675,7 @@ class Broker():
                         tax_rate=tax_rate,
                         submission_cost_rate=submission_cost_rate,
                         cancellation_cost_rate=cancellation_cost_rate,
+                        execution_cost_fn=execution_cost_fn,
                         results_path=results_path,
                         use_random=use_random,
                         random_seed=random_seed,
@@ -697,6 +728,7 @@ class Broker():
                             tax_rate=tax_rate,
                             submission_cost_rate=submission_cost_rate,
                             cancellation_cost_rate=cancellation_cost_rate,
+                            execution_cost_fn=execution_cost_fn,
                             results_path=results_path,
                             use_random=use_random,
                             random_seed=random_seed,
@@ -708,13 +740,17 @@ class Broker():
                     print(" [{}: ] data ready for request {}, pass {}, from {}".format(self.name, _request, __best_pass, __best_constellation.name))
                     from fame_agents_base import EXECUTION_FAILED_SENTINEL
                     execution_failed = (data_product is EXECUTION_FAILED_SENTINEL)
-                    _new_status = ObservationStatus.EXECUTION_FAILED if execution_failed else ObservationStatus.DATA_RECEIVED
+                    _success = (not execution_failed) and _dispatchable_task.success_declarer(data_product)
+                    # An empty data product (satellite observed but no phenomenon detected)
+                    # is treated as EXECUTION_FAILED so backup passes can still claim the
+                    # task and follow-up reachability is not prematurely collapsed.
+                    _new_status = ObservationStatus.DATA_RECEIVED if _success else ObservationStatus.EXECUTION_FAILED
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = _new_status
-                    effective_dp = [] if execution_failed else data_product
+                    effective_dp = data_product if _success else []
                     for _ix, __dp in self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'data_product'].items():
                         self._requests.at[_ix, 'data_product'] = effective_dp
 
-                    if execution_failed:
+                    if not _success:
                         return
 
                     # If another backup pass already completed this task, just record
@@ -729,7 +765,7 @@ class Broker():
                     _dispatchable_task.dispatched = True
                     _dispatchable_task.completed = True
                     _dispatchable_task.data_product = data_product
-                    _dispatchable_task.successful_execution = _dispatchable_task.success_declarer(data_product)
+                    _dispatchable_task.successful_execution = True
 
                     try:
                         for child_task_id in self._workflow_graph.successors(_dispatchable_task):
@@ -763,6 +799,7 @@ class Broker():
                         tax_rate=tax_rate,
                         submission_cost_rate=submission_cost_rate,
                         cancellation_cost_rate=cancellation_cost_rate,
+                        execution_cost_fn=execution_cost_fn,
                         results_path=results_path,
                         use_random=use_random,
                         random_seed=random_seed,
@@ -785,6 +822,7 @@ class Broker():
                     'assigned_downlink': None,
                     'status': ObservationStatus.SUBMITTED,
                     'data_product': None,
+                    'dispatch_time': current_time,
                     'scheduled_callback': callback_request_scheduled,
                     'unscheduled_callback': callback_request_unscheduled,
                     'ready_callback': callback_request_ready,
@@ -858,6 +896,7 @@ class Broker():
                 use_stochastic: bool = True,
                 stochastic_formulation: str = "log_linearized",
                 execution_cost_rate: float = 0.0,
+                execution_cost_fn = None,
                 success_probability_function = None,
                 acceptance_probability_function = None,
                 execution_probability_function = None,
@@ -920,6 +959,7 @@ class Broker():
                         tax_rate=tax_rate,
                         submission_cost_rate=submission_cost_rate,
                         execution_cost_rate=execution_cost_rate,
+                        execution_cost_fn=execution_cost_fn,
                         results_dir=results_path
                     )
                 else:
@@ -935,7 +975,8 @@ class Broker():
                         solver_engine=solver_engine,
                         tax_rate=tax_rate,
                         submission_cost_rate=submission_cost_rate,
-                        execution_cost_rate=execution_cost_rate
+                        execution_cost_rate=execution_cost_rate,
+                        execution_cost_fn=execution_cost_fn
                     )
             else:
                 if use_random:
@@ -971,6 +1012,7 @@ class Broker():
                     plot_title=f"{self.name} at {self.world.time} (epoch {self._workflow_schedule_epoch})",
                     show_night=plot_night_in_schedule,
                     show_night_location=plot_location_for_night_in_schedule,
+                    requests=self._requests,
                 )
                 if save_schedule_plot:
                     safe_time_str = str(self.world.time).replace(':', '-')
@@ -1030,12 +1072,25 @@ class Broker():
                         _dispatchable_task.dispatched = True
                         return
 
-                    def callback_request_unscheduled(reason, _request=request, __best_pass=_pass_obj, __best_constellation=_pass_constellation, _dispatchable_task=dispatchable_task):
+                    def callback_request_unscheduled(reason, _request=request, __best_pass=_pass_obj, __best_constellation=_pass_constellation, __best_satellite=_pass_satellite, _dispatchable_task=dispatchable_task):
                         print(f" [{self.name}] received UNscheduling of request {_request}, pass {__best_pass}, from {__best_constellation.name}")
                         self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'assigned_pass'] = None
                         self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'status'] = reason
                         self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'constellation'] = None
                         self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'satellite'] = None
+
+                        # Only release broker timeline on CONSTELLATION_REJECTED (acceptance roll).
+                        # For ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING the constellation slot
+                        # is occupied by something else; keeping the lock prevents re-trying the same slot.
+                        if reason == ObservationStatus.CONSTELLATION_REJECTED:
+                            _tl = self._satellite_busy_timelines.get(__best_satellite)
+                            if _tl is not None:
+                                _obs_start = __best_pass.highest.time
+                                _obs_end   = __best_pass.highest.time + __best_pass.highest.duration
+                                _tl.impact_container = [
+                                    imp for imp in _tl.impact_container
+                                    if imp.time != _obs_start and imp.time != _obs_end
+                                ]
 
                         _still_in_flight = self._requests.loc[
                             (self._requests['request'] == _request) &
@@ -1071,6 +1126,7 @@ class Broker():
                             tax_rate=tax_rate,
                             submission_cost_rate=submission_cost_rate,
                             cancellation_cost_rate=cancellation_cost_rate,
+                            execution_cost_fn=execution_cost_fn,
                             results_path=results_path,
                             use_random=use_random,
                             random_seed=random_seed,
@@ -1122,6 +1178,7 @@ class Broker():
                                 tax_rate=tax_rate,
                                 submission_cost_rate=submission_cost_rate,
                                 cancellation_cost_rate=cancellation_cost_rate,
+                                execution_cost_fn=execution_cost_fn,
                                 results_path=results_path,
                                 use_random=use_random,
                                 random_seed=random_seed,
@@ -1134,13 +1191,17 @@ class Broker():
                         print(f" [{self.name}: ] data ready for request {_request}, pass {__best_pass}, from {__best_constellation.name}")
                         from fame_agents_base import EXECUTION_FAILED_SENTINEL
                         execution_failed = (data_product is EXECUTION_FAILED_SENTINEL)
-                        _new_status = ObservationStatus.EXECUTION_FAILED if execution_failed else ObservationStatus.DATA_RECEIVED
+                        _success = (not execution_failed) and _dispatchable_task.success_declarer(data_product)
+                        # An empty data product (satellite observed but no phenomenon detected)
+                        # is treated as EXECUTION_FAILED so backup passes can still claim the
+                        # task and follow-up reachability is not prematurely collapsed.
+                        _new_status = ObservationStatus.DATA_RECEIVED if _success else ObservationStatus.EXECUTION_FAILED
                         self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'status'] = _new_status
-                        effective_dp = [] if execution_failed else data_product
+                        effective_dp = data_product if _success else []
                         for _ix, __dp in self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'data_product'].items():
                             self._requests.at[_ix, 'data_product'] = effective_dp
 
-                        if execution_failed:
+                        if not _success:
                             return
 
                         if _dispatchable_task.completed:
@@ -1153,7 +1214,7 @@ class Broker():
                         _dispatchable_task.dispatched = True
                         _dispatchable_task.completed = True
                         _dispatchable_task.data_product = data_product
-                        _dispatchable_task.successful_execution = _dispatchable_task.success_declarer(data_product)
+                        _dispatchable_task.successful_execution = True
 
                         # --- Cancellation of inferior pending passes ---
                         if enable_cancellations:
@@ -1194,6 +1255,7 @@ class Broker():
                             tax_rate=tax_rate,
                             submission_cost_rate=submission_cost_rate,
                             cancellation_cost_rate=cancellation_cost_rate,
+                            execution_cost_fn=execution_cost_fn,
                             results_path=results_path,
                             use_random=use_random,
                             random_seed=random_seed,
@@ -1217,6 +1279,7 @@ class Broker():
                         'assigned_downlink': None,
                         'status': ObservationStatus.SUBMITTED,
                         'data_product': None,
+                        'dispatch_time': current_time,
                         'scheduled_callback': callback_request_scheduled,
                         'unscheduled_callback': callback_request_unscheduled,
                         'ready_callback': callback_request_ready,

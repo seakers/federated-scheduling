@@ -83,7 +83,8 @@ from benchmarking_utils import (
 # SIMULATION_START is a module global because the geometry helpers below read
 # it. In single-run mode it is overwritten from --start BEFORE anything uses
 # it, so all processes in a campaign share identical orbital geometry.
-SIMULATION_START = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+SIMULATION_START = dt.datetime(2026, 8, 1, 0, 0, 0)  # fixed for reproducibility; override with --start
+
 
 lookahead_horizon_h = 12
 FOLLOW_UP_INTERVAL_H = 3
@@ -93,20 +94,46 @@ NUM_MC_RUNS = 3
 
 # === COST CONFIGURATION ===
 TAX_RATE = 0.0              # Legacy per-booking tax (disabled)
-SUBMISSION_COST = 0.05      # Unconditional booking submission overhead
-EXEC_COST = 0.2             # Conditional execution cost if accepted
+SUBMISSION_COST = 0.02      # Unconditional booking submission overhead (fraction of Q_MAX_task)
+
+# Per-provider execution cost rates (fraction of Q_MAX_task at reference lead time).
+PROVIDER_RATES = {
+    "Planet":          0.08,
+    "Umbra":           0.20,
+    "Capella":         0.25,
+    "LOFT":            0.10,
+    "Ubotica":         0.15,
+    "Mission Control": 0.10,
+    "AC":              0.08,
+    "ICEYE":           0.20,
+}
+PROVIDER_RATE_DEFAULT = 0.20  # fallback for unknown providers
+
+# Lead-time multiplier: cost = rate × Q_MAX × (1 + LEAD_K × max(0, 1 - lead_h / LEAD_T_REF_H))
+# At lead >= LEAD_T_REF_H: multiplier = 1.0 (base cost)
+# At lead = 0: multiplier = 1 + LEAD_K (maximum cost)
+LEAD_K = 1.0          # extra cost fraction at zero lead
+LEAD_T_REF_H = 24.0   # reference lead horizon in hours
+
+# === ACCEPTANCE NOTIFICATION DELAY ===
+# Constellations notify accept/reject uniform(MIN_H, MAX_H) hours before the pass.
+# MIN_H = minimum lead before pass → latest possible notification (closest to pass).
+# MAX_H = maximum lead before pass → earliest possible notification (furthest from pass).
+# Set ACCEPT_NOTIFY_MAX_H = 0.0 to restore synchronous (immediate) accept/reject.
+ACCEPT_NOTIFY_MIN_H = 1.0   # min hours before pass  →  latest notification  (e.g. 1h before)
+ACCEPT_NOTIFY_MAX_H = 6.0   # max hours before pass  →  earliest notification (e.g. 6h before)
 
 # === PROBABILITY CONFIGURATION ===
 # Acceptance probability range: constellation rejects a booking when its demand
 # is high, accepts when quiet.  DemandField maps demand → p_accept in [P_ACC_MIN, P_ACC_MAX].
 P_ACC_MIN = 0.70            # Minimum acceptance probability (high-demand / congested)
-P_ACC_MAX = 1.0           # Maximum acceptance probability (low-demand / quiet)
+P_ACC_MAX = 0.95           # Maximum acceptance probability (low-demand / quiet)
 
 # Execution probability range: even an accepted pass may fail (cloud cover, sensor issue).
 # The function maps look-angle → p_exec in [P_EXEC_MIN, P_EXEC_MAX].
 # At nadir (best geometry) → P_EXEC_MAX; at worst geometry → P_EXEC_MIN.
-P_EXEC_MIN = 1.0           # Minimum execution probability (worst geometry)
-P_EXEC_MAX = 1.0           # Maximum execution probability (best geometry)
+P_EXEC_MIN = 0.90           # Minimum execution probability (worst geometry)
+P_EXEC_MAX = 0.99           # Maximum execution probability (best geometry)
 
 SCHEDULERS = ['greedy','stochastic_log', 'deterministic', 'random']
 #SCHEDULERS = ['stochastic_log','greedy']
@@ -162,6 +189,7 @@ def create_world_and_constellations(cached_satellites: list[Satellite],
             acceptance_probability=legacy_p,
             acceptance_probability_function=_sim_acc_fn,
             execution_probability_function=execution_probability_function,
+            acceptance_notification_delay_h=(ACCEPT_NOTIFY_MIN_H, ACCEPT_NOTIFY_MAX_H),
         )
 
     scheduler_planet          = _make_scheduler(planet_sats,          "Planet",          0.40)
@@ -212,11 +240,7 @@ def build_demand_field(volcano_db_locations, min_time):
     demand_field.precompute(_all_constellation_names)
     print("[DemandField] Precompute complete.")
 
-    _cost_proxy = {
-        "Planet": 0.1, "Ubotica": 0.15, "LOFT": 0.2, "Mission Control": 0.25,
-        "ICEYE": 0.3, "AC": 0.35, "Umbra": 0.5, "Capella": 0.6,
-    }
-    demand_field.check_cost_reliability_tension(_cost_proxy)
+    demand_field.check_cost_reliability_tension(PROVIDER_RATES)
     return demand_field
 
 
@@ -235,6 +259,41 @@ def make_probability_functions(demand_field):
         return max(P_EXEC_MIN, min(P_EXEC_MAX, execution_prob))
 
     return acceptance_prob_function, execution_prob_function
+
+
+def make_execution_cost_fn(all_constellations):
+    """
+    Build a per-provider, lead-time-sensitive execution cost function.
+
+    cost(task, satellite, obs_pass, dispatch_time, q_max) =
+        PROVIDER_RATES[provider] × q_max × (1 + LEAD_K × max(0, 1 - lead_h / LEAD_T_REF_H))
+
+    q_max is the maximum quality over all candidate passes for the task,
+    provided by the caller (planning model or realized metrics).
+    """
+    _sat_to_constellation_name = {
+        sat: c.name for c in all_constellations for sat in c.satellites
+    }
+
+    def execution_cost_fn(task, satellite, obs_pass, dispatch_time, q_max=None):
+        if q_max is None or q_max <= 0:
+            q_max = 1.0  # fallback: avoid zero costs masking issues
+        provider_name = _sat_to_constellation_name.get(satellite, "")
+        rate = PROVIDER_RATES.get(provider_name, PROVIDER_RATE_DEFAULT)
+        # Guard against pandas NaT: pd.NaT is not None evaluates True, but arithmetic fails
+        try:
+            _dt_valid = dispatch_time is not None and dispatch_time == dispatch_time  # NaT != NaT
+        except Exception:
+            _dt_valid = False
+        if _dt_valid and obs_pass is not None:
+            rise_time = obs_pass.rise.time if hasattr(obs_pass, 'rise') else obs_pass.highest.time
+            lead_h = max(0.0, (rise_time - dispatch_time).total_seconds() / 3600.0)
+            multiplier = 1.0 + LEAD_K * max(0.0, 1.0 - lead_h / LEAD_T_REF_H)
+        else:
+            multiplier = 1.0
+        return rate * q_max * multiplier
+
+    return execution_cost_fn
 
 
 def _compute_quality_rank_distribution(workflow_graph, broker, ObservationStatus):
@@ -306,6 +365,8 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
         demand_field=demand_field,
         execution_probability_function=execution_prob_function,
     )
+
+    execution_cost_fn = make_execution_cost_fn(constellations)
     
     # ✅ CREATE VOLCANO WORKFLOW WITH DUAL BRANCHES AND PLUME RETARGETING
     workflow = create_volcano_workflow(volcano_db_locations, min_time, max_time, lookahead_horizon_h=lookahead_horizon_h)
@@ -324,7 +385,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 acceptance_probability_function=acceptance_prob_function,
                 execution_probability_function=execution_prob_function,
                 submission_cost_rate=SUBMISSION_COST,
-                execution_cost_rate=EXEC_COST,
+                execution_cost_fn=execution_cost_fn,
                 tax_rate=TAX_RATE,
                 max_solver_time_s=MAX_SOLVER_TIME_S, solver_engine="GUROBI",
                 update_timelines=False, update_requests=False,
@@ -342,7 +403,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
                 results_path=plots_dir,
                 submission_cost_rate=SUBMISSION_COST,
-                execution_cost_rate=EXEC_COST
+                execution_cost_fn=execution_cost_fn,
             )
         elif scheduler == 'greedy':
             broker.schedule_workflow_redundant(
@@ -350,7 +411,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 max_solver_time_s=MAX_SOLVER_TIME_S,
                 update_timelines=False, update_requests=False, tax_rate=TAX_RATE,
                 submission_cost_rate=SUBMISSION_COST,
-                execution_cost_rate=EXEC_COST,
+                execution_cost_fn=execution_cost_fn,
                 max_reschedule_depth=10000,
                 plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
                 results_path=plots_dir
@@ -361,7 +422,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 max_solver_time_s=MAX_SOLVER_TIME_S,
                 update_timelines=False, update_requests=False, tax_rate=TAX_RATE,
                 submission_cost_rate=SUBMISSION_COST,
-                execution_cost_rate=EXEC_COST,
+                execution_cost_fn=execution_cost_fn,
                 max_reschedule_depth=10000,
                 plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
                 results_path=plots_dir,
@@ -375,7 +436,8 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
 
         m = compute_metrics_v3(
             broker._workflow_graph, broker, ObservationStatus,
-            submission_cost_rate=SUBMISSION_COST, execution_cost_rate=EXEC_COST,
+            submission_cost_rate=SUBMISSION_COST,
+            execution_cost_fn=execution_cost_fn,
             verbose=True,
         )
         m['scheduler'] = scheduler

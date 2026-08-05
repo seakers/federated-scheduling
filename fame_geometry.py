@@ -206,6 +206,12 @@ class Satellite():
         self.busy_with = None
         self.isl_links = isl_links # Satellite: range_km
         self.has_continuous_isl_to_ground = has_continuous_isl_to_ground
+    def __deepcopy__(self, memo):
+        # Orbital (pyorbital SWIG object) cannot be deepcopied. Satellites are
+        # effectively singletons in a simulation run — share the reference.
+        memo[id(self)] = self
+        return self
+
     def __str__(self):
         return self.name
     def __repr__(self):

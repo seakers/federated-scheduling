@@ -336,10 +336,11 @@ def ilp_schedule_workflow_stochastic(
         default_max_instances: int = 3,  # Redundancy cap when a request has no max_num_instances attribute. >1 is REQUIRED for the stochastic planner to hedge.
         solver_engine: str = "GUROBI",
         tax_rate: float = 0.15,  # Cost per scheduled obs as fraction of max quality (dynamic, per-request). Set to 0 to disable.
-        submission_cost_rate: float = 0.0,  # c_sub: unconditional per-booking submission overhead (as fraction of quality)
-        execution_cost_rate: float = 0.0,  # c_canc: conditional cancellation cost if accepted (as fraction of quality)
+        submission_cost_rate: float = 0.0,  # c_sub: unconditional per-booking submission overhead (as fraction of Q_MAX_task)
+        execution_cost_rate: float = 0.0,   # fallback if execution_cost_fn is None
+        execution_cost_fn = None,           # callable(task, satellite, obs_pass, dispatch_time, q_max) -> float
         results_dir: str = ""
-        
+
 ):
     """
     Stochastic MILP scheduler that accounts for observation success probabilities.
@@ -399,6 +400,7 @@ def ilp_schedule_workflow_stochastic(
             stochastic_formulation, success_probability_function,
             acceptance_probability_function, execution_probability_function,
             epsilon, pwl_tolerance, tax_rate, submission_cost_rate, execution_cost_rate,
+            execution_cost_fn=execution_cost_fn,
             mip_gap=mip_gap, default_max_instances=default_max_instances, results_dir=results_dir,
             detection_probability_function=detection_probability_function
         )
@@ -409,6 +411,7 @@ def ilp_schedule_workflow_stochastic(
             stochastic_formulation, success_probability_function,
             acceptance_probability_function, execution_probability_function,
             epsilon, pwl_tolerance, tax_rate, submission_cost_rate, execution_cost_rate,
+            execution_cost_fn=execution_cost_fn,
             default_max_instances=default_max_instances
         )
     else:
@@ -453,6 +456,7 @@ def _solve_with_gurobi(
         tax_rate: float,
         submission_cost_rate: float,
         execution_cost_rate: float,
+        execution_cost_fn,
         mip_gap: float,
         default_max_instances: int,
         results_dir: str,
@@ -615,19 +619,22 @@ def _solve_with_gurobi(
             if stochastic_formulation == "non_convex":
                 _build_non_convex_formulation(
                     model, workflow_graph, solution_holder, task_to_passes,
-                    epsilon, tax_rate, submission_cost_rate, execution_cost_rate, verbose
+                    epsilon, tax_rate, submission_cost_rate, execution_cost_rate, verbose,
+                    execution_cost_fn=execution_cost_fn, current_time=current_time
                 )
             elif stochastic_formulation == "log_linearized":
                 _build_log_linearized_formulation(
                     model, workflow_graph, solution_holder, task_to_passes,
-                    epsilon, pwl_tolerance, tax_rate, submission_cost_rate, execution_cost_rate, verbose
+                    epsilon, pwl_tolerance, tax_rate, submission_cost_rate, execution_cost_rate, verbose,
+                    execution_cost_fn=execution_cost_fn, current_time=current_time
                 )
             elif stochastic_formulation == "general_logical_dag":
                 _general_logical_warm_start_fn = _build_general_logical_formulation(
                     model, workflow_graph, solution_holder, task_to_passes,
                     epsilon, tax_rate, submission_cost_rate, execution_cost_rate, verbose,
                     detection_probability_function=detection_probability_function,
-                    default_max_instances=default_max_instances
+                    default_max_instances=default_max_instances,
+                    execution_cost_fn=execution_cost_fn, current_time=current_time
                 )
             else:
                 raise ValueError(f"Unknown stochastic_formulation: {stochastic_formulation}")
@@ -765,6 +772,7 @@ def _solve_with_scip(
         tax_rate: float,
         submission_cost_rate: float,
         execution_cost_rate: float,
+        execution_cost_fn = None,
         default_max_instances: int = 3
 ):
     """
@@ -1016,7 +1024,8 @@ def _solve_with_scip(
     _build_scip_log_linearized_formulation(
         solver, workflow_graph, solution_holder, task_to_passes,
         epsilon, pwl_tolerance, tax_rate, submission_cost_rate, execution_cost_rate, verbose,
-        hint_values_map
+        hint_values_map,
+        execution_cost_fn=execution_cost_fn, current_time=current_time
     )
 
     # Step 5: Add constraints
@@ -1191,7 +1200,8 @@ def _manual_pwl_exp(solver, x_var, result_var, num_segments=10):
 
 
 def _build_scip_log_linearized_formulation(
-        solver, graph, holder, task_to_passes, eps, tol, tax, sub, canc, verbose, hint_values_map
+        solver, graph, holder, task_to_passes, eps, tol, tax, sub, canc, verbose, hint_values_map,
+        execution_cost_fn=None, current_time=None
 ):
     """
     Build log-linearized stochastic formulation using OR-Tools with manual PWL approximations.
@@ -1305,10 +1315,26 @@ def _build_scip_log_linearized_formulation(
         if not all_qualities:
             continue
 
-        _max_quality_for_request = max(all_qualities)
-        c_sub = sub * _max_quality_for_request
-        c_canc = canc * _max_quality_for_request
-        c_tax = tax * _max_quality_for_request
+        _q_max_task = max(all_qualities)
+        c_sub = sub * _q_max_task
+        c_tax = tax * _q_max_task
+
+        # Determine assumed dispatch time for follow-up tasks vs root tasks.
+        _has_success_parent = any(
+            'SUCCESS' in str(e.get('constraint_class', ''))
+            for p in graph.predecessors(constrained_request)
+            for e in graph.get_edge_data(p, constrained_request).values()
+        )
+        if _has_success_parent:
+            # Assume dispatched at earliest parent pass time (conservative but linear).
+            _parent_passes = [
+                sp.highest.time
+                for p in graph.predecessors(constrained_request)
+                for sat, sp in task_to_passes.get(p, [])
+            ]
+            _t_dispatch = min(_parent_passes) if _parent_passes else current_time
+        else:
+            _t_dispatch = current_time
 
         for satellite, satpass in task_to_passes[constrained_request]:
             x_var = holder[constrained_request][satellite][satpass]['x']
@@ -1317,10 +1343,17 @@ def _build_scip_log_linearized_formulation(
             theta_acc = holder[constrained_request][satellite][satpass]['theta_acc']
             w_abs = effective_pass_realization[(constrained_request, satellite, satpass)]
 
-            # Expected reward
+            if execution_cost_fn is not None:
+                try:
+                    c_exec_k = execution_cost_fn(constrained_request, satellite, satpass, _t_dispatch, q_max=_q_max_task)
+                except Exception:
+                    c_exec_k = canc * _q_max_task
+            else:
+                c_exec_k = canc * _q_max_task
+
+            # Expected reward; costs use Q_MAX_task for provider-rate billing.
             objective.SetCoefficient(w_abs, quality * theta)
-            # Costs: execution cost is conditional on full execution (theta), not just acceptance.
-            objective.SetCoefficient(x_var, -c_sub - c_canc * theta - c_tax)
+            objective.SetCoefficient(x_var, -c_sub - c_exec_k * theta_acc - c_tax)
 
 def _add_scip_workflow_constraints(
         solver,
@@ -1530,7 +1563,9 @@ def _build_non_convex_formulation(
         tax_rate: float,
         submission_cost_rate: float,
         cancellation_cost_rate: float,
-        verbose: int
+        verbose: int,
+        execution_cost_fn=None,
+        current_time=None
 ):
     """
     Build non-convex quadratic formulation with exact products.
@@ -1622,13 +1657,27 @@ def _build_non_convex_formulation(
             )
 
     # === STEP 4: OBJECTIVE COMPILER ===
-    # Costs use pass-specific quality q_k (not Q_max) to match simulator billing.
-    # Execution cost uses theta_acc = p_acc: charged on both DATA_RECEIVED and
-    # EXECUTION_FAILED in the simulator (both require acceptance).
+    # Costs use Q_MAX_task (max quality over all passes for the task) for provider-rate
+    # billing, decoupled from per-pass geometry. Matches realized metrics billing.
     objective_terms = []
     for constrained_request in solution_holder.keys():
         if not solution_holder[constrained_request]:
             continue
+
+        _q_max_task = max(
+            solution_holder[constrained_request][s][p]['quality']
+            for s, p in task_to_passes[constrained_request]
+        )
+        _has_success_parent = any(
+            'SUCCESS' in str(e.get('constraint_class', ''))
+            for p in workflow_graph.predecessors(constrained_request)
+            for e in workflow_graph.get_edge_data(p, constrained_request).values()
+        )
+        if _has_success_parent:
+            _parent_passes = [sp.highest.time for p in workflow_graph.predecessors(constrained_request) for sat, sp in task_to_passes.get(p, [])]
+            _t_dispatch = min(_parent_passes) if _parent_passes else current_time
+        else:
+            _t_dispatch = current_time
 
         for satellite, satpass in task_to_passes[constrained_request]:
             x_var = solution_holder[constrained_request][satellite][satpass]['x']
@@ -1637,13 +1686,19 @@ def _build_non_convex_formulation(
             theta_acc = solution_holder[constrained_request][satellite][satpass]['theta_acc']
             w_abs = w_abs_vars[(constrained_request, satellite, satpass)]
 
-            c_sub  = submission_cost_rate * quality
-            c_canc = cancellation_cost_rate * quality
-            c_tax  = tax_rate * quality
+            c_sub = submission_cost_rate * _q_max_task
+            if execution_cost_fn is not None:
+                try:
+                    c_exec_k = execution_cost_fn(constrained_request, satellite, satpass, _t_dispatch, q_max=_q_max_task)
+                except Exception:
+                    c_exec_k = cancellation_cost_rate * _q_max_task
+            else:
+                c_exec_k = cancellation_cost_rate * _q_max_task
+            c_tax = tax_rate * _q_max_task
 
             objective_terms.append(quality * theta * w_abs)
             objective_terms.append(-c_sub * x_var)
-            objective_terms.append(-c_canc * theta_acc * x_var)
+            objective_terms.append(-c_exec_k * theta_acc * x_var)
             objective_terms.append(-c_tax * x_var)
 
     model.setObjective(gp.quicksum(objective_terms), GRB.MAXIMIZE)
@@ -1809,7 +1864,9 @@ def _build_general_logical_formulation(
         cancellation_cost_rate: float,
         verbose: int,
         detection_probability_function: Callable = None,
-        default_max_instances: int = 3
+        default_max_instances: int = 3,
+        execution_cost_fn=None,
+        current_time=None
 ):
     """General AND/OR/NOT stochastic formulation (paper Sec. "Generalization to
     Arbitrary AND/OR Dependencies").
@@ -2038,13 +2095,27 @@ def _build_general_logical_formulation(
         _emit_logs(node, name, S_local[node])
 
     # === OBJECTIVE — only observation nodes contribute reward. =================
-    # Costs use pass-specific quality q_k (not Q_max) to match simulator billing.
-    # Execution cost uses theta_acc = p_acc: charged on both DATA_RECEIVED and
-    # EXECUTION_FAILED in the simulator (both require acceptance).
+    # Costs use Q_MAX_task for provider-rate billing; decoupled from pass geometry.
     objective_terms = []
     for node in observation_tasks:
         if not solution_holder[node]:
             continue
+
+        _q_max_task = max(
+            solution_holder[node][s][p]['quality']
+            for s, p in task_to_passes[node]
+        )
+        _has_success_parent = any(
+            'SUCCESS' in str(e.get('constraint_class', ''))
+            for p in workflow_graph.predecessors(node)
+            for e in workflow_graph.get_edge_data(p, node).values()
+        )
+        if _has_success_parent:
+            _parent_passes = [sp.highest.time for p in workflow_graph.predecessors(node) for sat, sp in task_to_passes.get(p, [])]
+            _t_dispatch = min(_parent_passes) if _parent_passes else current_time
+        else:
+            _t_dispatch = current_time
+
         for satellite, satpass in task_to_passes[node]:
             x_var = solution_holder[node][satellite][satpass]['x']
             quality = solution_holder[node][satellite][satpass]['quality']
@@ -2052,13 +2123,19 @@ def _build_general_logical_formulation(
             theta_acc = solution_holder[node][satellite][satpass]['theta_acc']
             w = W_abs[(node, satellite, satpass)]
 
-            c_sub  = submission_cost_rate * quality
-            c_canc = cancellation_cost_rate * quality
-            c_tax  = tax_rate * quality
+            c_sub = submission_cost_rate * _q_max_task
+            if execution_cost_fn is not None:
+                try:
+                    c_exec_k = execution_cost_fn(node, satellite, satpass, _t_dispatch, q_max=_q_max_task)
+                except Exception:
+                    c_exec_k = cancellation_cost_rate * _q_max_task
+            else:
+                c_exec_k = cancellation_cost_rate * _q_max_task
+            c_tax = tax_rate * _q_max_task
 
             objective_terms.append(quality * theta * w)
             objective_terms.append(-c_sub * x_var)
-            objective_terms.append(-c_canc * theta_acc * x_var)
+            objective_terms.append(-c_exec_k * theta_acc * x_var)
             if c_tax:
                 objective_terms.append(-c_tax * x_var)
 
@@ -2216,7 +2293,9 @@ def _build_log_linearized_formulation(
         verbose: int,
         tighten_bounds: bool = True,
         default_max_instances: int = 3,
-        reward_envelope_cuts: bool = True
+        reward_envelope_cuts: bool = True,
+        execution_cost_fn=None,
+        current_time=None
 ):
     """
     Log-linearized stochastic formulation (paper Sections 5.2-5.6), built in a
@@ -2609,11 +2688,9 @@ def _build_log_linearized_formulation(
     # Maximize sum_k Q_k * theta_k * W_abs_k
     #         - sum_k (c_sub_k + c_exec_k * theta_acc_k + c_tax_k) * x_k
     #
-    # Costs are scaled by the PASS-SPECIFIC quality q_k (not Q_max) so that the
-    # planning objective exactly matches what compute_metrics_v3 charges in the
-    # simulator: c_sub * q_k unconditionally, c_exec * q_k if accepted.
-    # Using Q_max for every pass would over-penalise low-quality backup passes
-    # and make the planner more conservative than optimal.
+    # Costs use Q_MAX_task (max quality over all passes for the task) for
+    # provider-rate billing, decoupled from per-pass geometry. Matches
+    # realized metrics billing in compute_metrics_v3.
     #
     # Execution cost uses theta_acc (= p_acc), NOT theta (= p_acc * p_exec):
     # the simulator bills execution cost for both DATA_RECEIVED and
@@ -2623,6 +2700,21 @@ def _build_log_linearized_formulation(
         if not solution_holder[constrained_request]:
             continue
 
+        _q_max_task = max(
+            solution_holder[constrained_request][s][p]['quality']
+            for s, p in task_to_passes[constrained_request]
+        )
+        _has_success_parent = any(
+            'SUCCESS' in str(e.get('constraint_class', ''))
+            for p in workflow_graph.predecessors(constrained_request)
+            for e in workflow_graph.get_edge_data(p, constrained_request).values()
+        )
+        if _has_success_parent:
+            _parent_passes = [sp.highest.time for p in workflow_graph.predecessors(constrained_request) for sat, sp in task_to_passes.get(p, [])]
+            _t_dispatch = min(_parent_passes) if _parent_passes else current_time
+        else:
+            _t_dispatch = current_time
+
         for satellite, satpass in task_to_passes[constrained_request]:
             x_var = solution_holder[constrained_request][satellite][satpass]['x']
             quality = solution_holder[constrained_request][satellite][satpass]['quality']
@@ -2630,17 +2722,22 @@ def _build_log_linearized_formulation(
             theta_acc = solution_holder[constrained_request][satellite][satpass]['theta_acc']
             w_abs = effective_pass_realization[(constrained_request, satellite, satpass)]
 
-            c_sub  = submission_cost_rate * quality
-            c_canc = cancellation_cost_rate * quality
-            c_tax  = tax_rate * quality
+            c_sub = submission_cost_rate * _q_max_task
+            if execution_cost_fn is not None:
+                try:
+                    c_exec_k = execution_cost_fn(constrained_request, satellite, satpass, _t_dispatch, q_max=_q_max_task)
+                except Exception:
+                    c_exec_k = cancellation_cost_rate * _q_max_task
+            else:
+                c_exec_k = cancellation_cost_rate * _q_max_task
+            c_tax = tax_rate * _q_max_task
 
             # Expected best-success quality credit for this pass.
             objective_terms.append(quality * theta * w_abs)
             # Unconditional submission overhead (paid regardless of acceptance).
             objective_terms.append(-c_sub * x_var)
             # Execution cost, conditional on acceptance (theta_acc = p_acc).
-            # Charged on both DATA_RECEIVED and EXECUTION_FAILED in the simulator.
-            objective_terms.append(-c_canc * theta_acc * x_var)
+            objective_terms.append(-c_exec_k * theta_acc * x_var)
             if c_tax:
                 objective_terms.append(-c_tax * x_var)
 

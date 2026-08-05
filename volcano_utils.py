@@ -203,7 +203,7 @@ def rewarder_observation(opportunity: ObservationOpportunity, preferred_zenith_a
     look_angle_reward = abs(90.0 - opportunity.look_angle_dec_deg) / 90.0
     zenith_angle_reward = abs(preferred_zenith_angle_deg - opportunity.sun_zenith_angle_deg) / 90.0
     range_reward = 1.0 / (opportunity.range_km / 1000.0)
-    return look_angle_reward + zenith_angle_reward + range_reward + static_reward
+    return (look_angle_reward + zenith_angle_reward + range_reward)*static_reward
 
 
 def success_declarer_eruption(data_product):

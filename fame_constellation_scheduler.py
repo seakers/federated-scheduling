@@ -23,7 +23,7 @@ from fame_workflow import AssignmentTimeline, Impact, ImpactType
 from fame_agents_base import *
 
 class ConstellationGroundScheduler():
-    def __init__(self, satellites: list, ground_stations: list, world, name="Constellation", ack_probability_if_scheduled: float=1., ack_probability_if_unscheduled: float=1., acceptance_probability: float=1.0, acceptance_probability_function=None, execution_probability_function=None):
+    def __init__(self, satellites: list, ground_stations: list, world, name="Constellation", ack_probability_if_scheduled: float=1., ack_probability_if_unscheduled: float=1., acceptance_probability: float=1.0, acceptance_probability_function=None, execution_probability_function=None, acceptance_notification_delay_h: tuple = (0.0, 0.0)):
         self.name = name
         self.satellites = satellites
         self.ground_stations = ground_stations
@@ -35,6 +35,7 @@ class ConstellationGroundScheduler():
         self.acceptance_probability = acceptance_probability
         self.acceptance_probability_function = acceptance_probability_function
         self.execution_probability_function = execution_probability_function
+        self.acceptance_notification_delay_h = acceptance_notification_delay_h
         self._satellite_busy_timelines_obs  = {ks: AssignmentTimeline(name=ks.name, initial_time=world.time, initial_value=False) for ks in self.satellites}
         self._satellite_busy_timelines_comm = {ks: AssignmentTimeline(name=ks.name, initial_time=world.time, initial_value=False) for ks in self.satellites}
 
@@ -54,6 +55,7 @@ class ConstellationGroundScheduler():
             acceptance_probability=self.acceptance_probability,
             acceptance_probability_function=self.acceptance_probability_function,
             execution_probability_function=self.execution_probability_function,
+            acceptance_notification_delay_h=self.acceptance_notification_delay_h,
         )
         new_constellation._requests = copy.deepcopy(self._requests, memo)
         new_constellation._satellite_busy_timelines_obs = copy.deepcopy(self._satellite_busy_timelines_obs, memo)
@@ -208,39 +210,14 @@ class ConstellationGroundScheduler():
                     callback_request_unscheduled(ObservationStatus.ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING)
                 return -5
 
-        # Step 3: Stochastic Rejection Simulation
+        # Step 3: Compute acceptance probability (used later in decision closure)
         if self.acceptance_probability_function is not None:
             theta_accept = self.acceptance_probability_function(request, target_satellite, self.world.time)
         else:
             theta_accept = self.acceptance_probability
 
-        if random.random() > theta_accept:
-            print(f"   [{self.name}] REJECTED request {request.name} on {target_satellite.name} (acceptance prob={theta_accept:.2f})")
-            self._requests.loc[self._requests['request'] == request, 'status'] = ObservationStatus.CONSTELLATION_REJECTED
-            if random.random() < self.ack_probability_if_unscheduled:
-                callback_request_unscheduled(ObservationStatus.CONSTELLATION_REJECTED)
-            return -6  # Rejected: timeline remains free for other requests, but this pass fails
-
-        # Step 4: ACCEPTED - Book pass and lock timeline
-        print(f"   [{self.name}] ACCEPTED request {request.name} on {target_satellite.name} (acceptance prob={theta_accept:.2f})")
-
-        if earliest_ul_opportunity == "ISL":
-            schedule_observation(self.world, target_pass.highest, phenomenon_processor=phenomenon_processor, execution_probability_function=self.execution_probability_function)
-        else:
-            schedule_observation_uplink(self.world, earliest_ul_opportunity, target_pass.highest, earliest_ul_opportunity_station, phenomenon_processor=phenomenon_processor, execution_probability_function=self.execution_probability_function)
-
-        if dl_pass == "ISL":
-            schedule_isl_downlink(_world=self.world, satellite=target_satellite, time=target_pass.highest.time, constellation_scheduler=self)
-        else:
-            schedule_sat_downlink(_world=self.world, satellite=target_satellite, comm_pass=dl_pass, station=dl_station, constellation_scheduler=self)
-
-        self._requests.loc[self._requests['request'] == request, 'satellite'] = target_satellite
-        self._requests.loc[self._requests['request'] == request, 'observation'] = target_pass.highest
-        self._requests.loc[self._requests['request'] == request, 'uplink'] = earliest_ul_opportunity
-        self._requests.loc[self._requests['request'] == request, 'downlink'] = dl_pass
-        self._requests.loc[self._requests['request'] == request, 'status'] = ObservationStatus.SCHEDULED
-
-        # Lock satellite busy timeline for accepted pass
+        # Reserve timeline slot immediately so later feasibility checks see this pass as busy.
+        # On rejection the slot is released. On acceptance the slot stays and events are scheduled.
         self._satellite_busy_timelines_obs[target_satellite].add_impact(Impact(time=target_pass.highest.time, type=ImpactType.ASSIGNMENT, value=True))
         self._satellite_busy_timelines_obs[target_satellite].add_impact(Impact(time=target_pass.highest.time + target_pass.highest.duration, type=ImpactType.ASSIGNMENT, value=False))
 
@@ -251,8 +228,66 @@ class ConstellationGroundScheduler():
             self._satellite_busy_timelines_comm[target_satellite].add_impact(Impact(time=dl_pass.rise.time, type=ImpactType.ASSIGNMENT, value=True))
             self._satellite_busy_timelines_comm[target_satellite].add_impact(Impact(time=dl_pass.fall.time, type=ImpactType.ASSIGNMENT, value=False))
 
-        if random.random() < self.ack_probability_if_scheduled:
-            callback_request_scheduled(target_pass.highest)
+        self._requests.loc[self._requests['request'] == request, 'uplink'] = earliest_ul_opportunity
+        self._requests.loc[self._requests['request'] == request, 'downlink'] = dl_pass
+
+        # Step 4: Accept/reject decision — deferred or immediate.
+        # Observation/downlink events are only scheduled on accept, so rejected passes
+        # never put spurious ObservationEvents into the world.
+        def _fire_acceptance_decision(
+            _req=request, _sat=target_satellite, _pass=target_pass,
+            _theta=theta_accept,
+            _ul=earliest_ul_opportunity, _ul_station=earliest_ul_opportunity_station,
+            _dl=dl_pass, _dl_station=dl_station,
+        ):
+            if random.random() > _theta:
+                # REJECTED — release the reserved timeline slot
+                print(f"   [{self.name}] REJECTED request {_req.name} on {_sat.name} (acceptance prob={_theta:.2f})")
+                self._requests.loc[self._requests['request'] == _req, 'status'] = ObservationStatus.CONSTELLATION_REJECTED
+                # Undo obs timeline reservation
+                self._satellite_busy_timelines_obs[_sat].add_impact(Impact(time=_pass.highest.time, type=ImpactType.ASSIGNMENT, value=False))
+                self._satellite_busy_timelines_obs[_sat].add_impact(Impact(time=_pass.highest.time + _pass.highest.duration, type=ImpactType.ASSIGNMENT, value=True))
+                # Undo comm timeline reservations
+                if type(_ul) == ObservationPass:
+                    self._satellite_busy_timelines_comm[_sat].add_impact(Impact(time=_ul.rise.time, type=ImpactType.ASSIGNMENT, value=False))
+                    self._satellite_busy_timelines_comm[_sat].add_impact(Impact(time=_ul.fall.time, type=ImpactType.ASSIGNMENT, value=True))
+                if type(_dl) == ObservationPass:
+                    self._satellite_busy_timelines_comm[_sat].add_impact(Impact(time=_dl.rise.time, type=ImpactType.ASSIGNMENT, value=False))
+                    self._satellite_busy_timelines_comm[_sat].add_impact(Impact(time=_dl.fall.time, type=ImpactType.ASSIGNMENT, value=True))
+                if random.random() < self.ack_probability_if_unscheduled:
+                    callback_request_unscheduled(ObservationStatus.CONSTELLATION_REJECTED)
+            else:
+                # ACCEPTED — now schedule the observation and downlink events
+                print(f"   [{self.name}] ACCEPTED request {_req.name} on {_sat.name} (acceptance prob={_theta:.2f})")
+                if _ul == "ISL":
+                    schedule_observation(self.world, _pass.highest, phenomenon_processor=phenomenon_processor, execution_probability_function=self.execution_probability_function)
+                else:
+                    schedule_observation_uplink(self.world, _ul, _pass.highest, _ul_station, phenomenon_processor=phenomenon_processor, execution_probability_function=self.execution_probability_function)
+                if _dl == "ISL":
+                    schedule_isl_downlink(_world=self.world, satellite=_sat, time=_pass.highest.time, constellation_scheduler=self)
+                else:
+                    schedule_sat_downlink(_world=self.world, satellite=_sat, comm_pass=_dl, station=_dl_station, constellation_scheduler=self)
+                self._requests.loc[self._requests['request'] == _req, 'status'] = ObservationStatus.SCHEDULED
+                if random.random() < self.ack_probability_if_scheduled:
+                    callback_request_scheduled(_pass.highest)
+
+        # acceptance_notification_delay_h = (min_h, max_h):
+        #   notification fires at pass_time - uniform(min_h, max_h)
+        #   min_h → latest notification (closest to pass), max_h → earliest
+        _notify_min_h, _notify_max_h = self.acceptance_notification_delay_h
+        if _notify_max_h > 0:
+            _delay_h = random.uniform(_notify_min_h, _notify_max_h)
+            _notify_time = max(
+                current_time,
+                target_pass.highest.time - dt.timedelta(hours=_delay_h),
+            )
+            self.world.add_event(Event(
+                time=_notify_time,
+                action_callable=_fire_acceptance_decision,
+                name=f"AcceptNotify {request.name} on {target_satellite.name}",
+            ))
+        else:
+            _fire_acceptance_decision()  # synchronous (legacy behaviour)
 
         return 0
     def schedule_request(

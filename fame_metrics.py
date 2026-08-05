@@ -23,7 +23,8 @@ def _status_names(ObservationStatus):
 
 
 def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
-                       submission_cost_rate, execution_cost_rate,
+                       submission_cost_rate, execution_cost_fn=None,
+                       execution_cost_rate=0.0,
                        verbose=True):
     """
     Realized, causally-valid, reachability-adjusted metrics.
@@ -60,6 +61,25 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
     if S['execution_failed'] is not None:
         _accepted_statuses.add(S['execution_failed'])
 
+    # Precompute Q_MAX per task: max quality over all submitted passes.
+    # Used for cost billing so costs don't depend on which specific pass was booked.
+    q_max_by_task = {}
+    for _, row in reqs.iterrows():
+        rp = row['requested_pass']
+        if rp is None:
+            continue
+        task = obsreq_to_task.get(row['request'])
+        if task is None:
+            continue
+        try:
+            q = task.rewarder(rp.highest)
+        except Exception:
+            q = 0.0
+        if q > q_max_by_task.get(task, -np.inf):
+            q_max_by_task[task] = q
+
+    has_dispatch_time = 'dispatch_time' in reqs.columns
+
     for _, row in reqs.iterrows():
         rp = row['requested_pass']
         if rp is None:
@@ -74,25 +94,45 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
         except Exception:
             q = 0.0
 
+        q_max = q_max_by_task.get(task, q)
+        _raw_dt = row['dispatch_time'] if has_dispatch_time else None
+        # Convert pandas NaT to None so cost functions can check `is not None` safely
+        try:
+            dispatch_time = None if (_raw_dt != _raw_dt) else _raw_dt
+        except Exception:
+            dispatch_time = _raw_dt
+
         n_submissions += 1
         submitted_count_by_task[task] = submitted_count_by_task.get(task, 0) + 1
-        total_submission_cost += submission_cost_rate * q
+        total_submission_cost += submission_cost_rate * q_max
 
         if status == S['rejected']:
             n_rejected += 1
         if S['cancelled'] is not None and status == S['cancelled']:
             n_cancelled += 1
-            # Submission cost already counted above; no execution cost for cancelled passes
         if S['execution_failed'] is not None and status == S['execution_failed']:
             n_execution_failed += 1
-            # Accepted + executed but failed: pay full execution cost, zero quality
-            total_execution_cost += execution_cost_rate * q
+            sat = row['satellite']
+            if execution_cost_fn is not None:
+                try:
+                    total_execution_cost += execution_cost_fn(task, sat, rp, dispatch_time, q_max=q_max)
+                except Exception:
+                    total_execution_cost += execution_cost_rate * q_max
+            else:
+                total_execution_cost += execution_cost_rate * q_max
         if status in _accepted_statuses:
             n_accepted += 1
         if status == S['received']:
             n_executed += 1
             executed_count_by_task[task] = executed_count_by_task.get(task, 0) + 1
-            total_execution_cost += execution_cost_rate * q
+            sat = row['satellite']
+            if execution_cost_fn is not None:
+                try:
+                    total_execution_cost += execution_cost_fn(task, sat, rp, dispatch_time, q_max=q_max)
+                except Exception:
+                    total_execution_cost += execution_cost_rate * q_max
+            else:
+                total_execution_cost += execution_cost_rate * q_max
 
             # Track best execution quality per task (only successful executions)
             prev = best_success_quality_by_task.get(task, -np.inf)
