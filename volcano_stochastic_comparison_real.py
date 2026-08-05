@@ -126,7 +126,7 @@ ACCEPT_NOTIFY_MAX_H = 6.0   # max hours before pass  →  earliest notification 
 # === PROBABILITY CONFIGURATION ===
 # Acceptance probability range: constellation rejects a booking when its demand
 # is high, accepts when quiet.  DemandField maps demand → p_accept in [P_ACC_MIN, P_ACC_MAX].
-P_ACC_MIN = 0.70            # Minimum acceptance probability (high-demand / congested)
+P_ACC_MIN = 0.65            # Minimum acceptance probability (high-demand / congested)
 P_ACC_MAX = 0.95           # Maximum acceptance probability (low-demand / quiet)
 
 # Execution probability range: even an accepted pass may fail (cloud cover, sensor issue).
@@ -135,7 +135,7 @@ P_ACC_MAX = 0.95           # Maximum acceptance probability (low-demand / quiet)
 P_EXEC_MIN = 0.90           # Minimum execution probability (worst geometry)
 P_EXEC_MAX = 0.99           # Maximum execution probability (best geometry)
 
-SCHEDULERS = ['greedy','stochastic_log', 'deterministic', 'random']
+SCHEDULERS = ['stochastic_log', 'deterministic', 'random']
 #SCHEDULERS = ['stochastic_log','greedy']
 
 # Set to True to cancel inferior pending passes once a better/sufficient one succeeds.

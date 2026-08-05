@@ -309,7 +309,7 @@ def request_updater_volcanoes(
         except ValueError:
             offset_hours = 0.0
 
-        # Target: midpoint of the follow-up observation window
+        # Target: midpoint of the follow-up observation sub-window (offset_hours..offset_hours+3h)
         target_window_mid_h = offset_hours + 1.5
         if volcano_name in volcano_map:
             base_loc = volcano_map[volcano_name]
@@ -326,11 +326,9 @@ def request_updater_volcanoes(
 
             propagated = []
             for obs_time, obs_lon, obs_lat in past_obs_sorted:
-                # Elapsed hours from this observation to the target window midpoint.
-                # The target midpoint is min_time + target_window_mid_h.
-                # We don't carry min_time here, but we know:
-                #   target window start = req.observation_request.min_time
-                target_mid_abs = req.observation_request.min_time + dt.timedelta(hours=1.5)
+                # Elapsed hours from past observation to the sub-window midpoint.
+                # offset_hours marks the sub-window start; +1.5h is the midpoint.
+                target_mid_abs = req.observation_request.min_time + dt.timedelta(hours=offset_hours + 1.5)
                 elapsed_h = (target_mid_abs - obs_time).total_seconds() / 3600.0
                 if elapsed_h < 0:
                     # Observation is in the future relative to target window — skip
@@ -454,10 +452,12 @@ def create_volcano_workflow(
             ]
 
             # Volume Follow-up Task (Targeted at vent location)
+            # Full planning window: timing is enforced by START_AFTER/BEFORE_OFFSET
+            # constraints relative to the actual detection pass time.
             vol_req = ObservationRequest(
                 lon_deg=volcano.lon_deg, lat_deg=volcano.lat_deg, alt_km=volcano.alt_km,
-                min_time=min_time + dt.timedelta(hours=follow_up_ix),
-                max_time=min_time + dt.timedelta(hours=follow_up_ix + follow_up_interval_h),
+                min_time=min_time,
+                max_time=max_time,
                 instrument=InstrumentType.RGB,
                 request_name=f"{volcano.name}_volume_followup_{follow_up_ix}h",
                 min_elevation_deg=20.0
@@ -491,8 +491,8 @@ def create_volcano_workflow(
 
             plume_req = ObservationRequest(
                 lon_deg=initial_plume_lon, lat_deg=initial_plume_lat, alt_km=plume_alt_km,
-                min_time=min_time + dt.timedelta(hours=follow_up_ix),
-                max_time=min_time + dt.timedelta(hours=follow_up_ix + follow_up_interval_h),
+                min_time=min_time,
+                max_time=max_time,
                 instrument=InstrumentType.RGB,
                 request_name=f"{volcano.name}_plume_followup_{follow_up_ix}h",
                 min_elevation_deg=20.0

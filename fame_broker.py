@@ -741,10 +741,10 @@ class Broker():
                     from fame_agents_base import EXECUTION_FAILED_SENTINEL
                     execution_failed = (data_product is EXECUTION_FAILED_SENTINEL)
                     _success = (not execution_failed) and _dispatchable_task.success_declarer(data_product)
-                    # An empty data product (satellite observed but no phenomenon detected)
-                    # is treated as EXECUTION_FAILED so backup passes can still claim the
-                    # task and follow-up reachability is not prematurely collapsed.
-                    _new_status = ObservationStatus.DATA_RECEIVED if _success else ObservationStatus.EXECUTION_FAILED
+                    # EXECUTION_FAILED only for true p_exec hardware failure (sentinel).
+                    # A spatial miss (satellite observed but no phenomenon in FOV) is
+                    # DATA_RECEIVED with an empty data product — the satellite did its job.
+                    _new_status = ObservationStatus.EXECUTION_FAILED if execution_failed else ObservationStatus.DATA_RECEIVED
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = _new_status
                     effective_dp = data_product if _success else []
                     for _ix, __dp in self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'data_product'].items():
@@ -1192,10 +1192,10 @@ class Broker():
                         from fame_agents_base import EXECUTION_FAILED_SENTINEL
                         execution_failed = (data_product is EXECUTION_FAILED_SENTINEL)
                         _success = (not execution_failed) and _dispatchable_task.success_declarer(data_product)
-                        # An empty data product (satellite observed but no phenomenon detected)
-                        # is treated as EXECUTION_FAILED so backup passes can still claim the
-                        # task and follow-up reachability is not prematurely collapsed.
-                        _new_status = ObservationStatus.DATA_RECEIVED if _success else ObservationStatus.EXECUTION_FAILED
+                        # EXECUTION_FAILED only for true p_exec hardware failure (sentinel).
+                        # A spatial miss (satellite observed but no phenomenon in FOV) is
+                        # DATA_RECEIVED with an empty data product — the satellite did its job.
+                        _new_status = ObservationStatus.EXECUTION_FAILED if execution_failed else ObservationStatus.DATA_RECEIVED
                         self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'status'] = _new_status
                         effective_dp = data_product if _success else []
                         for _ix, __dp in self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'data_product'].items():

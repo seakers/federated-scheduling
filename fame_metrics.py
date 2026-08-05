@@ -134,10 +134,14 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
             else:
                 total_execution_cost += execution_cost_rate * q_max
 
-            # Track best execution quality per task (only successful executions)
-            prev = best_success_quality_by_task.get(task, -np.inf)
-            if q > prev:
-                best_success_quality_by_task[task] = q
+            # Credit quality only for true detections (non-empty data product).
+            # A spatial miss has DATA_RECEIVED with [] — satellite executed, no phenomenon found.
+            _dp = row['data_product']
+            _detected = isinstance(_dp, list) and len(_dp) > 0
+            if _detected:
+                prev = best_success_quality_by_task.get(task, -np.inf)
+                if q > prev:
+                    best_success_quality_by_task[task] = q
 
     total_cost = total_submission_cost + total_execution_cost
     completed_tasks = set(best_success_quality_by_task.keys())
