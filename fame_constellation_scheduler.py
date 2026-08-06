@@ -246,7 +246,7 @@ class ConstellationGroundScheduler():
                 self._requests.loc[self._requests['request'] == _req, 'status'] = ObservationStatus.CONSTELLATION_REJECTED
                 # Undo obs timeline reservation
                 self._satellite_busy_timelines_obs[_sat].add_impact(Impact(time=_pass.highest.time, type=ImpactType.ASSIGNMENT, value=False))
-                self._satellite_busy_timelines_obs[_sat].add_impact(Impact(time=_pass.highest.time + _pass.highest.duration, type=ImpactType.ASSIGNMENT, value=True))
+                self._satellite_busy_timelines_obs[_sat].add_impact(Impact(time=_pass.highest.time + _pass.highest.duration, type=ImpactType.ASSIGNMENT, value=False))
                 # Undo comm timeline reservations
                 if type(_ul) == ObservationPass:
                     self._satellite_busy_timelines_comm[_sat].add_impact(Impact(time=_ul.rise.time, type=ImpactType.ASSIGNMENT, value=False))
@@ -270,12 +270,13 @@ class ConstellationGroundScheduler():
                 self._requests.loc[self._requests['request'] == _req, 'status'] = ObservationStatus.SCHEDULED
                 if random.random() < self.ack_probability_if_scheduled:
                     callback_request_scheduled(_pass.highest)
+                    #TODO
 
         # acceptance_notification_delay_h = (min_h, max_h):
         #   notification fires at pass_time - uniform(min_h, max_h)
         #   min_h → latest notification (closest to pass), max_h → earliest
         _notify_min_h, _notify_max_h = self.acceptance_notification_delay_h
-        if _notify_max_h > 0:
+        if _notify_max_h >= 0:
             _delay_h = random.uniform(_notify_min_h, _notify_max_h)
             _notify_time = max(
                 current_time,

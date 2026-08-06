@@ -751,6 +751,50 @@ class Broker():
                         self._requests.at[_ix, 'data_product'] = effective_dp
 
                     if not _success:
+                        # On execution failure, only replan if no backup passes remain in-flight.
+                        # Without this reset the task stays dispatched=True and blocks all
+                        # WAIT_FOR_COMPLETION_IF_FEASIBLE successors permanently.
+                        if execution_failed:
+                            _still_in_flight = self._requests.loc[
+                                (self._requests['request'] == _request) &
+                                (self._requests['status'].isin([ObservationStatus.SUBMITTED, ObservationStatus.SCHEDULED]))
+                            ]
+                            if len(_still_in_flight) > 0:
+                                print(f" [{self.name}] {len(_still_in_flight)} backup pass(es) still in flight for {_request.name} after exec failure, deferring reschedule.")
+                                return
+                            _dispatchable_task.scheduled = False
+                            _dispatchable_task.dispatched = False
+                            follow_up_action_failure(ObservationStatus.EXECUTION_FAILED)
+                            self._n_replans += 1
+                            self._reschedule_depth += 1
+                            self.schedule_workflow(
+                                current_time=self.world.time,
+                                use_ilp=use_ilp,
+                                plot_schedule=plot_schedule,
+                                plot_axes=plot_axes,
+                                plot_night_in_schedule=plot_night_in_schedule,
+                                plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
+                                max_solver_time_s=max_solver_time_s,
+                                receding_horizon_duration=receding_horizon_duration,
+                                save_schedule_plot=save_schedule_plot,
+                                solver_engine=solver_engine,
+                                use_stochastic=use_stochastic,
+                                stochastic_formulation=stochastic_formulation,
+                                success_probability_function=success_probability_function,
+                                acceptance_probability_function=acceptance_probability_function,
+                                execution_probability_function=execution_probability_function,
+                                detection_probability_function=detection_probability_function,
+                                epsilon=epsilon,
+                                pwl_tolerance=pwl_tolerance,
+                                tax_rate=tax_rate,
+                                submission_cost_rate=submission_cost_rate,
+                                cancellation_cost_rate=cancellation_cost_rate,
+                                execution_cost_fn=execution_cost_fn,
+                                results_path=results_path,
+                                use_random=use_random,
+                                random_seed=random_seed,
+                            )
+                            self._reschedule_depth -= 1
                         return
 
                     # If another backup pass already completed this task, just record
@@ -1202,6 +1246,50 @@ class Broker():
                             self._requests.at[_ix, 'data_product'] = effective_dp
 
                         if not _success:
+                            # On execution failure, only replan if no backup passes remain in-flight.
+                            # Without this reset the task stays dispatched=True and blocks all
+                            # WAIT_FOR_COMPLETION_IF_FEASIBLE successors permanently.
+                            if execution_failed:
+                                _still_in_flight = self._requests.loc[
+                                    (self._requests['request'] == _request) &
+                                    (self._requests['status'].isin([ObservationStatus.SUBMITTED, ObservationStatus.SCHEDULED]))
+                                ]
+                                if len(_still_in_flight) > 0:
+                                    print(f" [{self.name}] {len(_still_in_flight)} backup pass(es) still in flight for {_request.name} after exec failure, deferring reschedule.")
+                                    return
+                                _dispatchable_task.scheduled = False
+                                _dispatchable_task.dispatched = False
+                                follow_up_action_failure(ObservationStatus.EXECUTION_FAILED)
+                                self._n_replans += 1
+                                self._reschedule_depth += 1
+                                self.schedule_workflow_redundant(
+                                    current_time=self.world.time,
+                                    use_ilp=use_ilp,
+                                    plot_schedule=plot_schedule,
+                                    plot_axes=plot_axes,
+                                    plot_night_in_schedule=plot_night_in_schedule,
+                                    plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
+                                    max_solver_time_s=max_solver_time_s,
+                                    receding_horizon_duration=receding_horizon_duration,
+                                    save_schedule_plot=save_schedule_plot,
+                                    solver_engine=solver_engine,
+                                    use_stochastic=use_stochastic,
+                                    stochastic_formulation=stochastic_formulation,
+                                    success_probability_function=success_probability_function,
+                                    acceptance_probability_function=acceptance_probability_function,
+                                    execution_probability_function=execution_probability_function,
+                                    epsilon=epsilon,
+                                    pwl_tolerance=pwl_tolerance,
+                                    tax_rate=tax_rate,
+                                    submission_cost_rate=submission_cost_rate,
+                                    cancellation_cost_rate=cancellation_cost_rate,
+                                    execution_cost_fn=execution_cost_fn,
+                                    results_path=results_path,
+                                    use_random=use_random,
+                                    random_seed=random_seed,
+                                    enable_cancellations=enable_cancellations,
+                                )
+                                self._reschedule_depth -= 1
                             return
 
                         if _dispatchable_task.completed:

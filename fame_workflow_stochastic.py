@@ -1406,16 +1406,24 @@ def _add_scip_workflow_constraints(
         passes = solution_holder_by_satellite[satellite]
         passes.sort(key=lambda x: x[0].highest.time)
 
+        # Track the max end time seen up to index i so the inner loop can break
+        # correctly even when passes from different tasks have non-monotonic end times.
+        max_end_so_far = {}
+        running_max = passes[0][0].highest.time + passes[0][0].highest.duration if passes else None
+        for i, (p, _, _r) in enumerate(passes):
+            running_max = max(running_max, p.highest.time + p.highest.duration)
+            max_end_so_far[i] = running_max
+
         for i in range(len(passes)):
             pass_i, x_i, req_i = passes[i]
             for j in range(i + 1, len(passes)):
                 pass_j, x_j, req_j = passes[j]
+                if pass_j.highest.time >= max_end_so_far[i]:
+                    break
                 end_i = pass_i.highest.time + pass_i.highest.duration
                 start_j = pass_j.highest.time
                 if start_j < end_i:
                     solver.Add(x_i + x_j <= 1)
-                else:
-                    break
 
     # Temporal constraints
     for constrained_request in solution_holder.keys():
@@ -2816,24 +2824,27 @@ def _add_workflow_constraints(
         passes = solution_holder_by_satellite[satellite]
         passes.sort(key=lambda x: x[0].highest.time)  # Sort by time
 
+        # Track the max end time seen up to index i so the inner loop can break
+        # correctly even when passes from different tasks have non-monotonic end times.
+        max_end_so_far = {}
+        running_max = passes[0][0].highest.time + passes[0][0].highest.duration if passes else None
+        for i, (p, _, _r) in enumerate(passes):
+            running_max = max(running_max, p.highest.time + p.highest.duration)
+            max_end_so_far[i] = running_max
+
         for i in range(len(passes)):
             pass_i, x_i, req_i = passes[i]
             for j in range(i + 1, len(passes)):
                 pass_j, x_j, req_j = passes[j]
-
-                # Check if passes overlap
+                if pass_j.highest.time >= max_end_so_far[i]:
+                    break
                 end_i = pass_i.highest.time + pass_i.highest.duration
                 start_j = pass_j.highest.time
-
                 if start_j < end_i:
-                    # Conflict: at most one can be scheduled
                     model.addConstr(
                         x_i + x_j <= 1,
                         name=f"conflict_{satellite.name}_{i}_{j}"
                     )
-                else:
-                    # No more conflicts (sorted by time)
-                    break
 
     # === TEMPORAL CONSTRAINTS ===
     for constrained_request in solution_holder.keys():
