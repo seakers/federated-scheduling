@@ -9,7 +9,7 @@ Two formulations are supported:
 1. Non-convex: Uses quadratic constraints (exact, requires Gurobi NonConvex=2)
 2. Log-linearized: Uses piecewise-linear log/exp approximations (faster, approximate)
 """
-N_THREADS=64
+N_THREADS=10
 import numpy as np
 import networkx as nx
 import datetime as dt

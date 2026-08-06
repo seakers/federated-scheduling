@@ -455,7 +455,7 @@ def create_volcano_workflow(
             # Full planning window: timing is enforced by START_AFTER/BEFORE_OFFSET
             # constraints relative to the actual detection pass time.
             follow_up_start = min_time + dt.timedelta(hours=follow_up_ix)
-            follow_up_end = min_time + dt.timedelta(hours=follow_up_ix + follow_up_interval_h)
+            follow_up_end = max_time_detection + dt.timedelta(hours=follow_up_ix + follow_up_interval_h)
             vol_req = ObservationRequest(
                 lon_deg=volcano.lon_deg, lat_deg=volcano.lat_deg, alt_km=volcano.alt_km,
                 min_time=follow_up_start,

@@ -154,25 +154,90 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
         for t in tasks
     }
 
-    def is_task_causally_valid(task):
-        """Checks if all required parent dependencies succeeded in simulation execution."""
-        parents = list(workflow_graph.predecessors(task))
-        if not parents:
+    # Tasks that received at least one pass candidate from the planner.
+    tasks_with_passes = set(submitted_count_by_task.keys())
+
+    def _timeline_was_active(task):
+        """Returns False if any GREATER_OR_EQUAL timeline constraint was never satisfiable.
+
+        Uses the task's observation window midpoint as the evaluation time; falls
+        back to the constraint's own threshold value to determine whether the
+        timeline was below the required minimum throughout the window.
+        """
+        tl_constraints = getattr(task, 'timeline_constraints', [])
+        if not tl_constraints:
             return True
+        obs_req = getattr(task, 'observation_request', None)
+        if obs_req is not None:
+            min_t = getattr(obs_req, 'min_time', None)
+            max_t = getattr(obs_req, 'max_time', None)
+            if min_t is not None and max_t is not None:
+                eval_time = min_t + (max_t - min_t) / 2
+            elif min_t is not None:
+                eval_time = min_t
+            else:
+                eval_time = None
+        else:
+            eval_time = None
+
+        for tc in tl_constraints:
+            tl = getattr(tc, 'timeline', None)
+            threshold = getattr(tc, 'value', None)
+            tc_type = getattr(tc, 'type', None)
+            if tl is None or threshold is None:
+                continue
+            # Only evaluate GREATER_OR_EQUAL constraints (the kind used for activity checks)
+            if tc_type is not None and 'GREATER_OR_EQUAL' not in str(tc_type):
+                continue
+            if eval_time is None:
+                continue
+            try:
+                tl_val = tl.get_value_at(eval_time)
+            except Exception:
+                continue
+            if tl_val < threshold:
+                return False
+        return True
+
+    def is_task_feasible(task):
+        """A task is feasible only if it had passes AND its timelines were active."""
+        if task not in tasks_with_passes:
+            return False
+        if not _timeline_was_active(task):
+            return False
+        return True
+
+    # Build a reachability set: a task is reachable if it is feasible and all
+    # START_IF_SUCCESSFUL parent dependencies were themselves reachable AND succeeded.
+    # We evaluate in topological order so parent reachability is known first.
+    try:
+        import networkx as nx
+        topo_order = list(nx.topological_sort(workflow_graph))
+    except Exception:
+        topo_order = tasks  # fallback if graph is not a DAG or nx unavailable
+
+    task_reachable: dict = {}
+    for task in topo_order:
+        if not is_task_feasible(task):
+            task_reachable[task] = False
+            continue
+        parents = list(workflow_graph.predecessors(task))
+        reachable = True
         for p in parents:
             edge_data = workflow_graph.get_edge_data(p, task)
             for _, constraint in edge_data.items():
                 c_class = constraint.get('constraint_class')
                 c_type = constraint.get('constraint_type')
-                # If constraint requires parent success, parent must have succeeded
-                if 'SUCCESS' in str(c_class):
-                    if 'START_IF_SUCCESSFUL' in str(c_type):
-                        if not task_success_map.get(p, False):
-                            return False
-        return True
+                if 'SUCCESS' in str(c_class) and 'START_IF_SUCCESSFUL' in str(c_type):
+                    # Parent must have been reachable and succeeded
+                    if not (task_reachable.get(p, False) and task_success_map.get(p, False)):
+                        reachable = False
+                        break
+            if not reachable:
+                break
+        task_reachable[task] = reachable
 
-    # Filter reachable tasks (root tasks + children of successful parents)
-    reachable_tasks = set(t for t in tasks if is_task_causally_valid(t))
+    reachable_tasks = {t for t, ok in task_reachable.items() if ok}
     n_tasks_reachable = len(reachable_tasks)
 
     # Valid completed tasks must be reachable
