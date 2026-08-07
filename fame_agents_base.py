@@ -97,7 +97,8 @@ class World():
         self.time = dt.datetime.min
         self.history = []
     
-    def tick(self, print_forbidden_prefixes=[]):
+    def tick(self, print_forbidden_prefixes=[], record_history=True, profile=False):
+        import time as _time
         if len(self.events):
             _event = self.events.pop(0)
 
@@ -110,24 +111,32 @@ class World():
                 print("Executing {}".format(_event))
 
             self.time = _event.time
-            outcome = _event.action_callable()
 
-            self.history.append({
-                'time': _event.time,
-                'event': _event,
-                'phenomena': [copy.deepcopy(p) for p in self.phenomena],
-                'states': {
-                    'satellites': [copy.deepcopy(s) for s in self.satellites],
-                    # Constellations and brokers have a pointer to World, which has a pointer to constellations, which...recursion! This should be fixed with new, custom deepcopy classes
-                    'constellations': [copy.deepcopy(c) for c in self.constellations],
-                    'brokers': [copy.deepcopy(b) for b in self.brokers],
-                }
-            })
-            
+            _t0 = _time.perf_counter() if profile else None
+            outcome = _event.action_callable()
+            _t_action = (_time.perf_counter() - _t0) if profile else 0.0
+
+            _t_copy = 0.0
+            if record_history:
+                _t1 = _time.perf_counter() if profile else None
+                self.history.append({
+                    'time': _event.time,
+                    'event': _event,
+                    'phenomena': [copy.deepcopy(p) for p in self.phenomena],
+                    'states': {
+                        'satellites': [copy.deepcopy(s) for s in self.satellites],
+                        # Constellations and brokers have a pointer to World, which has a pointer to constellations, which...recursion! This should be fixed with new, custom deepcopy classes
+                        'constellations': [copy.deepcopy(c) for c in self.constellations],
+                        'brokers': [copy.deepcopy(b) for b in self.brokers],
+                    }
+                })
+                _t_copy = (_time.perf_counter() - _t1) if profile else 0.0
+
         else:
             print("No more events")
-            
-        return len(self.events)
+            _t_action, _t_copy = 0.0, 0.0
+
+        return len(self.events), _t_action, _t_copy
 
     def add_satellite(self, satellite):
         self.satellite.append(satellite)
