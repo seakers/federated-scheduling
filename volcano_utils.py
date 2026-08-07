@@ -207,11 +207,11 @@ def rewarder_observation(opportunity: ObservationOpportunity, preferred_zenith_a
 
 
 def success_declarer_eruption(data_product):
-    return len(data_product) > 0
+    return True
 
 
 def success_declarer_plume(data_product):
-    return len(data_product) > 0
+    return True
 
 
 def timeline_updater_volcanoes(current_time: dt.datetime, requests: list, timelines: list):

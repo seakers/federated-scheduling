@@ -176,6 +176,7 @@ def create_world_and_constellations(
     sim_start: dt.datetime,
     demand_field=None,
     execution_probability_function=None,
+    acceptance_notification_delay_h: tuple = (0.0, 0.0),
 ):
     """
     Spin up a fresh World + 8 ConstellationGroundSchedulers from deep-copied satellites.
@@ -183,6 +184,8 @@ def create_world_and_constellations(
     demand_field: if provided, its make_simulator_acceptance_function() is wired as
                   the simulator-side acceptance draw (same model the planner uses).
     execution_probability_function: if provided, passed to every ConstellationGroundScheduler.
+    acceptance_notification_delay_h: (min_h, max_h) uniform delay before accept/reject
+                  notification fires before the pass. (0, 0) = synchronous (no delay).
     """
     local_sats = copy.deepcopy(cached_satellites)
     world = World(satellites=local_sats)
@@ -206,6 +209,7 @@ def create_world_and_constellations(
             acceptance_probability=legacy_p,
             acceptance_probability_function=sim_acc_fn,
             execution_probability_function=execution_probability_function,
+            acceptance_notification_delay_h=acceptance_notification_delay_h,
         )
 
     sched_planet  = _make(planet_sats,  "Planet",          0.60)
@@ -231,15 +235,32 @@ def create_world_and_constellations(
 # SIMULATION RUNNER
 # ===========================================================================
 
-def run_simulation_forward(world, max_ticks: int = 40000):
-    """Tick the event loop to completion (retcode=0) or safety cut-off."""
+def run_simulation_forward(world, max_ticks: int = 40000, profile_ticks: int = 0):
+    """Tick the event loop to completion (retcode=0) or safety cut-off.
+
+    Args:
+        profile_ticks: if > 0, print per-tick action vs deepcopy timing for the
+                       first N ticks so you can identify the real bottleneck.
+    """
+    import time as _time
     ticks = 0
     last_report = 0
+    t_action_total = 0.0
+    t_copy_total = 0.0
+    profiling = profile_ticks > 0
     while True:
-        retcode = world.tick(print_forbidden_prefixes=[
-            "Downlink", "End of downlink", "Unlock uplink",
-            "Unlock satellite after obs",
-        ])
+        profiling_this_tick = profiling and ticks < profile_ticks
+        retcode, t_action, t_copy = world.tick(
+            print_forbidden_prefixes=[
+                "Downlink", "End of downlink", "Unlock uplink",
+                "Unlock satellite after obs",
+            ],
+            record_history=False,
+            profile=profiling_this_tick,
+        )
+        if profiling:
+            t_action_total += t_action
+            t_copy_total += t_copy
         ticks += 1
         if ticks - last_report >= 5000:
             print(f"    [Sim] {ticks} ticks, time: {world.time}")
@@ -250,6 +271,8 @@ def run_simulation_forward(world, max_ticks: int = 40000):
             print(f"    [Sim] Safety cut-off at {max_ticks} ticks.")
             break
     print(f"    [Sim] Done. {ticks} ticks, final time: {world.time}")
+    if profiling:
+        print(f"    [Sim profile] action={t_action_total:.2f}s  deepcopy={t_copy_total:.2f}s  ({ticks} ticks profiled)")
 
 
 # ===========================================================================

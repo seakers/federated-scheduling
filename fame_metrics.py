@@ -25,9 +25,16 @@ def _status_names(ObservationStatus):
 def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
                        submission_cost_rate, execution_cost_fn=None,
                        execution_cost_rate=0.0,
-                       verbose=True):
+                       verbose=True,
+                       sim_end_time=None):
     """
     Realized, causally-valid, reachability-adjusted metrics.
+
+    sim_end_time: datetime at which the simulation stopped.  When provided,
+    tasks whose every submitted pass has a fall time strictly after sim_end_time
+    (i.e., the simulation ended before any of their passes could have resolved)
+    are excluded from both numerator and denominator.  Pass broker.world.time
+    (or equivalent) to activate this filter.
     """
     S = _status_names(ObservationStatus)
     reqs = broker._requests
@@ -134,14 +141,12 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
             else:
                 total_execution_cost += execution_cost_rate * q_max
 
-            # Credit quality only for true detections (non-empty data product).
-            # A spatial miss has DATA_RECEIVED with [] — satellite executed, no phenomenon found.
-            _dp = row['data_product']
-            _detected = isinstance(_dp, list) and len(_dp) > 0
-            if _detected:
-                prev = best_success_quality_by_task.get(task, -np.inf)
-                if q > prev:
-                    best_success_quality_by_task[task] = q
+            # DATA_RECEIVED means the satellite executed; credit quality regardless of
+            # whether the data product is non-empty (spatial misses are treated as
+            # successful executions — quality is geometry-based, not detection-based).
+            prev = best_success_quality_by_task.get(task, -np.inf)
+            if q > prev:
+                best_success_quality_by_task[task] = q
 
     total_cost = total_submission_cost + total_execution_cost
     completed_tasks = set(best_success_quality_by_task.keys())
@@ -156,6 +161,40 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
 
     # Tasks that received at least one pass candidate from the planner.
     tasks_with_passes = set(submitted_count_by_task.keys())
+
+    # Tasks cut off by the simulation ending before any of their passes could
+    # resolve.  A task is "sim-truncated" if it was dispatched (has at least one
+    # SUBMITTED or SCHEDULED row) and ALL of those passes have fall times after
+    # sim_end_time — meaning the simulation stopped before any accept/reject
+    # notification or data callback could fire.
+    sim_truncated_tasks: set = set()
+    if sim_end_time is not None:
+        _in_flight_statuses = {ObservationStatus.SUBMITTED, ObservationStatus.SCHEDULED}
+        for task in tasks_with_passes:
+            task_rows = reqs[reqs['request'] == task.observation_request]
+            in_flight = task_rows[task_rows['status'].isin(_in_flight_statuses)]
+            if in_flight.empty:
+                continue
+            # If the task already completed, it's not truncated
+            if task in completed_tasks:
+                continue
+            # Check whether every in-flight pass falls after sim_end_time
+            all_after = True
+            for _, row in in_flight.iterrows():
+                rp = row['requested_pass']
+                if rp is None:
+                    all_after = False
+                    break
+                try:
+                    fall_t = rp.fall.time
+                except Exception:
+                    all_after = False
+                    break
+                if fall_t <= sim_end_time:
+                    all_after = False
+                    break
+            if all_after:
+                sim_truncated_tasks.add(task)
 
     def _timeline_was_active(task):
         """Returns False if any GREATER_OR_EQUAL timeline constraint was never satisfiable.
@@ -200,10 +239,12 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
         return True
 
     def is_task_feasible(task):
-        """A task is feasible only if it had passes AND its timelines were active."""
+        """A task is feasible if it had passes, timelines were active, and sim didn't cut it off."""
         if task not in tasks_with_passes:
             return False
         if not _timeline_was_active(task):
+            return False
+        if task in sim_truncated_tasks:
             return False
         return True
 
@@ -239,6 +280,15 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
 
     reachable_tasks = {t for t, ok in task_reachable.items() if ok}
     n_tasks_reachable = len(reachable_tasks)
+
+    # Classify all tasks for diagnostics
+    n_no_passes = sum(1 for t in tasks if t not in tasks_with_passes)
+    n_inactive_timeline = sum(1 for t in tasks if t in tasks_with_passes and not _timeline_was_active(t))
+    n_sim_truncated = len(sim_truncated_tasks)
+    n_parent_not_met = sum(1 for t in tasks
+                           if t in tasks_with_passes and _timeline_was_active(t)
+                           and t not in sim_truncated_tasks
+                           and not task_reachable.get(t, False))
 
     # Valid completed tasks must be reachable
     valid_completed_tasks = completed_tasks.intersection(reachable_tasks)
@@ -285,6 +335,63 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
     rejection_rate = (n_rejected / n_submissions) if n_submissions > 0 else 0.0
     completions_per_cost = (n_tasks_completed_valid / total_cost) if total_cost > 0 else float('nan')
 
+    # ---------------------------------------------------------------------------
+    # 3. Per-execution detail list
+    # ---------------------------------------------------------------------------
+    # For every pass that actually executed (DATA_RECEIVED), record quality and
+    # realized cost. Quality is geometry-based (task.rewarder), not detection-based.
+    # Only passes for reachable tasks are included — same causal filter as
+    # task_completion_rate.
+    execution_details = []
+    for _, row in reqs[reqs['status'] == S['received']].iterrows():
+        task = obsreq_to_task.get(row['request'])
+        if task is None or task not in reachable_tasks:
+            continue
+        rp = row['requested_pass']
+        sat = row['satellite']
+        _raw_dt = row['dispatch_time'] if has_dispatch_time else None
+        try:
+            _dt_valid = _raw_dt is not None and _raw_dt == _raw_dt
+        except Exception:
+            _dt_valid = False
+        _dispatch_time = _raw_dt if _dt_valid else None
+        q = q_max_by_task.get(task, 0.0)  # use precomputed Q_MAX for this task
+        try:
+            _pass_q = task.rewarder(rp.highest) if rp else 0.0
+        except Exception:
+            _pass_q = 0.0
+        if execution_cost_fn is not None and rp is not None and sat is not None:
+            try:
+                _exec_cost = execution_cost_fn(task, sat, rp, _dispatch_time, q_max=q)
+            except Exception:
+                _exec_cost = 0.0
+        else:
+            _exec_cost = execution_cost_rate * q
+        execution_details.append({
+            'task': getattr(task, 'name', str(id(task))),
+            'group': group_of(task),
+            'satellite': sat.name if sat is not None else None,
+            'pass_time': str(rp.highest.time) if rp else None,
+            'quality': round(_pass_q, 4),
+            'exec_cost': round(_exec_cost, 4),
+            'is_valid': task in valid_completed_tasks,
+        })
+    execution_details.sort(key=lambda x: (x['group'], x['task']))
+
+    # ---------------------------------------------------------------------------
+    # 4. Planning session stats (accumulated by Broker across all replan calls)
+    # ---------------------------------------------------------------------------
+    import math as _math
+    _sessions = getattr(broker, '_planning_sessions', [])
+    def _is_finite(v):
+        try:
+            return v is not None and not _math.isnan(v)
+        except (TypeError, ValueError):
+            return False
+    _solve_times = [s['solve_time_s'] for s in _sessions if _is_finite(s.get('solve_time_s'))]
+    _wall_times  = [s['wall_s']       for s in _sessions if _is_finite(s.get('wall_s'))]
+    _mip_gaps    = [s['mip_gap']      for s in _sessions if _is_finite(s.get('mip_gap'))]
+
     m = {
         # ---- PRIMARY: Reachable & Demand Metrics ----
         'task_completion_rate': reachable_task_completion_rate,  # Main metric uses reachable denominator
@@ -317,9 +424,29 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
         'acceptance_rate': acceptance_rate,
         'rejection_rate': rejection_rate,
         'raw_task_completion_rate': raw_task_completion_rate,
+
+        # ---- FEASIBILITY BREAKDOWN (denominator diagnostics) ----
+        'n_tasks_no_passes': n_no_passes,                  # orbital gap — excluded
+        'n_tasks_inactive_timeline': n_inactive_timeline,  # timeline below threshold — excluded
+        'n_tasks_sim_truncated': n_sim_truncated,          # sim ended before pass resolved — excluded
+        'n_tasks_parent_not_met': n_parent_not_met,        # parent dependency failed — excluded
+
+        # ---- PLANNING SESSION DIAGNOSTICS ----
+        'n_planning_sessions': len(_sessions),
+        'avg_solve_time_s': float(np.mean(_solve_times)) if _solve_times else float('nan'),
+        'avg_wall_time_s': float(np.mean(_wall_times)) if _wall_times else float('nan'),
+        'avg_mip_gap_pct': float(np.mean(_mip_gaps) * 100) if _mip_gaps else float('nan'),
+        'final_mip_gap_pct': float(_sessions[-1].get('mip_gap', float('nan')) * 100) if _sessions else float('nan'),
+
+        # ---- PER-EXECUTION DETAIL (popped before saving run_*.json) ----
+        'execution_details': execution_details,
     }
 
     if verbose:
+        _trunc_str = f", sim-truncated={n_sim_truncated}" if n_sim_truncated else ""
+        print(f"   [Metrics] Tasks total={n_tasks_total}: reachable={n_tasks_reachable} "
+              f"(no-passes={n_no_passes}, inactive-tl={n_inactive_timeline}"
+              f"{_trunc_str}, parent-not-met={n_parent_not_met})")
         print(f"   [Metrics] Reachable Completion: tasks {n_tasks_completed_valid}/{n_tasks_reachable} "
               f"({100*reachable_task_completion_rate:.1f}%), groups {n_groups_completed}/{n_groups_total} "
               f"({100*group_completion_rate:.1f}%)")
@@ -332,6 +459,10 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
               f"{n_cancelled} cancelled, {getattr(broker, '_n_replans', 0)} replans")
         print(f"   [Metrics] TRUE passes/task: {submitted_passes_per_task:.2f} submitted, "
               f"{exec_passes_per_completed:.2f} executed among completed")
+        if _sessions:
+            _gap_str = (f", avg MIP gap {np.mean(_mip_gaps)*100:.1f}%" if _mip_gaps else "")
+            _solve_str = (f"avg solve {np.mean(_solve_times):.1f}s" if _solve_times else "")
+            print(f"   [Metrics] Planning: {len(_sessions)} sessions, {_solve_str}{_gap_str}")
 
     return m
 

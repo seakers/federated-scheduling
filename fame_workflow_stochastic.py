@@ -332,10 +332,10 @@ def ilp_schedule_workflow_stochastic(
         detection_probability_function: Callable = None,   # p_det: prob target present / in footprint (entry-boundary factor). None => 1.0. Only used by "general_logical_dag".
         epsilon: float = 1e-3,
         pwl_tolerance: float = 1e-1,  # SCIP path only; the Gurobi path now uses exact MINLP handling (FuncNonlinear=1)
-        mip_gap: float = 0.05,
+        mip_gap: float = 0.02,
         default_max_instances: int = 3,  # Redundancy cap when a request has no max_num_instances attribute. >1 is REQUIRED for the stochastic planner to hedge.
         solver_engine: str = "GUROBI",
-        tax_rate: float = 0.15,  # Cost per scheduled obs as fraction of max quality (dynamic, per-request). Set to 0 to disable.
+        tax_rate: float = 0.0,  # Cost per scheduled obs as fraction of max quality (dynamic, per-request). Set to 0 to disable.
         submission_cost_rate: float = 0.0,  # c_sub: unconditional per-booking submission overhead (as fraction of Q_MAX_task)
         execution_cost_rate: float = 0.0,   # fallback if execution_cost_fn is None
         execution_cost_fn = None,           # callable(task, satellite, obs_pass, dispatch_time, q_max) -> float
@@ -703,6 +703,15 @@ def _solve_with_gurobi(
                 workflow_graph.graph['objective_value'] = 0.0
             else:
                 model.optimize()
+                # Store solver diagnostics for planning-session metrics
+                try:
+                    workflow_graph.graph['solve_time_s'] = model.Runtime
+                except Exception:
+                    workflow_graph.graph['solve_time_s'] = float('nan')
+                try:
+                    workflow_graph.graph['mip_gap'] = model.MIPGap if model.SolCount > 0 else float('nan')
+                except Exception:
+                    workflow_graph.graph['mip_gap'] = float('nan')
 
             # Step 7: Extract solution
             if model.NumVars > 0:  # Only extract if we actually solved something
@@ -1062,6 +1071,9 @@ def _solve_with_scip(
         # Step 6: Solve
         objective.SetMaximization()
         status = solver.Solve()
+        # Store solver diagnostics for planning-session metrics (ortools WallTime is in ms)
+        workflow_graph.graph['solve_time_s'] = solver.WallTime() / 1000.0
+        workflow_graph.graph['mip_gap'] = float('nan')  # ortools doesn't expose MIP gap
 
         # Enhanced diagnostics
         status_names = ['OPTIMAL', 'FEASIBLE', 'INFEASIBLE', 'UNBOUNDED', 'ABNORMAL', 'MODEL_INVALID', 'NOT_SOLVED']

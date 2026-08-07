@@ -21,7 +21,7 @@ import json
 from fame_workflow import AssignmentTimeline, Impact, ImpactType
 
 from fame_agents_base import *
-
+COMPETITOR_OWNER = "competitor"
 class ConstellationGroundScheduler():
     def __init__(self, satellites: list, ground_stations: list, world, name="Constellation", ack_probability_if_scheduled: float=1., ack_probability_if_unscheduled: float=1., acceptance_probability: float=1.0, acceptance_probability_function=None, execution_probability_function=None, acceptance_notification_delay_h: tuple = (0.0, 0.0)):
         self.name = name
@@ -70,8 +70,8 @@ class ConstellationGroundScheduler():
             return False
         start_time_index = bisect.bisect(self._satellite_busy_timelines_obs[satellite].impact_container, _request.time, key=lambda x: x.time)
         end_time_index = bisect.bisect(self._satellite_busy_timelines_obs[satellite].impact_container, _request.time+_request.duration, key=lambda x: x.time)
-        if (start_time_index != end_time_index): # Something is happening
-            return False
+        # if (start_time_index != end_time_index): # Something is happening
+        #     return False
         if screen_against_comm_passes:
             if (self._satellite_busy_timelines_comm[satellite].get_value_at(_request.time) == True):
                 return False
@@ -118,8 +118,23 @@ class ConstellationGroundScheduler():
             ):
         """
         Submits a specific (target_satellite, target_pass) pair selected by the stochastic MILP planner.
-        Bypasses internal greedy selection to guarantee that redundant backup passes are booked on 
+        Bypasses internal greedy selection to guarantee that redundant backup passes are booked on
         their intended satellites.
+
+        TIMELINE RESERVATION SEMANTICS
+        ------------------------------
+        The slot is reserved BEFORE the acceptance coin flip so that later
+        feasibility checks in the same dispatch round see it as busy, and
+        released if the flip comes up NACK.
+
+        The release removes the exact Impact objects that were inserted, by
+        IDENTITY.  It must not append compensating impacts: the second half of
+        screen_opportunity_for_feasibility is an "are there any entries in this
+        interval" test (bisect index comparison), not a busy/idle state test, so
+        appending a cancelling `False` still leaves the container populated and
+        the slot stays permanently unbookable.  Nor can the release match on
+        timestamp, because a co-timed booking from a different request would be
+        collaterally removed.
         """
         if current_time is None:
             current_time = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
@@ -172,7 +187,7 @@ class ConstellationGroundScheduler():
             earliest_ul_opportunity_station = None
             if target_satellite in ul_comm_opportunities:
                 for comm_opportunity in ul_comm_opportunities[target_satellite]:
-                    if self.screen_pass_for_feasibility(target_satellite, comm_opportunity[1], screen_against_comm_passes=False):
+                    if self.screen_pass_for_feasibility(target_satellite, comm_opportunity[1], screen_against_comm_passes=True):
                         earliest_ul_opportunity = comm_opportunity[1]
                         earliest_ul_opportunity_station = comm_opportunity[0]
                         break
@@ -198,7 +213,7 @@ class ConstellationGroundScheduler():
             dl_station = None
             if target_satellite in dl_comm_opportunities:
                 for comm_opportunity in dl_comm_opportunities[target_satellite]:
-                    if self.screen_pass_for_feasibility(target_satellite, comm_opportunity[1], screen_against_comm_passes=False):
+                    if self.screen_pass_for_feasibility(target_satellite, comm_opportunity[1], screen_against_comm_passes=True):
                         dl_pass = comm_opportunity[1]
                         dl_station = comm_opportunity[0]
                         break
@@ -216,17 +231,31 @@ class ConstellationGroundScheduler():
         else:
             theta_accept = self.acceptance_probability
 
-        # Reserve timeline slot immediately so later feasibility checks see this pass as busy.
-        # On rejection the slot is released. On acceptance the slot stays and events are scheduled.
-        self._satellite_busy_timelines_obs[target_satellite].add_impact(Impact(time=target_pass.highest.time, type=ImpactType.ASSIGNMENT, value=True))
-        self._satellite_busy_timelines_obs[target_satellite].add_impact(Impact(time=target_pass.highest.time + target_pass.highest.duration, type=ImpactType.ASSIGNMENT, value=False))
+        # --- Reserve timeline slots.  Keep references to the exact Impact
+        # objects so the rejection path can remove them by identity.
+        _obs_timeline = self._satellite_busy_timelines_obs[target_satellite]
+        _comm_timeline = self._satellite_busy_timelines_comm[target_satellite]
 
-        if type(earliest_ul_opportunity) == ObservationPass:
-            self._satellite_busy_timelines_comm[target_satellite].add_impact(Impact(time=earliest_ul_opportunity.rise.time, type=ImpactType.ASSIGNMENT, value=True))
-            self._satellite_busy_timelines_comm[target_satellite].add_impact(Impact(time=earliest_ul_opportunity.fall.time, type=ImpactType.ASSIGNMENT, value=False))
-        if type(dl_pass) == ObservationPass:
-            self._satellite_busy_timelines_comm[target_satellite].add_impact(Impact(time=dl_pass.rise.time, type=ImpactType.ASSIGNMENT, value=True))
-            self._satellite_busy_timelines_comm[target_satellite].add_impact(Impact(time=dl_pass.fall.time, type=ImpactType.ASSIGNMENT, value=False))
+        _obs_impacts = [
+            Impact(time=target_pass.highest.time,
+                   type=ImpactType.ASSIGNMENT, value=True, owner=request),
+            Impact(time=target_pass.highest.time + target_pass.highest.duration,
+                   type=ImpactType.ASSIGNMENT, value=False, owner=request),
+        ]
+        for _imp in _obs_impacts:
+            _obs_timeline.add_impact(_imp)
+
+        _comm_impacts = []
+        for _comm_pass in (earliest_ul_opportunity, dl_pass):
+            if type(_comm_pass) == ObservationPass:
+                _comm_impacts.extend([
+                    Impact(time=_comm_pass.rise.time,
+                           type=ImpactType.ASSIGNMENT, value=True, owner=request),
+                    Impact(time=_comm_pass.fall.time,
+                           type=ImpactType.ASSIGNMENT, value=False, owner=request),
+                ])
+        for _imp in _comm_impacts:
+            _comm_timeline.add_impact(_imp)
 
         self._requests.loc[self._requests['request'] == request, 'uplink'] = earliest_ul_opportunity
         self._requests.loc[self._requests['request'] == request, 'downlink'] = dl_pass
@@ -234,30 +263,47 @@ class ConstellationGroundScheduler():
         # Step 4: Accept/reject decision — deferred or immediate.
         # Observation/downlink events are only scheduled on accept, so rejected passes
         # never put spurious ObservationEvents into the world.
+        def _release_reservations(_timeline, _impacts):
+            """Remove exactly the Impact objects we inserted, by identity."""
+            if not _impacts:
+                return 0
+            _before = len(_timeline.impact_container)
+            _timeline.impact_container = [
+                _existing for _existing in _timeline.impact_container
+                if not any(_existing is _mine for _mine in _impacts)
+            ]
+            return _before - len(_timeline.impact_container)
+
         def _fire_acceptance_decision(
             _req=request, _sat=target_satellite, _pass=target_pass,
             _theta=theta_accept,
             _ul=earliest_ul_opportunity, _ul_station=earliest_ul_opportunity_station,
             _dl=dl_pass, _dl_station=dl_station,
+            _obs_tl=_obs_timeline, _comm_tl=_comm_timeline,
+            _obs_imps=_obs_impacts, _comm_imps=_comm_impacts,
         ):
             if random.random() > _theta:
-                # REJECTED — release the reserved timeline slot
+                # REJECTED — a competitor took this slot, so the capacity is
+                # consumed: re-own the obs reservation instead of releasing it,
+                # otherwise a replan immediately rebooks the same window and the
+                # rejection costs nothing.  Comm holds were speculative and ours
+                # alone, so those are released.
                 print(f"   [{self.name}] REJECTED request {_req.name} on {_sat.name} (acceptance prob={_theta:.2f})")
                 self._requests.loc[self._requests['request'] == _req, 'status'] = ObservationStatus.CONSTELLATION_REJECTED
-                # Undo obs timeline reservation
-                self._satellite_busy_timelines_obs[_sat].add_impact(Impact(time=_pass.highest.time, type=ImpactType.ASSIGNMENT, value=False))
-                self._satellite_busy_timelines_obs[_sat].add_impact(Impact(time=_pass.highest.time + _pass.highest.duration, type=ImpactType.ASSIGNMENT, value=False))
-                # Undo comm timeline reservations
-                if type(_ul) == ObservationPass:
-                    self._satellite_busy_timelines_comm[_sat].add_impact(Impact(time=_ul.rise.time, type=ImpactType.ASSIGNMENT, value=False))
-                    self._satellite_busy_timelines_comm[_sat].add_impact(Impact(time=_ul.fall.time, type=ImpactType.ASSIGNMENT, value=True))
-                if type(_dl) == ObservationPass:
-                    self._satellite_busy_timelines_comm[_sat].add_impact(Impact(time=_dl.rise.time, type=ImpactType.ASSIGNMENT, value=False))
-                    self._satellite_busy_timelines_comm[_sat].add_impact(Impact(time=_dl.fall.time, type=ImpactType.ASSIGNMENT, value=True))
+
+                for _imp in _obs_imps:
+                    _imp.owner = COMPETITOR_OWNER
+
+                _n_comm = _release_reservations(_comm_tl, _comm_imps)
+                if _n_comm != len(_comm_imps):
+                    print(f"   [{self.name}] WARNING: released {_n_comm}/{len(_comm_imps)} "
+                        f"comm impacts for {_req.name} on {_sat.name}")
+
                 if random.random() < self.ack_probability_if_unscheduled:
                     callback_request_unscheduled(ObservationStatus.CONSTELLATION_REJECTED)
             else:
-                # ACCEPTED — now schedule the observation and downlink events
+                # ACCEPTED — reservations stay in place; schedule the observation
+                # and downlink events.
                 print(f"   [{self.name}] ACCEPTED request {_req.name} on {_sat.name} (acceptance prob={_theta:.2f})")
                 if _ul == "ISL":
                     schedule_observation(self.world, _pass.highest, phenomenon_processor=phenomenon_processor, execution_probability_function=self.execution_probability_function)

@@ -1443,7 +1443,7 @@ def ilp_schedule_workflow(
                 # --- Authenticate and start Gurobi Env ---
                 env = gp.Env(empty=True)
                 env.setParam('OutputFlag', 0) 
-                env.setParam('MIPGap', 0.01)  
+                env.setParam('MIPGap', 0.05)  
                 env.setParam('OutputFlag', 1)
                 
                 if os.environ.get("WLSACCESSID"):

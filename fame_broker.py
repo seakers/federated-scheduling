@@ -211,6 +211,117 @@ class Broker():
 
         return n_cancelled
 
+    # ------------------------------------------------------------------
+    # Best-of-N redundancy support
+    #
+    # The stochastic planner books several redundant passes per task, but the
+    # reward structure it optimises only credits the *highest quality*
+    # observation that succeeds.  The dispatcher therefore holds a successful
+    # observation as "provisional" while any strictly better pass is still in
+    # flight, and only commits it once no better outcome is possible.  If the
+    # better passes are then rejected / time out / fail execution, the held
+    # observation is committed instead of the task being declared failed.
+    #
+    # With a single dispatched pass (deterministic ILP, greedy, random) there is
+    # never a better pass in flight, so a success commits immediately and the
+    # behaviour is identical to the original code path.
+    # ------------------------------------------------------------------
+    def _pass_quality(self, task, obs_pass):
+        """Quality score of `obs_pass` for `task`, or None if not computable."""
+        if obs_pass is None:
+            return None
+        try:
+            return task.rewarder(obs_pass.highest)
+        except Exception:
+            return None
+
+    def _count_passes_in_flight(self, request, task=None, min_quality=None):
+        """Number of SUBMITTED/SCHEDULED passes for `request`.
+
+        If `min_quality` is given, only passes whose quality is STRICTLY better
+        than `min_quality` are counted (passes with an unknown quality are
+        treated as not better, so they never block a commit).
+        """
+        rows = self._requests.loc[
+            (self._requests['request'] == request) &
+            (self._requests['status'].isin([ObservationStatus.SUBMITTED, ObservationStatus.SCHEDULED]))
+        ]
+        if min_quality is None:
+            return len(rows)
+        n = 0
+        for _, row in rows.iterrows():
+            q = self._pass_quality(task, row['requested_pass'])
+            if q is not None and q > min_quality + 1e-12:
+                n += 1
+        return n
+
+    def _record_provisional_success(self, task, obs_pass, data_product):
+        """Stash a successful observation as the best-so-far for `task`.
+
+        Returns True if this observation is the new best.
+        """
+        q = self._pass_quality(task, obs_pass)
+        if q is None:
+            q = -float('inf')
+        best = getattr(task, 'provisional_best', None)
+        if (best is None) or (q > best['quality']):
+            task.provisional_best = {
+                'quality': q,
+                'data_product': data_product,
+                'pass': obs_pass,
+            }
+            return True
+        print(f" [{self.name}] Discarding lower-quality success for {task.observation_request.name} "
+              f"(quality {q:.3f} <= held {best['quality']:.3f})")
+        return False
+
+    def _commit_provisional_success(self, task, replan, enable_cancellations=False):
+        """Promote the held best observation to a real task completion.
+
+        Runs the success follow-up, sets the completion flags, optionally
+        cancels remaining inferior bookings, propagates GEOMETRY constraints to
+        children and triggers a replan.  Returns True if a commit happened.
+        """
+        best = getattr(task, 'provisional_best', None)
+        if best is None or task.completed:
+            return False
+
+        data_product = best['data_product']
+        winning_pass = best['pass']
+        _q = best['quality']
+        print(f" [{self.name}] Committing best-of-N observation for "
+              f"{task.observation_request.name} (quality {_q:.3f})")
+
+        task.provisional_best = None
+
+        task.follow_up_action_success(data_product)
+
+        task.scheduled = True
+        task.dispatched = True
+        task.completed = True
+        task.data_product = data_product
+        task.successful_execution = True
+
+        if enable_cancellations and winning_pass is not None:
+            self._try_cancel_inferior_passes(
+                dispatchable_task=task,
+                winning_pass=winning_pass,
+                current_time=self.world.time,
+            )
+
+        try:
+            for child_task_id in self._workflow_graph.successors(task):
+                outedges = self._workflow_graph.get_edge_data(task, child_task_id)
+                for constraint_key, constraint in outedges.items():
+                    if (constraint['constraint_class'] == ConstraintClass.GEOMETRY):
+                        child_task_id.observation_request = constraint['parameters']['geometry_generator'](
+                            child_task_id.observation_request, data_product)
+        except Exception as e:
+            print(f" [{self.name}] Error propagating geometry constraints: {e}")
+
+        replan()
+        return True
+
     # Broadly, look at the ephemerides, find the best option, find the corresponding constellation, give them a window around that.
     def schedule_request(
             self,
@@ -311,18 +422,15 @@ class Broker():
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = reason
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'constellation'] = None
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'satellite'] = None
-                    # Only release broker timeline on CONSTELLATION_REJECTED (acceptance roll).
-                    # For ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING the constellation slot
-                    # is occupied by something else; keeping the lock prevents re-trying the same slot.
-                    if reason == ObservationStatus.CONSTELLATION_REJECTED:
-                        _tl = self._satellite_busy_timelines.get(__best_satellite)
-                        if _tl is not None:
-                            _obs_start = __best_pass.highest.time
-                            _obs_end   = __best_pass.highest.time + __best_pass.highest.duration
-                            _tl.impact_container = [
-                                imp for imp in _tl.impact_container
-                                if imp.time != _obs_start and imp.time != _obs_end
-                            ]
+                    # if reason == ObservationStatus.CONSTELLATION_REJECTED:
+                    #     _tl = self._satellite_busy_timelines.get(__best_satellite)
+                    #     if _tl is not None:
+                    #         _obs_start = __best_pass.highest.time
+                    #         _obs_end   = __best_pass.highest.time + __best_pass.highest.duration
+                    #         _tl.impact_container = [
+                    #             imp for imp in _tl.impact_container
+                    #             if imp.time != _obs_start and imp.time != _obs_end
+                    #         ]
                     follow_up_action_failure(reason)
                     # Also reschedule
 
@@ -583,6 +691,42 @@ class Broker():
             follow_up_action_failure = dispatchable_task.follow_up_action_failure
             follow_up_action_success = dispatchable_task.follow_up_action_success
 
+            # This entry point never cancels inferior bookings.
+            _enable_cancellations = False
+
+            # Single definition of the re-planning call, shared by every callback
+            # below so that no code path can silently drop a parameter.
+            def _replan():
+                self.schedule_workflow(
+                    current_time=self.world.time,
+                    use_ilp=use_ilp,
+                    plot_schedule=plot_schedule,
+                    plot_axes=plot_axes,
+                    plot_night_in_schedule=plot_night_in_schedule,
+                    plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
+                    max_solver_time_s=max_solver_time_s,
+                    receding_horizon_duration=receding_horizon_duration,
+                    save_schedule_plot=save_schedule_plot,
+                    solver_engine=solver_engine,
+                    use_stochastic=use_stochastic,
+                    stochastic_formulation=stochastic_formulation,
+                    execution_cost_rate=execution_cost_rate,
+                    execution_cost_fn=execution_cost_fn,
+                    success_probability_function=success_probability_function,
+                    acceptance_probability_function=acceptance_probability_function,
+                    execution_probability_function=execution_probability_function,
+                    detection_probability_function=detection_probability_function,
+                    epsilon=epsilon,
+                    pwl_tolerance=pwl_tolerance,
+                    tax_rate=tax_rate,
+                    submission_cost_rate=submission_cost_rate,
+                    cancellation_cost_rate=cancellation_cost_rate,
+                    max_reschedule_depth=max_reschedule_depth,
+                    results_path=results_path,
+                    use_random=use_random,
+                    random_seed=random_seed,
+                )
+
             # Use all redundant passes from the planner if available; fall back to
             # the single primary pass for backward-compatibility with deterministic
             # requests that never populate pending_dispatch_passes.
@@ -648,38 +792,19 @@ class Broker():
                         print(f" [{self.name}] {len(_still_in_flight)} backup pass(es) still in flight for {_request.name}, deferring reschedule.")
                         return
 
+                    # Every outstanding attempt for this task has now resolved.  If an
+                    # earlier (lower-quality) pass succeeded and was being held back for a
+                    # better one, commit it now rather than declaring the task failed.
+                    if self._commit_provisional_success(_dispatchable_task, _replan,
+                                                        enable_cancellations=_enable_cancellations):
+                        return
+
                     _dispatchable_task.scheduled = False
                     _dispatchable_task.dispatched = False
                     follow_up_action_failure(reason)
                     self._n_replans += 1
                     self._reschedule_depth += 1
-                    self.schedule_workflow(
-                        current_time=self.world.time,
-                        use_ilp=use_ilp,
-                        plot_schedule=plot_schedule,
-                        plot_axes=plot_axes,
-                        plot_night_in_schedule=plot_night_in_schedule,
-                        plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
-                        max_solver_time_s=max_solver_time_s,
-                        receding_horizon_duration=receding_horizon_duration,
-                        save_schedule_plot=save_schedule_plot,
-                        solver_engine=solver_engine,
-                        use_stochastic=use_stochastic,
-                        stochastic_formulation=stochastic_formulation,
-                        success_probability_function=success_probability_function,
-                        acceptance_probability_function=acceptance_probability_function,
-                        execution_probability_function=execution_probability_function,
-                        detection_probability_function=detection_probability_function,
-                        epsilon=epsilon,
-                        pwl_tolerance=pwl_tolerance,
-                        tax_rate=tax_rate,
-                        submission_cost_rate=submission_cost_rate,
-                        cancellation_cost_rate=cancellation_cost_rate,
-                        execution_cost_fn=execution_cost_fn,
-                        results_path=results_path,
-                        use_random=use_random,
-                        random_seed=random_seed,
-                    )
+                    _replan()
                     self._reschedule_depth -= 1
                     return
 
@@ -702,37 +827,19 @@ class Broker():
                             print(f" [{self.name}] {len(_still_in_flight)} backup pass(es) still in flight for {_request.name} after timeout, deferring reschedule.")
                             return
 
+                        # Every outstanding attempt for this task has now resolved.  If an
+                        # earlier (lower-quality) pass succeeded and was being held back for a
+                        # better one, commit it now rather than declaring the task failed.
+                        if self._commit_provisional_success(_dispatchable_task, _replan,
+                                                            enable_cancellations=_enable_cancellations):
+                            return
+
                         _dispatchable_task.scheduled = False
                         _dispatchable_task.dispatched = False
                         follow_up_action_failure(ObservationStatus.TIMEOUT)
                         self._n_replans += 1
                         self._reschedule_depth += 1
-                        self.schedule_workflow(
-                            current_time=self.world.time,
-                            use_ilp=use_ilp,
-                            plot_schedule=plot_schedule,
-                            plot_axes=plot_axes,
-                            plot_night_in_schedule=plot_night_in_schedule,
-                            plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
-                            max_solver_time_s=max_solver_time_s,
-                            receding_horizon_duration=receding_horizon_duration,
-                            save_schedule_plot=save_schedule_plot,
-                            solver_engine=solver_engine,
-                            use_stochastic=use_stochastic,
-                            stochastic_formulation=stochastic_formulation,
-                            success_probability_function=success_probability_function,
-                            acceptance_probability_function=acceptance_probability_function,
-                            execution_probability_function=execution_probability_function,
-                            epsilon=epsilon,
-                            pwl_tolerance=pwl_tolerance,
-                            tax_rate=tax_rate,
-                            submission_cost_rate=submission_cost_rate,
-                            cancellation_cost_rate=cancellation_cost_rate,
-                            execution_cost_fn=execution_cost_fn,
-                            results_path=results_path,
-                            use_random=use_random,
-                            random_seed=random_seed,
-                        )
+                        _replan()
                         self._reschedule_depth -= 1
                     return
 
@@ -762,39 +869,28 @@ class Broker():
                             if len(_still_in_flight) > 0:
                                 print(f" [{self.name}] {len(_still_in_flight)} backup pass(es) still in flight for {_request.name} after exec failure, deferring reschedule.")
                                 return
+                            # Every outstanding attempt for this task has now resolved.  If an
+                            # earlier (lower-quality) pass succeeded and was being held back for a
+                            # better one, commit it now rather than declaring the task failed.
+                            if self._commit_provisional_success(_dispatchable_task, _replan,
+                                                                enable_cancellations=_enable_cancellations):
+                                return
+
                             _dispatchable_task.scheduled = False
                             _dispatchable_task.dispatched = False
                             follow_up_action_failure(ObservationStatus.EXECUTION_FAILED)
                             self._n_replans += 1
                             self._reschedule_depth += 1
-                            self.schedule_workflow(
-                                current_time=self.world.time,
-                                use_ilp=use_ilp,
-                                plot_schedule=plot_schedule,
-                                plot_axes=plot_axes,
-                                plot_night_in_schedule=plot_night_in_schedule,
-                                plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
-                                max_solver_time_s=max_solver_time_s,
-                                receding_horizon_duration=receding_horizon_duration,
-                                save_schedule_plot=save_schedule_plot,
-                                solver_engine=solver_engine,
-                                use_stochastic=use_stochastic,
-                                stochastic_formulation=stochastic_formulation,
-                                success_probability_function=success_probability_function,
-                                acceptance_probability_function=acceptance_probability_function,
-                                execution_probability_function=execution_probability_function,
-                                detection_probability_function=detection_probability_function,
-                                epsilon=epsilon,
-                                pwl_tolerance=pwl_tolerance,
-                                tax_rate=tax_rate,
-                                submission_cost_rate=submission_cost_rate,
-                                cancellation_cost_rate=cancellation_cost_rate,
-                                execution_cost_fn=execution_cost_fn,
-                                results_path=results_path,
-                                use_random=use_random,
-                                random_seed=random_seed,
-                            )
+                            _replan()
                             self._reschedule_depth -= 1
+                        else:
+                            # Spatial miss: the satellite executed but nothing was in the
+                            # FOV.  Not a p_exec failure, so no replan is needed - but if
+                            # this was the last outstanding attempt, any held-back success
+                            # must be released now.
+                            if self._count_passes_in_flight(_request) == 0:
+                                self._commit_provisional_success(_dispatchable_task, _replan,
+                                                                 enable_cancellations=_enable_cancellations)
                         return
 
                     # If another backup pass already completed this task, just record
@@ -803,51 +899,20 @@ class Broker():
                         print(f" [{self.name}] Task {_request.name} already completed by a prior pass, skipping follow-up for {__best_pass}.")
                         return
 
-                    follow_up_action_success(data_product)
+                    # Best-of-N redundancy: this success is provisional until every
+                    # strictly-better pass for the same task has resolved, because credit
+                    # is only given for the highest-quality observation that succeeds.
+                    self._record_provisional_success(_dispatchable_task, __best_pass, data_product)
+                    _held = _dispatchable_task.provisional_best
+                    _n_better = self._count_passes_in_flight(_request, task=_dispatchable_task,
+                                                             min_quality=_held['quality'])
+                    if _n_better > 0:
+                        print(f" [{self.name}] Success on {_request.name} (quality {_held['quality']:.3f}) "
+                              f"held: {_n_better} higher-quality pass(es) still in flight.")
+                        return
 
-                    _dispatchable_task.scheduled = True
-                    _dispatchable_task.dispatched = True
-                    _dispatchable_task.completed = True
-                    _dispatchable_task.data_product = data_product
-                    _dispatchable_task.successful_execution = True
-
-                    try:
-                        for child_task_id in self._workflow_graph.successors(_dispatchable_task):
-                            outedges = self._workflow_graph.get_edge_data(_dispatchable_task, child_task_id)
-                            for constraint_key, constraint in outedges.items():
-                                if (constraint['constraint_class'] == ConstraintClass.GEOMETRY):
-                                    child_task_id.observation_request = constraint['parameters']['geometry_generator'](child_task_id.observation_request, data_product)
-                    except Exception as e:
-                        print(e)
-                        import pdb; pdb.set_trace()
-
-                    self.schedule_workflow(
-                        current_time=self.world.time,
-                        use_ilp=use_ilp,
-                        plot_schedule=plot_schedule,
-                        plot_axes=plot_axes,
-                        plot_night_in_schedule=plot_night_in_schedule,
-                        plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
-                        max_solver_time_s=max_solver_time_s,
-                        receding_horizon_duration=receding_horizon_duration,
-                        save_schedule_plot=save_schedule_plot,
-                        solver_engine=solver_engine,
-                        use_stochastic=use_stochastic,
-                        stochastic_formulation=stochastic_formulation,
-                        success_probability_function=success_probability_function,
-                        acceptance_probability_function=acceptance_probability_function,
-                        execution_probability_function=execution_probability_function,
-                        detection_probability_function=detection_probability_function,
-                        epsilon=epsilon,
-                        pwl_tolerance=pwl_tolerance,
-                        tax_rate=tax_rate,
-                        submission_cost_rate=submission_cost_rate,
-                        cancellation_cost_rate=cancellation_cost_rate,
-                        execution_cost_fn=execution_cost_fn,
-                        results_path=results_path,
-                        use_random=use_random,
-                        random_seed=random_seed,
-                    )
+                    self._commit_provisional_success(_dispatchable_task, _replan,
+                                                     enable_cancellations=_enable_cancellations)
                     return
 
                 _pass_callbacks.append((_pass_satellite, _pass_obj, _pass_constellation,
@@ -1084,6 +1149,42 @@ class Broker():
                 follow_up_action_failure = dispatchable_task.follow_up_action_failure
                 follow_up_action_success = dispatchable_task.follow_up_action_success
 
+                _enable_cancellations = enable_cancellations
+
+                # Single definition of the re-planning call, shared by every callback
+                # below so that no code path can silently drop a parameter.
+                def _replan():
+                    self.schedule_workflow_redundant(
+                        current_time=self.world.time,
+                        use_ilp=use_ilp,
+                        plot_schedule=plot_schedule,
+                        plot_axes=plot_axes,
+                        plot_night_in_schedule=plot_night_in_schedule,
+                        plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
+                        max_solver_time_s=max_solver_time_s,
+                        receding_horizon_duration=receding_horizon_duration,
+                        save_schedule_plot=save_schedule_plot,
+                        solver_engine=solver_engine,
+                        use_stochastic=use_stochastic,
+                        stochastic_formulation=stochastic_formulation,
+                        execution_cost_rate=execution_cost_rate,
+                        execution_cost_fn=execution_cost_fn,
+                        success_probability_function=success_probability_function,
+                        acceptance_probability_function=acceptance_probability_function,
+                        execution_probability_function=execution_probability_function,
+                        detection_probability_function=detection_probability_function,
+                        epsilon=epsilon,
+                        pwl_tolerance=pwl_tolerance,
+                        tax_rate=tax_rate,
+                        submission_cost_rate=submission_cost_rate,
+                        cancellation_cost_rate=cancellation_cost_rate,
+                        max_reschedule_depth=max_reschedule_depth,
+                        results_path=results_path,
+                        use_random=use_random,
+                        random_seed=random_seed,
+                        enable_cancellations=enable_cancellations,
+                    )
+
                 # --- EXTRACT SOLVED PASSES FROM STOCHASTIC PLANNER ---
                 _passes_to_dispatch = []
                 if hasattr(dispatchable_task, 'pending_dispatch_passes') and dispatchable_task.pending_dispatch_passes:
@@ -1144,38 +1245,19 @@ class Broker():
                             print(f" [{self.name}] {len(_still_in_flight)} backup pass(es) still in flight for {_request.name}, deferring reschedule.")
                             return
 
+                        # Every outstanding attempt for this task has now resolved.  If an
+                        # earlier (lower-quality) pass succeeded and was being held back for a
+                        # better one, commit it now rather than declaring the task failed.
+                        if self._commit_provisional_success(_dispatchable_task, _replan,
+                                                            enable_cancellations=_enable_cancellations):
+                            return
+
                         _dispatchable_task.scheduled = False
                         _dispatchable_task.dispatched = False
                         follow_up_action_failure(reason)
                         self._n_replans += 1
                         self._reschedule_depth += 1
-                        self.schedule_workflow_redundant(
-                            current_time=self.world.time,
-                            use_ilp=use_ilp,
-                            plot_schedule=plot_schedule,
-                            plot_axes=plot_axes,
-                            plot_night_in_schedule=plot_night_in_schedule,
-                            plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
-                            max_solver_time_s=max_solver_time_s,
-                            receding_horizon_duration=receding_horizon_duration,
-                            save_schedule_plot=save_schedule_plot,
-                            solver_engine=solver_engine,
-                            use_stochastic=use_stochastic,
-                            stochastic_formulation=stochastic_formulation,
-                            success_probability_function=success_probability_function,
-                            acceptance_probability_function=acceptance_probability_function,
-                            execution_probability_function=execution_probability_function,
-                            epsilon=epsilon,
-                            pwl_tolerance=pwl_tolerance,
-                            tax_rate=tax_rate,
-                            submission_cost_rate=submission_cost_rate,
-                            cancellation_cost_rate=cancellation_cost_rate,
-                            execution_cost_fn=execution_cost_fn,
-                            results_path=results_path,
-                            use_random=use_random,
-                            random_seed=random_seed,
-                            enable_cancellations=enable_cancellations,
-                        )
+                        _replan()
                         self._reschedule_depth -= 1
                         return
 
@@ -1196,38 +1278,19 @@ class Broker():
                                 print(f" [{self.name}] {len(_still_in_flight)} backup pass(es) still in flight for {_request.name} after timeout, deferring reschedule.")
                                 return
 
+                            # Every outstanding attempt for this task has now resolved.  If an
+                            # earlier (lower-quality) pass succeeded and was being held back for a
+                            # better one, commit it now rather than declaring the task failed.
+                            if self._commit_provisional_success(_dispatchable_task, _replan,
+                                                                enable_cancellations=_enable_cancellations):
+                                return
+
                             _dispatchable_task.scheduled = False
                             _dispatchable_task.dispatched = False
                             follow_up_action_failure(ObservationStatus.TIMEOUT)
                             self._n_replans += 1
                             self._reschedule_depth += 1
-                            self.schedule_workflow_redundant(
-                                current_time=self.world.time,
-                                use_ilp=use_ilp,
-                                plot_schedule=plot_schedule,
-                                plot_axes=plot_axes,
-                                plot_night_in_schedule=plot_night_in_schedule,
-                                plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
-                                max_solver_time_s=max_solver_time_s,
-                                receding_horizon_duration=receding_horizon_duration,
-                                save_schedule_plot=save_schedule_plot,
-                                solver_engine=solver_engine,
-                                use_stochastic=use_stochastic,
-                                stochastic_formulation=stochastic_formulation,
-                                success_probability_function=success_probability_function,
-                                acceptance_probability_function=acceptance_probability_function,
-                                execution_probability_function=execution_probability_function,
-                                epsilon=epsilon,
-                                pwl_tolerance=pwl_tolerance,
-                                tax_rate=tax_rate,
-                                submission_cost_rate=submission_cost_rate,
-                                cancellation_cost_rate=cancellation_cost_rate,
-                                execution_cost_fn=execution_cost_fn,
-                                results_path=results_path,
-                                use_random=use_random,
-                                random_seed=random_seed,
-                                enable_cancellations=enable_cancellations,
-                            )
+                            _replan()
                             self._reschedule_depth -= 1
                         return
 
@@ -1244,7 +1307,7 @@ class Broker():
                         effective_dp = data_product if _success else []
                         for _ix, __dp in self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'data_product'].items():
                             self._requests.at[_ix, 'data_product'] = effective_dp
-
+                            
                         if not _success:
                             # On execution failure, only replan if no backup passes remain in-flight.
                             # Without this reset the task stays dispatched=True and blocks all
@@ -1257,98 +1320,48 @@ class Broker():
                                 if len(_still_in_flight) > 0:
                                     print(f" [{self.name}] {len(_still_in_flight)} backup pass(es) still in flight for {_request.name} after exec failure, deferring reschedule.")
                                     return
+                                # Every outstanding attempt for this task has now resolved.  If an
+                                # earlier (lower-quality) pass succeeded and was being held back for a
+                                # better one, commit it now rather than declaring the task failed.
+                                if self._commit_provisional_success(_dispatchable_task, _replan,
+                                                                    enable_cancellations=_enable_cancellations):
+                                    return
+
                                 _dispatchable_task.scheduled = False
                                 _dispatchable_task.dispatched = False
                                 follow_up_action_failure(ObservationStatus.EXECUTION_FAILED)
                                 self._n_replans += 1
                                 self._reschedule_depth += 1
-                                self.schedule_workflow_redundant(
-                                    current_time=self.world.time,
-                                    use_ilp=use_ilp,
-                                    plot_schedule=plot_schedule,
-                                    plot_axes=plot_axes,
-                                    plot_night_in_schedule=plot_night_in_schedule,
-                                    plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
-                                    max_solver_time_s=max_solver_time_s,
-                                    receding_horizon_duration=receding_horizon_duration,
-                                    save_schedule_plot=save_schedule_plot,
-                                    solver_engine=solver_engine,
-                                    use_stochastic=use_stochastic,
-                                    stochastic_formulation=stochastic_formulation,
-                                    success_probability_function=success_probability_function,
-                                    acceptance_probability_function=acceptance_probability_function,
-                                    execution_probability_function=execution_probability_function,
-                                    epsilon=epsilon,
-                                    pwl_tolerance=pwl_tolerance,
-                                    tax_rate=tax_rate,
-                                    submission_cost_rate=submission_cost_rate,
-                                    cancellation_cost_rate=cancellation_cost_rate,
-                                    execution_cost_fn=execution_cost_fn,
-                                    results_path=results_path,
-                                    use_random=use_random,
-                                    random_seed=random_seed,
-                                    enable_cancellations=enable_cancellations,
-                                )
+                                _replan()
                                 self._reschedule_depth -= 1
+                            else:
+                                # Spatial miss: the satellite executed but nothing was in the
+                                # FOV.  Not a p_exec failure, so no replan is needed - but if
+                                # this was the last outstanding attempt, any held-back success
+                                # must be released now.
+                                if self._count_passes_in_flight(_request) == 0:
+                                    self._commit_provisional_success(_dispatchable_task, _replan,
+                                                                     enable_cancellations=_enable_cancellations)
                             return
 
                         if _dispatchable_task.completed:
                             print(f" [{self.name}] Task {_request.name} already completed by a prior pass, skipping follow-up for {__best_pass}.")
                             return
 
-                        follow_up_action_success(data_product)
+                        # Best-of-N redundancy: this success is provisional until every
+                        # strictly-better pass for the same task has resolved, because credit
+                        # is only given for the highest-quality observation that succeeds.
+                        self._record_provisional_success(_dispatchable_task, __best_pass, data_product)
+                        _held = _dispatchable_task.provisional_best
+                        _n_better = self._count_passes_in_flight(_request, task=_dispatchable_task,
+                                                                 min_quality=_held['quality'])
+                        if _n_better > 0:
+                            print(f" [{self.name}] Success on {_request.name} (quality {_held['quality']:.3f}) "
+                                  f"held: {_n_better} higher-quality pass(es) still in flight.")
+                            return
 
-                        _dispatchable_task.scheduled = True
-                        _dispatchable_task.dispatched = True
-                        _dispatchable_task.completed = True
-                        _dispatchable_task.data_product = data_product
-                        _dispatchable_task.successful_execution = True
-
-                        # --- Cancellation of inferior pending passes ---
-                        if enable_cancellations:
-                            self._try_cancel_inferior_passes(
-                                dispatchable_task=_dispatchable_task,
-                                winning_pass=__best_pass,
-                                current_time=self.world.time,
-                            )
-
-                        try:
-                            for child_task_id in self._workflow_graph.successors(_dispatchable_task):
-                                outedges = self._workflow_graph.get_edge_data(_dispatchable_task, child_task_id)
-                                for constraint_key, constraint in outedges.items():
-                                    if (constraint['constraint_class'] == ConstraintClass.GEOMETRY):
-                                        child_task_id.observation_request = constraint['parameters']['geometry_generator'](child_task_id.observation_request, data_product)
-                        except Exception as e:
-                            print(e)
-                            import pdb; pdb.set_trace()
-
-                        self.schedule_workflow_redundant(
-                            current_time=self.world.time,
-                            use_ilp=use_ilp,
-                            plot_schedule=plot_schedule,
-                            plot_axes=plot_axes,
-                            plot_night_in_schedule=plot_night_in_schedule,
-                            plot_location_for_night_in_schedule=plot_location_for_night_in_schedule,
-                            max_solver_time_s=max_solver_time_s,
-                            receding_horizon_duration=receding_horizon_duration,
-                            save_schedule_plot=save_schedule_plot,
-                            solver_engine=solver_engine,
-                            use_stochastic=use_stochastic,
-                            stochastic_formulation=stochastic_formulation,
-                            success_probability_function=success_probability_function,
-                            acceptance_probability_function=acceptance_probability_function,
-                            execution_probability_function=execution_probability_function,
-                            epsilon=epsilon,
-                            pwl_tolerance=pwl_tolerance,
-                            tax_rate=tax_rate,
-                            submission_cost_rate=submission_cost_rate,
-                            cancellation_cost_rate=cancellation_cost_rate,
-                            execution_cost_fn=execution_cost_fn,
-                            results_path=results_path,
-                            use_random=use_random,
-                            random_seed=random_seed,
-                            enable_cancellations=enable_cancellations,
-                        )
+                        self._commit_provisional_success(_dispatchable_task, _replan,
+                                                         enable_cancellations=_enable_cancellations)
                         return
 
                     _pass_callbacks.append((_pass_satellite, _pass_obj, _pass_constellation,
@@ -1381,6 +1394,17 @@ class Broker():
                 # --- Phase 2: Dispatch to constellation using schedule_request_redundant ---
                 for (_pass_satellite, _pass_obj, _pass_constellation,
                     _cb_sched, _cb_unsched, _cb_ready, _cb_timeout) in _pass_callbacks:
+
+                    # if not self._screen_pass_for_feasibility(_pass_satellite, _pass_obj):
+                    #     print(f" [{self.name}] STALE: {request.name} on {_pass_satellite.name} "
+                    #         f"@ {_pass_obj.highest.time} no longer feasible, skipping submission")
+                    #     self._requests.loc[
+                    #         (self._requests['request'] == request) &
+                    #         (self._requests['requested_pass'] == _pass_obj),
+                    #         'status'
+                    #     ] = ObservationStatus.ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING
+                    #     continue
+
 
                     self._satellite_busy_timelines[_pass_satellite].add_impact(Impact(time=_pass_obj.highest.time, type=ImpactType.ASSIGNMENT, value=True))
                     self._satellite_busy_timelines[_pass_satellite].add_impact(Impact(time=_pass_obj.highest.time + _pass_obj.highest.duration, type=ImpactType.ASSIGNMENT, value=False))

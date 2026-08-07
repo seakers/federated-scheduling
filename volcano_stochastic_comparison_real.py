@@ -86,57 +86,69 @@ from benchmarking_utils import (
 SIMULATION_START = dt.datetime(2026, 8, 1, 0, 0, 0)  # fixed for reproducibility; override with --start
 
 
-lookahead_horizon_h = 36
-FOLLOW_UP_INTERVAL_H = 3
+lookahead_horizon_h = 12
+FOLLOW_UP_INTERVAL_H = 2
+HOURS_TO_DETECT = 3
 MAX_SOLVER_TIME_S = 120
 MAX_NUM_INSTANCES = 10
-NUM_MC_RUNS = 1
+NUM_MC_RUNS = 3
 
 # === COST CONFIGURATION ===
 TAX_RATE = 0.0              # Legacy per-booking tax (disabled)
-SUBMISSION_COST = 0.02      # Unconditional booking submission overhead (fraction of Q_MAX_task)
+SUBMISSION_COST = 0.005      # Unconditional booking submission overhead (fraction of Q_MAX_task)
 
 # Per-provider execution cost rates (fraction of Q_MAX_task at reference lead time).
+# PROVIDER_RATES = {
+#     "Planet":          0.08,
+#     "Umbra":           0.20,
+#     "Capella":         0.25,
+#     "LOFT":            0.10,
+#     "Ubotica":         0.15,
+#     "Mission Control": 0.10,
+#     "AC":              0.08,
+#     "ICEYE":           0.20,
+# }
 PROVIDER_RATES = {
-    "Planet":          0.08,
-    "Umbra":           0.20,
-    "Capella":         0.25,
-    "LOFT":            0.10,
-    "Ubotica":         0.15,
-    "Mission Control": 0.10,
-    "AC":              0.08,
-    "ICEYE":           0.20,
+    "Planet":          0.01,
+    "Umbra":           0.02,
+    "Capella":         0.03,
+    "LOFT":            0.01,
+    "Ubotica":         0.015,
+    "Mission Control": 0.010,
+    "AC":              0.008,
+    "ICEYE":           0.020,
 }
-PROVIDER_RATE_DEFAULT = 0.20  # fallback for unknown providers
+
+PROVIDER_RATE_DEFAULT = 0.020  # fallback for unknown providers
 
 # Lead-time multiplier: cost = rate × Q_MAX × (1 + LEAD_K × max(0, 1 - lead_h / LEAD_T_REF_H))
 # At lead >= LEAD_T_REF_H: multiplier = 1.0 (base cost)
 # At lead = 0: multiplier = 1 + LEAD_K (maximum cost)
-LEAD_K = 1.0          # extra cost fraction at zero lead
-LEAD_T_REF_H = 24.0   # reference lead horizon in hours
+LEAD_K = 10.0          # extra cost fraction at zero lead
+LEAD_T_REF_H = 6.0   # reference lead horizon in hours
 
 # === ACCEPTANCE NOTIFICATION DELAY ===
 # Constellations notify accept/reject uniform(MIN_H, MAX_H) hours before the pass.
 # MIN_H = minimum lead before pass → latest possible notification (closest to pass).
 # MAX_H = maximum lead before pass → earliest possible notification (furthest from pass).
 # Set ACCEPT_NOTIFY_MAX_H = 0.0 to restore synchronous (immediate) accept/reject.
-ACCEPT_NOTIFY_MIN_H = 1.0   # min hours before pass  →  latest notification  (e.g. 1h before)
-ACCEPT_NOTIFY_MAX_H = 6.0   # max hours before pass  →  earliest notification (e.g. 6h before)
+ACCEPT_NOTIFY_MIN_H = 0.50   # min hours before pass  →  latest notification  (e.g. 1h before)
+ACCEPT_NOTIFY_MAX_H = 1.0   # max hours before pass  →  earliest notification (e.g. 6h before)
 
 # === PROBABILITY CONFIGURATION ===
 # Acceptance probability range: constellation rejects a booking when its demand
 # is high, accepts when quiet.  DemandField maps demand → p_accept in [P_ACC_MIN, P_ACC_MAX].
-P_ACC_MIN = 0.65            # Minimum acceptance probability (high-demand / congested)
-P_ACC_MAX = 0.95           # Maximum acceptance probability (low-demand / quiet)
+P_ACC_MIN = 0.75            # Minimum acceptance probability (high-demand / congested)
+P_ACC_MAX = 0.95          # Maximum acceptance probability (low-demand / quiet)
 
 # Execution probability range: even an accepted pass may fail (cloud cover, sensor issue).
 # The function maps look-angle → p_exec in [P_EXEC_MIN, P_EXEC_MAX].
 # At nadir (best geometry) → P_EXEC_MAX; at worst geometry → P_EXEC_MIN.
-P_EXEC_MIN = 0.90           # Minimum execution probability (worst geometry)
-P_EXEC_MAX = 0.99           # Maximum execution probability (best geometry)
+P_EXEC_MIN = 0.50           # Minimum execution probability (worst geometry)
+P_EXEC_MAX = 0.80           # Maximum execution probability (best geometry)
 
-SCHEDULERS = ['stochastic_log', 'deterministic', 'random']
-#SCHEDULERS = ['stochastic_log','greedy']
+SCHEDULERS = ['stochastic_log', 'greedy','deterministic', 'random']
+#SCHEDULERS = ['greedy']
 
 # Set to True to cancel inferior pending passes once a better/sufficient one succeeds.
 # Only applies to stochastic_log (redundant scheduling). Saves execution cost at the
@@ -369,7 +381,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
     execution_cost_fn = make_execution_cost_fn(constellations)
     
     # ✅ CREATE VOLCANO WORKFLOW WITH DUAL BRANCHES AND PLUME RETARGETING
-    workflow = create_volcano_workflow(volcano_db_locations, min_time, max_time, lookahead_horizon_h=lookahead_horizon_h)
+    workflow = create_volcano_workflow(volcano_db_locations, min_time, max_time, lookahead_horizon_h=lookahead_horizon_h, hours_to_detect=HOURS_TO_DETECT, follow_up_interval_h=FOLLOW_UP_INTERVAL_H)
     
     broker = Broker(constellations=constellations, world=world,
                     name=f"Broker-{scheduler}")
@@ -444,6 +456,7 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
             submission_cost_rate=SUBMISSION_COST,
             execution_cost_fn=execution_cost_fn,
             verbose=True,
+            sim_end_time=world.time,
         )
         m['scheduler'] = scheduler
         m['seed'] = seed
@@ -456,6 +469,13 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
         m['quality_rank_distribution'] = _compute_quality_rank_distribution(
             broker._workflow_graph, broker, ObservationStatus
         )
+
+        # Save per-execution details separately (can be large; not needed for summary)
+        execution_details = m.pop('execution_details', [])
+        exec_file = os.path.join(results_dir, f"executions_seed{seed:04d}_{scheduler}.json")
+        with open(exec_file, 'w') as f:
+            json.dump(execution_details, f, indent=2, default=str)
+        print(f"  [Saved] {exec_file} ({len(execution_details)} execution records)")
 
         run_file = os.path.join(results_dir, f"run_seed{seed:04d}_{scheduler}.json")
         with open(run_file, 'w') as f:
@@ -614,8 +634,16 @@ def aggregate(results_dir, records=None):
         if sub.empty:
             continue
         print(f"\n{sched.upper()}  (n={len(sub)})")
+        n_reachable = sub['n_tasks_reachable'].mean() if 'n_tasks_reachable' in sub.columns else float('nan')
+        n_no_passes = sub['n_tasks_no_passes'].mean() if 'n_tasks_no_passes' in sub.columns else float('nan')
+        n_inactive_tl = sub['n_tasks_inactive_timeline'].mean() if 'n_tasks_inactive_timeline' in sub.columns else float('nan')
+        n_truncated = sub['n_tasks_sim_truncated'].mean() if 'n_tasks_sim_truncated' in sub.columns else float('nan')
+        n_parent = sub['n_tasks_parent_not_met'].mean() if 'n_tasks_parent_not_met' in sub.columns else float('nan')
+        _trunc_str = f", sim-truncated {n_truncated:.0f}" if n_truncated == n_truncated and n_truncated > 0 else ""
         print(f"  TASK completion rate : {sub['task_completion_rate'].mean():.3f} "
-              f"± {sub['task_completion_rate'].std():.3f}")
+              f"± {sub['task_completion_rate'].std():.3f}  "
+              f"(reachable {n_reachable:.0f} | no-passes {n_no_passes:.0f}, "
+              f"inactive-tl {n_inactive_tl:.0f}{_trunc_str}, parent-not-met {n_parent:.0f})")
         print(f"  GROUP completion rate: {sub['group_completion_rate'].mean():.3f} "
               f"± {sub['group_completion_rate'].std():.3f}")
         print(f"  Realized quality     : {sub['realized_quality'].mean():.1f}")
@@ -631,6 +659,16 @@ def aggregate(results_dir, records=None):
         print(f"  Rejection rate (diag): {100 * sub['rejection_rate'].mean():.1f}%")
         n_replans = sub['replans'].mean() if 'replans' in sub.columns else float('nan')
         print(f"  Replans / cancels    : {n_replans:.1f} replans, {n_cancelled:.1f} cancellations")
+
+        # Planning session diagnostics
+        n_sessions = sub['n_planning_sessions'].mean() if 'n_planning_sessions' in sub.columns else float('nan')
+        avg_solve = sub['avg_solve_time_s'].mean() if 'avg_solve_time_s' in sub.columns else float('nan')
+        avg_wall = sub['avg_wall_time_s'].mean() if 'avg_wall_time_s' in sub.columns else float('nan')
+        avg_gap = sub['avg_mip_gap_pct'].mean() if 'avg_mip_gap_pct' in sub.columns else float('nan')
+        _gap_str = f", avg MIP gap {avg_gap:.1f}%" if avg_gap == avg_gap else ""
+        _solve_str = f", avg solve {avg_solve:.1f}s" if avg_solve == avg_solve else ""
+        _wall_str = f", avg wall {avg_wall:.1f}s" if avg_wall == avg_wall else ""
+        print(f"  Planning sessions    : {n_sessions:.1f}{_solve_str}{_wall_str}{_gap_str}")
 
         # Quality-rank distribution (mean counts across runs)
         if 'quality_rank_distribution' in sub.columns:
@@ -656,7 +694,11 @@ def aggregate(results_dir, records=None):
         'utility', 'total_cost', 'n_submissions', 'n_accepted', 'n_executed',
         'n_execution_failed', 'n_cancelled', 'n_rejected', 'replans',
         'submitted_passes_per_task', 'exec_passes_per_completed',
-        'rejection_rate'] if c in df.columns]
+        'rejection_rate',
+        'n_tasks_reachable', 'n_tasks_no_passes', 'n_tasks_inactive_timeline',
+        'n_tasks_sim_truncated', 'n_tasks_parent_not_met',
+        'n_planning_sessions', 'avg_solve_time_s', 'avg_wall_time_s', 'avg_mip_gap_pct',
+    ] if c in df.columns]
     summary_df = df.groupby('scheduler')[summary_cols].mean().reset_index()
     summary_csv = os.path.join(results_dir, "summary_v2.csv")
     summary_df.to_csv(summary_csv, index=False)
