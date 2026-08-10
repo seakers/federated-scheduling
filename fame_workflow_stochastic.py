@@ -662,45 +662,138 @@ def _solve_with_gurobi(
                     f"constrs={model.NumConstrs} genconstrs={model.NumGenConstrs} "
                     f"(logs={sum(1 for gc in model.getGenConstrs() if gc.GenConstrType == GRB.GENCONSTR_LOG)})")
 
-            # Greedy MIP start: best-quality non-overlapping pass per request.
-            # Pure implementation lever -- gives Gurobi a strong incumbent at
-            # t=0 so the whole budget goes to closing the bound. Gurobi repairs
-            # or discards the start if constraints make it infeasible; no risk.
-            try:
+           # === MIP STARTS ===
+            # Two starts are supplied. Gurobi tries each and keeps whichever
+            # produces an incumbent.
+            #
+            #   Start 0: temporal-aware greedy -- best-quality non-overlapping
+            #            pass per task, walked in DAG order so a child is only
+            #            placed against an already-placed parent.
+            #   Start 1: mandatory-only fallback -- one pass per mandatory task,
+            #            zero elsewhere. Trivially satisfies the recurrence
+            #            (unbooked tasks collapse to y=1, S=0) and is the safety
+            #            net when the greedy start is rejected.
+            #
+            # The previous single greedy start ignored the pairwise TEMPORAL
+            # exclusions and ordered tasks by quality rather than topologically,
+            # so it violated a constraint on essentially every solve ("User MIP
+            # start violates constraint R#### by 1.0"). Gurobi attempts repair
+            # but was not succeeding, leaving hard solves with NO incumbent --
+            # which is how a 120s run ends with a negative best objective, or
+            # none at all.
+            from fame_workflow import ConstraintClass, TemporalConstraintType
+
+            def _temporal_ok(_child, _t_child, _placed_times):
+                """True if t_child satisfies every TEMPORAL relation to placed parents."""
+                if workflow_graph is None or _child not in workflow_graph:
+                    return True
+                for _parent in workflow_graph.predecessors(_child):
+                    _t_parent = _placed_times.get(_parent)
+                    if _t_parent is None:
+                        continue    # parent unplaced -> relation is vacuous here
+                    _edges = workflow_graph.get_edge_data(_parent, _child) or {}
+                    for _k, _c in _edges.items():
+                        if _c.get('constraint_class') != ConstraintClass.TEMPORAL:
+                            continue
+                        _off = (_c.get('parameters') or {}).get('offset', dt.timedelta(0))
+                        _ct = _c.get('constraint_type')
+                        if _ct == TemporalConstraintType.START_AFTER and _t_parent > _t_child:
+                            return False
+                        if _ct == TemporalConstraintType.START_AFTER_OFFSET and _t_parent + _off > _t_child:
+                            return False
+                        if _ct == TemporalConstraintType.START_BEFORE and _t_parent < _t_child:
+                            return False
+                        if _ct == TemporalConstraintType.START_BEFORE_OFFSET and _t_parent + _off < _t_child:
+                            return False
+                return True
+
+            def _free_on_sat(_busy, _sat, _s0, _e0):
+                return all(_e0 <= s or _s0 >= e for (s, e) in _busy.get(_sat, []))
+
+            def _build_start(mandatory_only: bool):
+                """Return ({(req,sat,sp): 0/1}, ok) for one start vector."""
                 _busy = {}
-                _greedy_x = {}  # (req, sat, sp) -> 0.0 or 1.0 for warm-start propagation
-                for _req in sorted(
-                        solution_holder.keys(),
-                        key=lambda r: -(max((solution_holder[r][s][p]['quality']
-                                             for s in solution_holder[r] for p in solution_holder[r][s]),
-                                            default=0.0))):
+                _placed_times = {}
+                _x_vals = {}
+                _ok = True
+
+                # DAG order so parents are placed before their children.
+                try:
+                    _order = [r for r in nx.topological_sort(workflow_graph)
+                              if r in solution_holder]
+                    _order += [r for r in solution_holder if r not in set(_order)]
+                except Exception:
+                    _order = list(solution_holder.keys())
+
+                for _req in _order:
+                    _passes = task_to_passes.get(_req, [])
+                    for _sat, _sp in _passes:
+                        _x_vals[(_req, _sat, _sp)] = 0.0
+                    if mandatory_only and not getattr(_req, 'is_mandatory', False):
+                        continue
+
+                    # Best-quality compatible pass, respecting satellite
+                    # occupancy and the temporal relations to placed parents.
+                    _cands = sorted(
+                        _passes,
+                        key=lambda sp_: -solution_holder[_req][sp_[0]][sp_[1]]['quality'])
                     _placed = False
-                    for _sat, _sp in task_to_passes.get(_req, []):
-                        _x = solution_holder[_req][_sat][_sp]['x']
+                    for _sat, _sp in _cands:
                         _s0 = _sp.highest.time
-                        _e0 = _sp.highest.time + _sp.highest.duration
-                        if (not _placed) and all(_e0 <= s or _s0 >= e for (s, e) in _busy.get(_sat, [])):
-                            _x.Start = 1.0
-                            _greedy_x[(_req, _sat, _sp)] = 1.0
-                            _busy.setdefault(_sat, []).append((_s0, _e0))
-                            _placed = True
-                        else:
-                            _x.Start = 0.0
-                            _greedy_x[(_req, _sat, _sp)] = 0.0
-                # For general_logical_dag, propagate binary assignment through the
-                # continuous variable chain so the MIP start is feasible.
-                if _general_logical_warm_start_fn is not None:
-                    _general_logical_warm_start_fn(_greedy_x)
+                        _e0 = _s0 + _sp.highest.duration
+                        if not _free_on_sat(_busy, _sat, _s0, _e0):
+                            continue
+                        if not _temporal_ok(_req, _s0, _placed_times):
+                            continue
+                        _x_vals[(_req, _sat, _sp)] = 1.0
+                        _busy.setdefault(_sat, []).append((_s0, _e0))
+                        _placed_times[_req] = _s0
+                        _placed = True
+                        break
+
+                    if (not _placed) and getattr(_req, 'is_mandatory', False) and _passes:
+                        # A mandatory task with no compatible pass makes this
+                        # start infeasible; report rather than submit garbage.
+                        _ok = False
+                return _x_vals, _ok
+
+            try:
+                _starts = []
+                _greedy_x, _greedy_ok = _build_start(mandatory_only=False)
+                if _greedy_ok:
+                    _starts.append(("greedy", _greedy_x))
+                _fallback_x, _fallback_ok = _build_start(mandatory_only=True)
+                if _fallback_ok:
+                    _starts.append(("mandatory-only", _fallback_x))
+
+                if _starts:
+                    model.NumStart = len(_starts)
+                    for _i, (_label, _xv) in enumerate(_starts):
+                        model.params.StartNumber = _i
+                        for (_req, _sat, _sp), _v in _xv.items():
+                            solution_holder[_req][_sat][_sp]['x'].Start = _v
+                        # Propagate the binary assignment through the continuous
+                        # chain so the start is complete, not just the binaries.
+                        if _general_logical_warm_start_fn is not None:
+                            _general_logical_warm_start_fn(_xv)
+                    model.params.StartNumber = -1   # back to "all starts"
+                    if verbose > 0:
+                        print(f"[Stochastic Scheduler] MIP starts: "
+                              f"{', '.join(l for l, _ in _starts)}")
+                elif verbose > 0:
+                    print("[Stochastic Scheduler] No feasible MIP start could be built "
+                          "(a mandatory task has no temporally compatible pass)")
             except Exception as _e:
                 if verbose > 0:
                     print(f"[Stochastic Scheduler] MIP start skipped: {_e}")
-
             # Skip optimization if there are no variables (nothing to schedule)
             if model.NumVars == 0:
                 if verbose > 0:
                     print("[Stochastic Scheduler] No pending tasks to schedule. Skipping optimization.")
                 # Mark model as optimal with 0 objective for consistency
                 workflow_graph.graph['objective_value'] = 0.0
+                workflow_graph.graph['solve_time_s'] = 0.0
+                workflow_graph.graph['mip_gap'] = 0.0
             else:
                 model.optimize()
                 # Store solver diagnostics for planning-session metrics
@@ -744,6 +837,33 @@ def _solve_with_gurobi(
                     else:
                         if verbose > 0:
                             print(f"[Stochastic Scheduler] Time limit reached with no feasible solution found")
+                        if verbose > 1:
+                            print("[Stochastic Scheduler] Probing feasibility (bounded)...")
+                            model.setParam('TimeLimit', 10)
+                            model.setParam('SolutionLimit', 1)
+                            model.optimize()
+                            if model.Status == GRB.INFEASIBLE:
+                                print("[Stochastic Scheduler] INFEASIBLE. Computing IIS...")
+                                model.setParam('IISMethod', 1)   # heuristic, much faster
+                                try:
+                                    model.computeIIS()
+                                    _ilp = os.path.join(results_dir, "infeasible_model.ilp") if results_dir else "infeasible_model.ilp"
+                                    model.write(_ilp)
+                                    print(f"[Stochastic Scheduler] IIS written to {_ilp}")
+                                    for c in model.getConstrs():
+                                        if c.IISConstr:
+                                            print(f"  IIS constr: {c.ConstrName}")
+                                    for v in model.getVars():
+                                        if v.IISLB or v.IISUB:
+                                            print(f"  IIS bound: {v.VarName} [{v.LB}, {v.UB}]")
+                                except Exception as _e:
+                                    print(f"[Stochastic Scheduler] IIS failed: {_e}")
+                            elif model.SolCount > 0:
+                                print("[Stochastic Scheduler] Feasible after all -- 70s was just "
+                                      "too short to find an incumbent.")
+                            else:
+                                print(f"[Stochastic Scheduler] Still undetermined (status {model.Status}) "
+                                      f"after the probe. Use the LP-relaxation test instead.")
                 elif model.Status == GRB.INFEASIBLE:
                     if verbose > 0:
                         print(f"[Stochastic Scheduler] Model is infeasible (no valid schedule found)")
@@ -1054,6 +1174,8 @@ def _solve_with_scip(
         if verbose > 0:
             print("[SCIP Stochastic] No pending tasks to schedule. Skipping optimization.")
         workflow_graph.graph['objective_value'] = 0.0
+        workflow_graph.graph['solve_time_s'] = 0.0
+        workflow_graph.graph['mip_gap'] = 0.0
     else:
         # === INJECT WARM-START BASELINE ===
         all_binary_vars = []
@@ -1929,7 +2051,7 @@ def _build_general_logical_formulation(
     import math
 
     ln_eps = math.log(epsilon)
-    LN_FLOOR = -1000.0
+    LN_FLOOR = -20.0
 
     observation_tasks = list(solution_holder.keys())
     ordered_nodes, dsop_of, is_logic = build_logical_dag(observation_tasks, workflow_graph)
@@ -2299,8 +2421,6 @@ def _build_general_logical_formulation(
                 _ws_ln_F[node].Start = _math.log(1.0 - _s_prot_v)
 
     return _warm_start_fn
-
-
 def _build_log_linearized_formulation(
         model: gp.Model,
         workflow_graph: nx.MultiDiGraph,
@@ -2316,78 +2436,65 @@ def _build_log_linearized_formulation(
         default_max_instances: int = 3,
         reward_envelope_cuts: bool = True,
         execution_cost_fn=None,
-        current_time=None
+        current_time=None,
+        detection_probability_function=None
 ):
     """
     Log-linearized stochastic formulation (paper Sections 5.2-5.6), built in a
     single topological sweep over the DAG.
 
-    Key properties (each fixing a previously observed failure mode):
+    ===========================================================================
+    p_det ENTRY BOUNDARY  (new; None => 1.0 => exactly the previous behaviour)
+    ===========================================================================
+    A per-task detection probability pi_r (target present / inside the footprint)
+    now enters at the START of the horizontal timeline:
+
+        Y_{r,0} = pi_r * A_parents_r                      (was: A_parents_r)
+        e2e_r   = Y_{r,0} - Y_{r,K_r}                      (was: A_parents_r - Y_K)
+        S_r     = pi_r * (1 - y_{r,K_r})                   (implicit, via e2e)
+
+    WHY THE ENTRY BOUNDARY AND NOT theta.  pi_r is SHARED across a task's
+    redundant passes: they all aim at the same point, so if the target is not
+    there they ALL miss -- perfectly correlated.  Folding pi_r into theta_k
+    would make the recurrence treat them as independent detection draws and
+    systematically over-credit redundancy.  Acceptance and execution ARE
+    independent per pass and stay in theta_k.
+
+    The identity chain is unchanged:
+        Y_{r,K} = pi_r * A_parents_r * prod_k (1 - theta_k x_k)
+              => e2e_r = pi_r * A_parents_r * (1 - y_{r,K}) = A_parents_r * S_r
+    so A_prot / ln_A / ln_S and the log-space join all carry through verbatim.
+
+    BEST-OF-N IS PRESERVED.  Passes are sorted by quality DESCENDING, so the
+    diminishing recurrence credits the FIRST success in quality order, i.e. the
+    HIGHEST-QUALITY success -- not the first in time.  Verified by enumeration
+    against E[Q of best success] for pi_r = 1 and pi_r < 1.
+
+    All best-case constants, variable bounds and valid cuts are scaled by pi_r
+    so the relaxation stays as tight as before.
+
+    ---------------------------------------------------------------------------
+    Existing properties (each fixing a previously observed failure mode):
 
     1. PROPORTIONAL log-protection floor:
            A_prot = A_e2e * (1 - eps) + eps * A_parents
-       (instead of the static "+ eps"). Consequence: A_prot <= A_parents holds
-       structurally, so ln_S = ln(A_prot) - ln(A_parents) <= 0 is ALWAYS
-       satisfiable and ln_S >= ln(eps) exactly. The static floor could force
-       ln_S > 0 for deep tasks with weak ancestors, which collided with the
-       ln_S <= 0 bound and created massive infeasibility pressure / branching
-       churn ("adaptive floor trap"). The proportional floor removes the trap
-       at its root.
+       so A_prot <= A_parents holds structurally and ln_S = ln(A_prot) -
+       ln(A_parents) <= 0 is ALWAYS satisfiable ("adaptive floor trap" fix).
 
-    2. DEPTH-AWARE log-variable bounds. Because ln_S in [ln(eps), 0] exactly
-       (see 1), the valid bounds are:
-           ln_A_parents >= n_anc * ln(eps)
-           ln_A         >= (n_anc + 1) * ln(eps)
-       A static bound of -12 silently acted as a hidden constraint forcing
-       ancestral chains to stay healthy (second door into the floor trap).
-       Bounds are capped at LN_FLOOR for numerical sanity; the cap only binds
-       for chains of many near-dead ancestors, which are objective-irrelevant.
+    2. DEPTH-AWARE log-variable bounds (ln_S in [ln eps, 0] exactly).
 
-    3. SINGLE-PARENT SHORTCUT: for a node r whose unique in-model ancestors
-       equal {q} + ancestors(q) for a single direct parent q (chain structure),
-       the entry boundary is set linearly:
-           ln_A_parents[r] == ln_A[q],   A_parents[r] == A_prot[q]
-       This is exact (Sum of ancestor ln_S telescopes to ln_A[q]) and removes
-       one exp() general constraint per chain node -- the dominant source of
-       MINLP work in chain-heavy workflows.
+    3. SINGLE-PARENT SHORTCUT: chain nodes get a linear entry boundary,
+       removing one exp() per chain node.
 
-    4. REAL-SPACE VALID CUTS: A_parents[r] <= A_prot[a] for every in-model
-       ancestor a (event inclusion: r's ancestral-success event is a subset of
-       a's protected end-to-end event). These bound the exp() relaxation in
-       probability space directly, bypassing the log machinery exactly where
-       its relaxation is loosest, recovering speed after switching to exact
-       nonlinear handling (FuncNonlinear=1).
+    4. REAL-SPACE VALID CUTS: A_parents[r] <= A_prot[a] for every ancestor a.
 
-    5. DATA-DRIVEN BOUND PROPAGATION (dual-bound tightening). The incumbent
-       is typically found quickly; what is expensive is proving optimality,
-       because the LP/OA relaxation of the exp()/log() equalities is one-sided
-       (the relaxed A_parents can float up to the chord of exp between its
-       variable bounds) and that overestimation COMPOUNDS multiplicatively
-       down the DAG, inflating the root dual bound. We therefore precompute,
-       in one topological pass over constants, the best-case protected
-       probabilities with ALL passes scheduled:
-           lmax(r)      = 1 - prod_k (1 - p_{r,k})              (union of all passes)
-           S_ub(r)      = lmax(r)*(1-eps) + eps
-           A_par_ub(r)  = prod_{a in anc(r)} S_ub(a)
-           e2e_ub(r)    = A_par_ub(r) * lmax(r)
-           A_prot_ub(r) = A_par_ub(r) * S_ub(r)
-       and install them as VARIABLE BOUNDS (plus matching log-space bounds).
-       Scheduling more passes only increases success probabilities, so these
-       are valid regardless of conflicts/max-instances; they cut the chord gap
-       of every exp/log relaxation at the root, before any branching.
+    5. DATA-DRIVEN BOUND PROPAGATION (cardinality-aware best-case constants).
 
-    6. UNION-BOUND CUTS: e2e[r] <= A_par_ub(r) * sum_k p_k x_k, valid since
-       1 - prod(1 - p x) <= sum p x. Ties the reward a task can claim in the
-       relaxation to the probability mass actually scheduled, so fractional
-       solutions cannot harvest reward without paying for bookings.
+    6. UNION-BOUND CUTS tying claimable reward to scheduled probability mass.
 
-    7. BINARY BRANCH PRIORITY: x variables get BranchPriority 10 so Gurobi
-       branches the schedule decisions before spatially branching the
-       continuous exp/log operands -- once x is integral the McCormick track
-       is exact and interval tightening closes the rest fast.
+    7. BINARY BRANCH PRIORITY on x.
 
-    NOTE: pwl_tolerance is unused here (kept for API compatibility); the
-    Gurobi path relies on FuncNonlinear=1 for exact exp/log handling.
+    NOTE: pwl_tolerance is unused here (kept for API compatibility).
     """
     import math
 
@@ -2401,28 +2508,36 @@ def _build_log_linearized_formulation(
     ln_S_vars = {}
 
     ln_eps = math.log(epsilon)
-    LN_FLOOR = -1000.0  # absolute cap on log-space lower bounds (exp(-50) ~ 2e-22)
+    LN_FLOOR = -20  # absolute cap on log-space lower bounds
 
-    # Topological order restricted to tasks actually in the model; guarantees
-    # every ancestor's variables exist before its descendants reference them.
     topo = [r for r in nx.topological_sort(workflow_graph) if r in solution_holder]
 
-    # Unique-ancestor closure sets (transitive closure trick: summing local
-    # ln_S over the UNIQUE ancestor set gives the exact joint ancestral
-    # probability under independence on general DAGs -- shared ancestors of
-    # diamond patterns are counted exactly once).
     anc_sets = {
         r: frozenset(a for a in nx.ancestors(workflow_graph, r) if a in solution_holder)
         for r in topo
     }
 
-    # --- Constant bound propagation, CARDINALITY-AWARE -------------------------
-    # The instances cap (max_num_instances) is a hard constraint, so no integer
-    # solution can ever schedule more than M_r passes. All best-case constants
-    # are therefore computed over the TOP-M_r probabilities only:
-    #     lmax_M(r) = 1 - prod_{k in top-M_r}(1 - p_k)
-    # Computing them over ALL passes (previous version) degenerates to ~1.0 as
-    # soon as a request has many candidate passes, making every bound trivial.
+    # --- p_det per task -------------------------------------------------------
+    # A CONSTANT per task, evaluated once. None => 1.0, which reduces every
+    # expression below to the pre-p_det formulation exactly (volcano parity).
+    def _p_det_for(node):
+        if detection_probability_function is None:
+            return 1.0
+        try:
+            if task_to_passes.get(node):
+                _sat0, _sp0 = task_to_passes[node][0]
+                v = float(detection_probability_function(node, _sat0, _sp0))
+            else:
+                v = float(detection_probability_function(node, None, None))
+        except Exception:
+            return 1.0
+        if v != v:          # NaN guard
+            return 1.0
+        return min(1.0, max(0.0, v))
+
+    p_det = {r: _p_det_for(r) for r in topo}
+
+    # --- Constant bound propagation, CARDINALITY- AND p_det-AWARE -------------
     lmax_ub, S_ub, A_par_ub, e2e_ub, A_prot_ub, M_of = {}, {}, {}, {}, {}, {}
     for r in topo:
         M = _effective_max_instances(r, default_max_instances)
@@ -2432,24 +2547,18 @@ def _build_log_linearized_formulation(
             reverse=True)[:M_of[r]]
         lmax = 1.0 - math.prod(1.0 - t for t in thetas) if thetas else 0.0
         lmax_ub[r] = min(1.0, lmax)
-        S_ub[r] = lmax_ub[r] * (1.0 - epsilon) + epsilon
+        # S_r <= pi_r * lmax_M(r); protected the same proportional way.
+        S_ub[r] = p_det[r] * lmax_ub[r] * (1.0 - epsilon) + epsilon
         A_par_ub[r] = math.prod(S_ub[a] for a in anc_sets[r]) if anc_sets[r] else 1.0
-        e2e_ub[r] = A_par_ub[r] * lmax_ub[r]
-        A_prot_ub[r] = A_par_ub[r] * S_ub[r]  # == e2e_ub*(1-eps) + eps*A_par_ub
+        e2e_ub[r] = A_par_ub[r] * p_det[r] * lmax_ub[r]
+        A_prot_ub[r] = A_par_ub[r] * S_ub[r]   # == e2e_ub*(1-eps) + eps*A_par_ub
     if not tighten_bounds:
         for r in topo:
-            A_par_ub[r], e2e_ub[r], A_prot_ub[r], S_ub[r] = 1.0, 1.0, 1.0, 1.0
+            A_par_ub[r], A_prot_ub[r], S_ub[r] = 1.0, 1.0, 1.0
             lmax_ub[r] = 1.0
+            e2e_ub[r] = p_det[r]
 
-    # --- Node classification + nonlinearity pruning ----------------------------
-    # Classify every node once: ROOT (no in-model ancestors), CHAIN (single
-    # in-model parent whose closure telescopes), MERGE (general log-space join,
-    # needs an exp() constraint). Then compute which tasks actually need their
-    # log() constraint: ln_S(r) is consumed ONLY inside merge-node joins, so
-    # log machinery is required exactly on the union of merge-node ancestor
-    # closures. Everything else propagates through the purely LINEAR real-space
-    # identities (A_parents[child] == A_prot[parent]). Consequence: a window
-    # with no live merge nodes builds a PURE MILP -- zero nonlinear constraints.
+    # --- Node classification + nonlinearity pruning ---------------------------
     node_kind = {}
     for r in topo:
         dps = [p for p in workflow_graph.predecessors(r) if p in solution_holder]
@@ -2463,6 +2572,7 @@ def _build_log_linearized_formulation(
     need_lnS = set()
     for m in merge_nodes:
         need_lnS |= anc_sets[m]
+
     if verbose > 0:
         import collections
         M_hist = dict(collections.Counter(M_of[r] for r in topo))
@@ -2470,34 +2580,35 @@ def _build_log_linearized_formulation(
         print(f"[Log-Linearized] {len(merge_nodes)} merge nodes; log constraints "
               f"pruned to {len(need_lnS)} of {len(topo)} tasks "
               f"({'PURE MILP' if not merge_nodes else 'MINLP on merge closures only'}).")
+        _pds = [p_det[r] for r in topo]
+        if _pds and min(_pds) < 1.0:
+            print(f"[Log-Linearized] p_det ACTIVE: min={min(_pds):.3f} "
+                  f"mean={sum(_pds)/len(_pds):.3f} max={max(_pds):.3f} "
+                  f"({sum(1 for v in _pds if v < 1.0)}/{len(_pds)} tasks < 1.0)")
+        else:
+            print("[Log-Linearized] p_det inactive (all 1.0) -- reduces to the base formulation.")
         if lmaxs:
             print(f"[Log-Linearized] ENGAGEMENT CHECK -- instance caps M (histogram): {M_hist}; "
                   f"lmax_M: min={min(lmaxs):.3f} mean={sum(lmaxs)/len(lmaxs):.3f} max={max(lmaxs):.3f}; "
                   f"tighten_bounds={tighten_bounds}. "
                   f"(If M is mostly 1, hedging is OFF; if lmax_M ~1.0, drain cuts are weak.)")
         else:
-            print(f"[Log-Linearized] ENGAGEMENT CHECK -- no task in this window has any "
-                  f"feasible pass (M histogram: {M_hist}); nothing to schedule or hedge.")
-
-    if verbose > 0:
-        n_chain = sum(
-            1 for r in topo
-            if len([p for p in workflow_graph.predecessors(r) if p in solution_holder]) == 1
-        )
-        print(f"[Log-Linearized] Building exact formulation for {len(topo)} tasks "
-              f"({n_chain} single-parent candidates for the linear shortcut).")
+            print("[Log-Linearized] ENGAGEMENT CHECK -- no task in this window has any "
+                  "feasible pass; nothing to schedule or hedge.")
 
     for constrained_request in topo:
-        req_name = getattr(getattr(constrained_request, 'observation_request', constrained_request), 'name', str(id(constrained_request)))
+        req_name = getattr(getattr(constrained_request, 'observation_request',
+                                   constrained_request), 'name', str(id(constrained_request)))
         n_anc = len(anc_sets[constrained_request])
+        pi_r = p_det[constrained_request]
 
-        # --- Depth-aware bounds -------------------------------------------------
         lb_ln_parents = max(n_anc * ln_eps, LN_FLOOR) if n_anc > 0 else 0.0
         lb_ln_A = max((n_anc + 1) * ln_eps, LN_FLOOR)
 
         r_ub = constrained_request
         kind = node_kind[constrained_request]
         needs_log = constrained_request in need_lnS
+
         ancestor_success_prob[constrained_request] = model.addVar(
             lb=math.exp(lb_ln_parents) if n_anc > 0 else 1.0, ub=A_par_ub[r_ub],
             vtype=GRB.CONTINUOUS, name=f"A_parents_{req_name}")
@@ -2507,7 +2618,6 @@ def _build_log_linearized_formulation(
             ln_A_vars[constrained_request] = model.addVar(
                 lb=lb_ln_A, ub=math.log(A_prot_ub[r_ub]) if A_prot_ub[r_ub] < 1.0 else 0.0,
                 vtype=GRB.CONTINUOUS, name=f"ln_A_{req_name}")
-            # Exact range under the proportional floor: ln_S in [ln(eps), ln(S_ub)].
             ln_S_vars[constrained_request] = model.addVar(
                 lb=ln_eps, ub=math.log(S_ub[r_ub]) if S_ub[r_ub] < 1.0 else 0.0,
                 vtype=GRB.CONTINUOUS, name=f"ln_S_{req_name}")
@@ -2516,7 +2626,7 @@ def _build_log_linearized_formulation(
                 lb=lb_ln_parents, ub=math.log(A_par_ub[r_ub]) if A_par_ub[r_ub] < 1.0 else 0.0,
                 vtype=GRB.CONTINUOUS, name=f"ln_A_parents_{req_name}")
 
-        # --- Vertical entry boundary (paper Sec 5.3) ---------------------------
+        # --- Vertical entry boundary (paper Sec 5.3) --------------------------
         direct_parents = [p for p in workflow_graph.predecessors(constrained_request)
                           if p in solution_holder]
 
@@ -2527,16 +2637,13 @@ def _build_log_linearized_formulation(
                 model.addConstr(ln_A_parents_vars[constrained_request] == 0.0,
                                 name=f"root_lnAp_{req_name}")
         elif kind == 'chain':
-            # Single-parent shortcut: entry boundary is linear in parent's vars.
             q = direct_parents[0]
             model.addConstr(ancestor_success_prob[constrained_request] == A_prot_vars[q],
                             name=f"chain_Ap_{req_name}")
             if needs_log:
-                # parent q is in anc(merge) whenever r is, so ln_A_vars[q] exists
                 model.addConstr(ln_A_parents_vars[constrained_request] == ln_A_vars[q],
                                 name=f"chain_lnAp_{req_name}")
         else:
-            # General merge node: exact log-space join over the unique closure set.
             model.addConstr(
                 ln_A_parents_vars[constrained_request]
                 == gp.quicksum(ln_S_vars[anc] for anc in anc_sets[constrained_request]),
@@ -2544,25 +2651,31 @@ def _build_log_linearized_formulation(
             model.addGenConstrExp(ln_A_parents_vars[constrained_request],
                                   ancestor_success_prob[constrained_request],
                                   name=f"exp_Ap_{req_name}")
-            # Real-space valid cuts tightening the exp() relaxation:
-            # A_parents[r] <= A_prot[a] for every in-model ancestor a.
             for anc in anc_sets[constrained_request]:
                 model.addConstr(
                     ancestor_success_prob[constrained_request] <= A_prot_vars[anc],
-                    name=f"cut_Ap_le_Aprot_{req_name}_{getattr(getattr(anc, 'observation_request', anc), 'name', id(anc))}")
+                    name=f"cut_Ap_le_Aprot_{req_name}_"
+                         f"{getattr(getattr(anc, 'observation_request', anc), 'name', id(anc))}")
 
-        # --- Horizontal scaled timeline (paper Sec 5.2) ------------------------
+        # --- Horizontal scaled timeline (paper Sec 5.2) -----------------------
         passes = task_to_passes[constrained_request]
         K_r = len(passes)
 
+        # Y is scaled by pi_r, so its upper bound is too.
+        _Y_ub = p_det[constrained_request] * A_par_ub[constrained_request]
         for k in range(K_r + 1):
             scaled_remaining_risk[(constrained_request, k)] = model.addVar(
-                lb=0.0, ub=A_par_ub[constrained_request], vtype=GRB.CONTINUOUS,
-                name=f"Y_{req_name}_k{k}")
+                lb=0.0, ub=_Y_ub, vtype=GRB.CONTINUOUS, name=f"Y_{req_name}_k{k}")
 
-        # Injection identity: timeline starts at the parents' joint success.
+        # *** p_det ENTRY BOUNDARY ***
+        # The timeline starts at (parents' joint success) x (target detectable).
+        # pi_r is shared across this task's redundant passes -- they all aim at
+        # the same point, so their detection outcomes are perfectly correlated.
+        # Putting pi_r here rather than in theta_k is what stops the recurrence
+        # from treating them as independent detection draws.
         model.addConstr(
-            scaled_remaining_risk[(constrained_request, 0)] == ancestor_success_prob[constrained_request],
+            scaled_remaining_risk[(constrained_request, 0)]
+            == pi_r * ancestor_success_prob[constrained_request],
             name=f"inject_{req_name}")
 
         for k, (satellite, satpass) in enumerate(passes):
@@ -2570,12 +2683,11 @@ def _build_log_linearized_formulation(
             theta_k = solution_holder[constrained_request][satellite][satpass]['theta']
             Y_current = scaled_remaining_risk[(constrained_request, k)]
 
-            w_abs = model.addVar(lb=0.0, ub=A_par_ub[constrained_request],
+            w_abs = model.addVar(lb=0.0, ub=_Y_ub,
                                  vtype=GRB.CONTINUOUS, name=f"w_abs_{req_name}_k{k}")
             effective_pass_realization[(constrained_request, satellite, satpass)] = w_abs
-            x_var.BranchPriority = 10  # branch schedule decisions before spatial branching
+            x_var.BranchPriority = 10
 
-            # Exact McCormick linearization of the binary-continuous product.
             model.addConstr(w_abs <= x_var, name=f"mc1_{req_name}_k{k}")
             model.addConstr(w_abs <= Y_current, name=f"mc2_{req_name}_k{k}")
             model.addConstr(w_abs >= Y_current - (1.0 - x_var), name=f"mc3_{req_name}_k{k}")
@@ -2584,57 +2696,42 @@ def _build_log_linearized_formulation(
                 scaled_remaining_risk[(constrained_request, k + 1)] == Y_current - theta_k * w_abs,
                 name=f"rec_{req_name}_k{k}")
 
-        # End-of-horizon fulfillment (paper Eq. 29).
+        # End-of-horizon fulfillment (paper Eq. 29), now measured from Y_0 so it
+        # is A_parents * S_r with S_r = pi_r * (1 - y_K).  With pi_r = 1 this is
+        # identical to the previous "A_parents - Y_K".
         model.addConstr(
             end_to_end_success[constrained_request]
-            == ancestor_success_prob[constrained_request] - scaled_remaining_risk[(constrained_request, K_r)],
+            == scaled_remaining_risk[(constrained_request, 0)]
+               - scaled_remaining_risk[(constrained_request, K_r)],
             name=f"e2e_{req_name}")
 
-        # Union-bound cut (docstring item 6): reward-carrying probability mass
-        # is capped by the scheduled probability mass, scaled by the best-case
-        # ancestral survival. Valid since 1 - prod(1-p*x) <= sum(p*x).
+        # Union-bound cut, scaled by pi_r.
         if K_r > 0:
             model.addConstr(
                 end_to_end_success[constrained_request]
-                <= A_par_ub[constrained_request] * gp.quicksum(
+                <= pi_r * A_par_ub[constrained_request] * gp.quicksum(
                     solution_holder[constrained_request][sat][sp]['theta']
                     * solution_holder[constrained_request][sat][sp]['x']
                     for (sat, sp) in passes),
                 name=f"cut_union_{req_name}")
 
-        # DRAIN CUT (the decisive one). In the LP relaxation, fractional x lets
-        # the McCormick track fully drain Y (claim near-certain local success)
-        # while "paying" only max_instances worth of booking mass -- this, not
-        # the exp/log chords, is what inflates the root bound by hundreds of
-        # percent when requests have many candidate passes. No INTEGER solution
-        # can exceed the top-M union probability, so:
-        #     e2e[r] <= lmax_M(r) * A_parents[r]
-        # is valid, linear, and caps the relaxation at the true per-task ceiling.
-        if tighten_bounds and K_r > 0 and lmax_ub[constrained_request] < 1.0:
+        # DRAIN CUT: no integer solution can exceed pi_r * (top-M union prob).
+        if tighten_bounds and K_r > 0 and (pi_r * lmax_ub[constrained_request]) < 1.0:
             model.addConstr(
                 end_to_end_success[constrained_request]
-                <= lmax_ub[constrained_request] * ancestor_success_prob[constrained_request],
+                <= pi_r * lmax_ub[constrained_request]
+                   * ancestor_success_prob[constrained_request],
                 name=f"cut_drain_{req_name}")
 
-        # REWARD ENVELOPE CUTS (cardinality-priced reward). The LP relaxation
-        # can otherwise earn near-union success probability while paying only
-        # a fraction of the integer booking count (McCormick complementarity
-        # binds only at integral x), so per-booking costs barely discount the
-        # bound. The per-task reward with n integer bookings is bounded by the
-        # CONCAVE curve R_ub(n) = A_par_ub * Q_max * lmax(n), where
-        # lmax(n) = 1 - prod over top-n p of (1-p). We add its tangents at
-        # n = 0..M-1: valid for every integer point by concavity, and they
-        # force the relaxation to pay one full booking of cost per top-marginal
-        # unit of reward. This encodes the diminishing-returns structure --
-        # invisible to the plain relaxation -- as linear inequalities, with no
-        # change to the feasible integer set or the objective.
+        # REWARD / SURVIVAL / QUALITY-PROBABILITY ENVELOPE CUTS, all scaled by pi_r.
         if reward_envelope_cuts and tighten_bounds and K_r > 0:
             _thetas_desc = sorted(
                 (solution_holder[constrained_request][sat][sp]['theta'] for (sat, sp) in passes),
                 reverse=True)
             _Qmax = max(solution_holder[constrained_request][sat][sp]['quality']
                         for (sat, sp) in passes)
-            _scale = A_par_ub[constrained_request] * _Qmax
+            _base = A_par_ub[constrained_request] * pi_r
+            _scale = _base * _Qmax
             _lmax_curve = [0.0]
             _fail = 1.0
             for _p in _thetas_desc[:M_of[constrained_request]]:
@@ -2653,26 +2750,12 @@ def _build_log_linearized_formulation(
                     _reward_expr <= _scale * (_lmax_curve[_n] - _slope * _n)
                                     + _scale * _slope * _xsum,
                     name=f"cut_renv_{req_name}_n{_n}")
-                # SURVIVAL envelope: the same concave cardinality pricing must
-                # also cap e2e itself, or the LP fractionally drains Y to the
-                # union level "for free" and hands inflated survival to every
-                # descendant (the recurrence Y_0[child] = A_prot[parent] then
-                # compounds the inflation down the DAG). With these cuts the
-                # survival passed downstream is priced per integer booking,
-                # and the chain recurrence compounds cost-consistent values.
                 model.addConstr(
                     end_to_end_success[constrained_request]
-                    <= A_par_ub[constrained_request] * (_lmax_curve[_n] - _slope * _n)
-                       + A_par_ub[constrained_request] * _slope * _xsum,
+                    <= _base * (_lmax_curve[_n] - _slope * _n)
+                       + _base * _slope * _xsum,
                     name=f"cut_senv_{req_name}_n{_n}")
 
-            # QUALITY-PROBABILITY frontier envelope: an integer solution picks
-            # ONE subset of passes; its credited reward is at most the sum of
-            # its Q*p products (dropping failure discounting), hence at most
-            # the sum of the n LARGEST Q*p products for n bookings -- a concave
-            # curve in n. The fractional LP otherwise splits booking mass to
-            # take survival from high-p passes and reward from high-Q slots at
-            # the same time, exceeding every integer subset on both axes.
             _qp_desc = sorted(
                 (solution_holder[constrained_request][sat][sp]['quality']
                  * solution_holder[constrained_request][sat][sp]['theta']
@@ -2683,11 +2766,11 @@ def _build_log_linearized_formulation(
             for _n in range(len(_qp_cum) - 1):
                 _slope_qp = _qp_cum[_n + 1] - _qp_cum[_n]
                 model.addConstr(
-                    _reward_expr <= A_par_ub[constrained_request]
+                    _reward_expr <= _base
                                     * ((_qp_cum[_n] - _slope_qp * _n) + _slope_qp * _xsum),
                     name=f"cut_qpenv_{req_name}_n{_n}")
 
-        # --- PROPORTIONAL floor + protected log (fix of the floor trap) --------
+        # --- PROPORTIONAL floor + protected log -------------------------------
         A_prot = model.addVar(lb=max(math.exp(lb_ln_A), 1e-30),
                               ub=A_prot_ub[constrained_request],
                               vtype=GRB.CONTINUOUS, name=f"A_prot_{req_name}")
@@ -2696,26 +2779,22 @@ def _build_log_linearized_formulation(
             A_prot == end_to_end_success[constrained_request] * (1.0 - epsilon)
                       + epsilon * ancestor_success_prob[constrained_request],
             name=f"prot_{req_name}")
-        # Log machinery only where ln_S(r) is actually consumed downstream.
         if needs_log:
             model.addGenConstrLog(A_prot, ln_A_vars[constrained_request], name=f"log_{req_name}")
-            # Log deduction identity (paper Eq. 32), now always satisfiable.
             model.addConstr(
                 ln_S_vars[constrained_request]
                 == ln_A_vars[constrained_request] - ln_A_parents_vars[constrained_request],
                 name=f"lnS_{req_name}")
 
-    # === OBJECTIVE =============================================================
+    # === OBJECTIVE ============================================================
     # Maximize sum_k Q_k * theta_k * W_abs_k
     #         - sum_k (c_sub_k + c_exec_k * theta_acc_k + c_tax_k) * x_k
     #
-    # Costs use Q_MAX_task (max quality over all passes for the task) for
-    # provider-rate billing, decoupled from per-pass geometry. Matches
-    # realized metrics billing in compute_metrics_v3.
-    #
-    # Execution cost uses theta_acc (= p_acc), NOT theta (= p_acc * p_exec):
-    # the simulator bills execution cost for both DATA_RECEIVED and
-    # EXECUTION_FAILED — both require acceptance, so expected cost = p_acc.
+    # p_det needs NO separate objective term: W_abs rides on Y, which already
+    # starts at pi_r * A_parents, so the reward is discounted automatically.
+    # Costs are NOT discounted by p_det -- you pay to book the pass whether or
+    # not the target turns out to be in the footprint, which is exactly the
+    # asymmetry that makes low-p_det tasks correctly unattractive.
     objective_terms = []
     for constrained_request in topo:
         if not solution_holder[constrained_request]:
@@ -2731,7 +2810,9 @@ def _build_log_linearized_formulation(
             for e in workflow_graph.get_edge_data(p, constrained_request).values()
         )
         if _has_success_parent:
-            _parent_passes = [sp.highest.time for p in workflow_graph.predecessors(constrained_request) for sat, sp in task_to_passes.get(p, [])]
+            _parent_passes = [sp.highest.time
+                              for p in workflow_graph.predecessors(constrained_request)
+                              for sat, sp in task_to_passes.get(p, [])]
             _t_dispatch = min(_parent_passes) if _parent_passes else current_time
         else:
             _t_dispatch = current_time
@@ -2746,23 +2827,484 @@ def _build_log_linearized_formulation(
             c_sub = submission_cost_rate * _q_max_task
             if execution_cost_fn is not None:
                 try:
-                    c_exec_k = execution_cost_fn(constrained_request, satellite, satpass, _t_dispatch, q_max=_q_max_task)
+                    c_exec_k = execution_cost_fn(constrained_request, satellite, satpass,
+                                                 _t_dispatch, q_max=_q_max_task)
                 except Exception:
                     c_exec_k = cancellation_cost_rate * _q_max_task
             else:
                 c_exec_k = cancellation_cost_rate * _q_max_task
             c_tax = tax_rate * _q_max_task
 
-            # Expected best-success quality credit for this pass.
             objective_terms.append(quality * theta * w_abs)
-            # Unconditional submission overhead (paid regardless of acceptance).
             objective_terms.append(-c_sub * x_var)
-            # Execution cost, conditional on acceptance (theta_acc = p_acc).
             objective_terms.append(-c_exec_k * theta_acc * x_var)
             if c_tax:
                 objective_terms.append(-c_tax * x_var)
 
     model.setObjective(gp.quicksum(objective_terms), GRB.MAXIMIZE)
+
+# def _build_log_linearized_formulation(
+#         model: gp.Model,
+#         workflow_graph: nx.MultiDiGraph,
+#         solution_holder: dict,
+#         task_to_passes: dict,
+#         epsilon: float,
+#         pwl_tolerance: float,
+#         tax_rate: float,
+#         submission_cost_rate: float,
+#         cancellation_cost_rate: float,
+#         verbose: int,
+#         tighten_bounds: bool = True,
+#         default_max_instances: int = 3,
+#         reward_envelope_cuts: bool = True,
+#         execution_cost_fn=None,
+#         current_time=None
+# ):
+#     """
+#     Log-linearized stochastic formulation (paper Sections 5.2-5.6), built in a
+#     single topological sweep over the DAG.
+
+#     Key properties (each fixing a previously observed failure mode):
+
+#     1. PROPORTIONAL log-protection floor:
+#            A_prot = A_e2e * (1 - eps) + eps * A_parents
+#        (instead of the static "+ eps"). Consequence: A_prot <= A_parents holds
+#        structurally, so ln_S = ln(A_prot) - ln(A_parents) <= 0 is ALWAYS
+#        satisfiable and ln_S >= ln(eps) exactly. The static floor could force
+#        ln_S > 0 for deep tasks with weak ancestors, which collided with the
+#        ln_S <= 0 bound and created massive infeasibility pressure / branching
+#        churn ("adaptive floor trap"). The proportional floor removes the trap
+#        at its root.
+
+#     2. DEPTH-AWARE log-variable bounds. Because ln_S in [ln(eps), 0] exactly
+#        (see 1), the valid bounds are:
+#            ln_A_parents >= n_anc * ln(eps)
+#            ln_A         >= (n_anc + 1) * ln(eps)
+#        A static bound of -12 silently acted as a hidden constraint forcing
+#        ancestral chains to stay healthy (second door into the floor trap).
+#        Bounds are capped at LN_FLOOR for numerical sanity; the cap only binds
+#        for chains of many near-dead ancestors, which are objective-irrelevant.
+
+#     3. SINGLE-PARENT SHORTCUT: for a node r whose unique in-model ancestors
+#        equal {q} + ancestors(q) for a single direct parent q (chain structure),
+#        the entry boundary is set linearly:
+#            ln_A_parents[r] == ln_A[q],   A_parents[r] == A_prot[q]
+#        This is exact (Sum of ancestor ln_S telescopes to ln_A[q]) and removes
+#        one exp() general constraint per chain node -- the dominant source of
+#        MINLP work in chain-heavy workflows.
+
+#     4. REAL-SPACE VALID CUTS: A_parents[r] <= A_prot[a] for every in-model
+#        ancestor a (event inclusion: r's ancestral-success event is a subset of
+#        a's protected end-to-end event). These bound the exp() relaxation in
+#        probability space directly, bypassing the log machinery exactly where
+#        its relaxation is loosest, recovering speed after switching to exact
+#        nonlinear handling (FuncNonlinear=1).
+
+#     5. DATA-DRIVEN BOUND PROPAGATION (dual-bound tightening). The incumbent
+#        is typically found quickly; what is expensive is proving optimality,
+#        because the LP/OA relaxation of the exp()/log() equalities is one-sided
+#        (the relaxed A_parents can float up to the chord of exp between its
+#        variable bounds) and that overestimation COMPOUNDS multiplicatively
+#        down the DAG, inflating the root dual bound. We therefore precompute,
+#        in one topological pass over constants, the best-case protected
+#        probabilities with ALL passes scheduled:
+#            lmax(r)      = 1 - prod_k (1 - p_{r,k})              (union of all passes)
+#            S_ub(r)      = lmax(r)*(1-eps) + eps
+#            A_par_ub(r)  = prod_{a in anc(r)} S_ub(a)
+#            e2e_ub(r)    = A_par_ub(r) * lmax(r)
+#            A_prot_ub(r) = A_par_ub(r) * S_ub(r)
+#        and install them as VARIABLE BOUNDS (plus matching log-space bounds).
+#        Scheduling more passes only increases success probabilities, so these
+#        are valid regardless of conflicts/max-instances; they cut the chord gap
+#        of every exp/log relaxation at the root, before any branching.
+
+#     6. UNION-BOUND CUTS: e2e[r] <= A_par_ub(r) * sum_k p_k x_k, valid since
+#        1 - prod(1 - p x) <= sum p x. Ties the reward a task can claim in the
+#        relaxation to the probability mass actually scheduled, so fractional
+#        solutions cannot harvest reward without paying for bookings.
+
+#     7. BINARY BRANCH PRIORITY: x variables get BranchPriority 10 so Gurobi
+#        branches the schedule decisions before spatially branching the
+#        continuous exp/log operands -- once x is integral the McCormick track
+#        is exact and interval tightening closes the rest fast.
+
+#     NOTE: pwl_tolerance is unused here (kept for API compatibility); the
+#     Gurobi path relies on FuncNonlinear=1 for exact exp/log handling.
+#     """
+#     import math
+
+#     scaled_remaining_risk = {}
+#     effective_pass_realization = {}
+#     ancestor_success_prob = {}
+#     end_to_end_success = {}
+#     A_prot_vars = {}
+#     ln_A_vars = {}
+#     ln_A_parents_vars = {}
+#     ln_S_vars = {}
+
+#     ln_eps = math.log(epsilon)
+#     LN_FLOOR = -20  # absolute cap on log-space lower bounds (exp(-50) ~ 2e-22)
+
+#     # Topological order restricted to tasks actually in the model; guarantees
+#     # every ancestor's variables exist before its descendants reference them.
+#     topo = [r for r in nx.topological_sort(workflow_graph) if r in solution_holder]
+
+#     # Unique-ancestor closure sets (transitive closure trick: summing local
+#     # ln_S over the UNIQUE ancestor set gives the exact joint ancestral
+#     # probability under independence on general DAGs -- shared ancestors of
+#     # diamond patterns are counted exactly once).
+#     anc_sets = {
+#         r: frozenset(a for a in nx.ancestors(workflow_graph, r) if a in solution_holder)
+#         for r in topo
+#     }
+
+#     # --- Constant bound propagation, CARDINALITY-AWARE -------------------------
+#     # The instances cap (max_num_instances) is a hard constraint, so no integer
+#     # solution can ever schedule more than M_r passes. All best-case constants
+#     # are therefore computed over the TOP-M_r probabilities only:
+#     #     lmax_M(r) = 1 - prod_{k in top-M_r}(1 - p_k)
+#     # Computing them over ALL passes (previous version) degenerates to ~1.0 as
+#     # soon as a request has many candidate passes, making every bound trivial.
+#     lmax_ub, S_ub, A_par_ub, e2e_ub, A_prot_ub, M_of = {}, {}, {}, {}, {}, {}
+#     for r in topo:
+#         M = _effective_max_instances(r, default_max_instances)
+#         M_of[r] = max(0, min(M, len(task_to_passes[r])))
+#         thetas = sorted(
+#             (solution_holder[r][sat][sp]['theta'] for (sat, sp) in task_to_passes[r]),
+#             reverse=True)[:M_of[r]]
+#         lmax = 1.0 - math.prod(1.0 - t for t in thetas) if thetas else 0.0
+#         lmax_ub[r] = min(1.0, lmax)
+#         S_ub[r] = lmax_ub[r] * (1.0 - epsilon) + epsilon
+#         A_par_ub[r] = math.prod(S_ub[a] for a in anc_sets[r]) if anc_sets[r] else 1.0
+#         e2e_ub[r] = A_par_ub[r] * lmax_ub[r]
+#         A_prot_ub[r] = A_par_ub[r] * S_ub[r]  # == e2e_ub*(1-eps) + eps*A_par_ub
+#     if not tighten_bounds:
+#         for r in topo:
+#             A_par_ub[r], e2e_ub[r], A_prot_ub[r], S_ub[r] = 1.0, 1.0, 1.0, 1.0
+#             lmax_ub[r] = 1.0
+
+#     # --- Node classification + nonlinearity pruning ----------------------------
+#     # Classify every node once: ROOT (no in-model ancestors), CHAIN (single
+#     # in-model parent whose closure telescopes), MERGE (general log-space join,
+#     # needs an exp() constraint). Then compute which tasks actually need their
+#     # log() constraint: ln_S(r) is consumed ONLY inside merge-node joins, so
+#     # log machinery is required exactly on the union of merge-node ancestor
+#     # closures. Everything else propagates through the purely LINEAR real-space
+#     # identities (A_parents[child] == A_prot[parent]). Consequence: a window
+#     # with no live merge nodes builds a PURE MILP -- zero nonlinear constraints.
+#     node_kind = {}
+#     for r in topo:
+#         dps = [p for p in workflow_graph.predecessors(r) if p in solution_holder]
+#         if not anc_sets[r]:
+#             node_kind[r] = 'root'
+#         elif len(dps) == 1 and anc_sets[r] == anc_sets[dps[0]] | {dps[0]}:
+#             node_kind[r] = 'chain'
+#         else:
+#             node_kind[r] = 'merge'
+#     merge_nodes = [r for r in topo if node_kind[r] == 'merge']
+#     need_lnS = set()
+#     for m in merge_nodes:
+#         need_lnS |= anc_sets[m]
+#     if verbose > 0:
+#         import collections
+#         M_hist = dict(collections.Counter(M_of[r] for r in topo))
+#         lmaxs = [lmax_ub[r] for r in topo if task_to_passes[r]]
+#         print(f"[Log-Linearized] {len(merge_nodes)} merge nodes; log constraints "
+#               f"pruned to {len(need_lnS)} of {len(topo)} tasks "
+#               f"({'PURE MILP' if not merge_nodes else 'MINLP on merge closures only'}).")
+#         if lmaxs:
+#             print(f"[Log-Linearized] ENGAGEMENT CHECK -- instance caps M (histogram): {M_hist}; "
+#                   f"lmax_M: min={min(lmaxs):.3f} mean={sum(lmaxs)/len(lmaxs):.3f} max={max(lmaxs):.3f}; "
+#                   f"tighten_bounds={tighten_bounds}. "
+#                   f"(If M is mostly 1, hedging is OFF; if lmax_M ~1.0, drain cuts are weak.)")
+#         else:
+#             print(f"[Log-Linearized] ENGAGEMENT CHECK -- no task in this window has any "
+#                   f"feasible pass (M histogram: {M_hist}); nothing to schedule or hedge.")
+
+#     if verbose > 0:
+#         n_chain = sum(
+#             1 for r in topo
+#             if len([p for p in workflow_graph.predecessors(r) if p in solution_holder]) == 1
+#         )
+#         print(f"[Log-Linearized] Building exact formulation for {len(topo)} tasks "
+#               f"({n_chain} single-parent candidates for the linear shortcut).")
+
+#     for constrained_request in topo:
+#         req_name = getattr(getattr(constrained_request, 'observation_request', constrained_request), 'name', str(id(constrained_request)))
+#         n_anc = len(anc_sets[constrained_request])
+
+#         # --- Depth-aware bounds -------------------------------------------------
+#         lb_ln_parents = max(n_anc * ln_eps, LN_FLOOR) if n_anc > 0 else 0.0
+#         lb_ln_A = max((n_anc + 1) * ln_eps, LN_FLOOR)
+
+#         r_ub = constrained_request
+#         kind = node_kind[constrained_request]
+#         needs_log = constrained_request in need_lnS
+#         ancestor_success_prob[constrained_request] = model.addVar(
+#             lb=math.exp(lb_ln_parents) if n_anc > 0 else 1.0, ub=A_par_ub[r_ub],
+#             vtype=GRB.CONTINUOUS, name=f"A_parents_{req_name}")
+#         end_to_end_success[constrained_request] = model.addVar(
+#             lb=0.0, ub=e2e_ub[r_ub], vtype=GRB.CONTINUOUS, name=f"A_node_{req_name}")
+#         if needs_log:
+#             ln_A_vars[constrained_request] = model.addVar(
+#                 lb=lb_ln_A, ub=math.log(A_prot_ub[r_ub]) if A_prot_ub[r_ub] < 1.0 else 0.0,
+#                 vtype=GRB.CONTINUOUS, name=f"ln_A_{req_name}")
+#             # Exact range under the proportional floor: ln_S in [ln(eps), ln(S_ub)].
+#             ln_S_vars[constrained_request] = model.addVar(
+#                 lb=ln_eps, ub=math.log(S_ub[r_ub]) if S_ub[r_ub] < 1.0 else 0.0,
+#                 vtype=GRB.CONTINUOUS, name=f"ln_S_{req_name}")
+#         if needs_log or kind == 'merge':
+#             ln_A_parents_vars[constrained_request] = model.addVar(
+#                 lb=lb_ln_parents, ub=math.log(A_par_ub[r_ub]) if A_par_ub[r_ub] < 1.0 else 0.0,
+#                 vtype=GRB.CONTINUOUS, name=f"ln_A_parents_{req_name}")
+
+#         # --- Vertical entry boundary (paper Sec 5.3) ---------------------------
+#         direct_parents = [p for p in workflow_graph.predecessors(constrained_request)
+#                           if p in solution_holder]
+
+#         if kind == 'root':
+#             model.addConstr(ancestor_success_prob[constrained_request] == 1.0,
+#                             name=f"root_Ap_{req_name}")
+#             if needs_log or kind == 'merge':
+#                 model.addConstr(ln_A_parents_vars[constrained_request] == 0.0,
+#                                 name=f"root_lnAp_{req_name}")
+#         elif kind == 'chain':
+#             # Single-parent shortcut: entry boundary is linear in parent's vars.
+#             q = direct_parents[0]
+#             model.addConstr(ancestor_success_prob[constrained_request] == A_prot_vars[q],
+#                             name=f"chain_Ap_{req_name}")
+#             if needs_log:
+#                 # parent q is in anc(merge) whenever r is, so ln_A_vars[q] exists
+#                 model.addConstr(ln_A_parents_vars[constrained_request] == ln_A_vars[q],
+#                                 name=f"chain_lnAp_{req_name}")
+#         else:
+#             # General merge node: exact log-space join over the unique closure set.
+#             model.addConstr(
+#                 ln_A_parents_vars[constrained_request]
+#                 == gp.quicksum(ln_S_vars[anc] for anc in anc_sets[constrained_request]),
+#                 name=f"join_lnAp_{req_name}")
+#             model.addGenConstrExp(ln_A_parents_vars[constrained_request],
+#                                   ancestor_success_prob[constrained_request],
+#                                   name=f"exp_Ap_{req_name}")
+#             # Real-space valid cuts tightening the exp() relaxation:
+#             # A_parents[r] <= A_prot[a] for every in-model ancestor a.
+#             for anc in anc_sets[constrained_request]:
+#                 model.addConstr(
+#                     ancestor_success_prob[constrained_request] <= A_prot_vars[anc],
+#                     name=f"cut_Ap_le_Aprot_{req_name}_{getattr(getattr(anc, 'observation_request', anc), 'name', id(anc))}")
+
+#         # --- Horizontal scaled timeline (paper Sec 5.2) ------------------------
+#         passes = task_to_passes[constrained_request]
+#         K_r = len(passes)
+
+#         for k in range(K_r + 1):
+#             scaled_remaining_risk[(constrained_request, k)] = model.addVar(
+#                 lb=0.0, ub=A_par_ub[constrained_request], vtype=GRB.CONTINUOUS,
+#                 name=f"Y_{req_name}_k{k}")
+
+#         # Injection identity: timeline starts at the parents' joint success.
+#         model.addConstr(
+#             scaled_remaining_risk[(constrained_request, 0)] == ancestor_success_prob[constrained_request],
+#             name=f"inject_{req_name}")
+
+#         for k, (satellite, satpass) in enumerate(passes):
+#             x_var = solution_holder[constrained_request][satellite][satpass]['x']
+#             theta_k = solution_holder[constrained_request][satellite][satpass]['theta']
+#             Y_current = scaled_remaining_risk[(constrained_request, k)]
+
+#             w_abs = model.addVar(lb=0.0, ub=A_par_ub[constrained_request],
+#                                  vtype=GRB.CONTINUOUS, name=f"w_abs_{req_name}_k{k}")
+#             effective_pass_realization[(constrained_request, satellite, satpass)] = w_abs
+#             x_var.BranchPriority = 10  # branch schedule decisions before spatial branching
+
+#             # Exact McCormick linearization of the binary-continuous product.
+#             model.addConstr(w_abs <= x_var, name=f"mc1_{req_name}_k{k}")
+#             model.addConstr(w_abs <= Y_current, name=f"mc2_{req_name}_k{k}")
+#             model.addConstr(w_abs >= Y_current - (1.0 - x_var), name=f"mc3_{req_name}_k{k}")
+
+#             model.addConstr(
+#                 scaled_remaining_risk[(constrained_request, k + 1)] == Y_current - theta_k * w_abs,
+#                 name=f"rec_{req_name}_k{k}")
+
+#         # End-of-horizon fulfillment (paper Eq. 29).
+#         model.addConstr(
+#             end_to_end_success[constrained_request]
+#             == ancestor_success_prob[constrained_request] - scaled_remaining_risk[(constrained_request, K_r)],
+#             name=f"e2e_{req_name}")
+
+#         # Union-bound cut (docstring item 6): reward-carrying probability mass
+#         # is capped by the scheduled probability mass, scaled by the best-case
+#         # ancestral survival. Valid since 1 - prod(1-p*x) <= sum(p*x).
+#         if K_r > 0:
+#             model.addConstr(
+#                 end_to_end_success[constrained_request]
+#                 <= A_par_ub[constrained_request] * gp.quicksum(
+#                     solution_holder[constrained_request][sat][sp]['theta']
+#                     * solution_holder[constrained_request][sat][sp]['x']
+#                     for (sat, sp) in passes),
+#                 name=f"cut_union_{req_name}")
+
+#         # DRAIN CUT (the decisive one). In the LP relaxation, fractional x lets
+#         # the McCormick track fully drain Y (claim near-certain local success)
+#         # while "paying" only max_instances worth of booking mass -- this, not
+#         # the exp/log chords, is what inflates the root bound by hundreds of
+#         # percent when requests have many candidate passes. No INTEGER solution
+#         # can exceed the top-M union probability, so:
+#         #     e2e[r] <= lmax_M(r) * A_parents[r]
+#         # is valid, linear, and caps the relaxation at the true per-task ceiling.
+#         if tighten_bounds and K_r > 0 and lmax_ub[constrained_request] < 1.0:
+#             model.addConstr(
+#                 end_to_end_success[constrained_request]
+#                 <= lmax_ub[constrained_request] * ancestor_success_prob[constrained_request],
+#                 name=f"cut_drain_{req_name}")
+
+#         # REWARD ENVELOPE CUTS (cardinality-priced reward). The LP relaxation
+#         # can otherwise earn near-union success probability while paying only
+#         # a fraction of the integer booking count (McCormick complementarity
+#         # binds only at integral x), so per-booking costs barely discount the
+#         # bound. The per-task reward with n integer bookings is bounded by the
+#         # CONCAVE curve R_ub(n) = A_par_ub * Q_max * lmax(n), where
+#         # lmax(n) = 1 - prod over top-n p of (1-p). We add its tangents at
+#         # n = 0..M-1: valid for every integer point by concavity, and they
+#         # force the relaxation to pay one full booking of cost per top-marginal
+#         # unit of reward. This encodes the diminishing-returns structure --
+#         # invisible to the plain relaxation -- as linear inequalities, with no
+#         # change to the feasible integer set or the objective.
+#         if reward_envelope_cuts and tighten_bounds and K_r > 0:
+#             _thetas_desc = sorted(
+#                 (solution_holder[constrained_request][sat][sp]['theta'] for (sat, sp) in passes),
+#                 reverse=True)
+#             _Qmax = max(solution_holder[constrained_request][sat][sp]['quality']
+#                         for (sat, sp) in passes)
+#             _scale = A_par_ub[constrained_request] * _Qmax
+#             _lmax_curve = [0.0]
+#             _fail = 1.0
+#             for _p in _thetas_desc[:M_of[constrained_request]]:
+#                 _fail *= (1.0 - _p)
+#                 _lmax_curve.append(1.0 - _fail)
+#             _reward_expr = gp.quicksum(
+#                 solution_holder[constrained_request][sat][sp]['quality']
+#                 * solution_holder[constrained_request][sat][sp]['theta']
+#                 * effective_pass_realization[(constrained_request, sat, sp)]
+#                 for (sat, sp) in passes)
+#             _xsum = gp.quicksum(
+#                 solution_holder[constrained_request][sat][sp]['x'] for (sat, sp) in passes)
+#             for _n in range(len(_lmax_curve) - 1):
+#                 _slope = _lmax_curve[_n + 1] - _lmax_curve[_n]
+#                 model.addConstr(
+#                     _reward_expr <= _scale * (_lmax_curve[_n] - _slope * _n)
+#                                     + _scale * _slope * _xsum,
+#                     name=f"cut_renv_{req_name}_n{_n}")
+#                 # SURVIVAL envelope: the same concave cardinality pricing must
+#                 # also cap e2e itself, or the LP fractionally drains Y to the
+#                 # union level "for free" and hands inflated survival to every
+#                 # descendant (the recurrence Y_0[child] = A_prot[parent] then
+#                 # compounds the inflation down the DAG). With these cuts the
+#                 # survival passed downstream is priced per integer booking,
+#                 # and the chain recurrence compounds cost-consistent values.
+#                 model.addConstr(
+#                     end_to_end_success[constrained_request]
+#                     <= A_par_ub[constrained_request] * (_lmax_curve[_n] - _slope * _n)
+#                        + A_par_ub[constrained_request] * _slope * _xsum,
+#                     name=f"cut_senv_{req_name}_n{_n}")
+
+#             # QUALITY-PROBABILITY frontier envelope: an integer solution picks
+#             # ONE subset of passes; its credited reward is at most the sum of
+#             # its Q*p products (dropping failure discounting), hence at most
+#             # the sum of the n LARGEST Q*p products for n bookings -- a concave
+#             # curve in n. The fractional LP otherwise splits booking mass to
+#             # take survival from high-p passes and reward from high-Q slots at
+#             # the same time, exceeding every integer subset on both axes.
+#             _qp_desc = sorted(
+#                 (solution_holder[constrained_request][sat][sp]['quality']
+#                  * solution_holder[constrained_request][sat][sp]['theta']
+#                  for (sat, sp) in passes), reverse=True)[:M_of[constrained_request]]
+#             _qp_cum = [0.0]
+#             for _qp in _qp_desc:
+#                 _qp_cum.append(_qp_cum[-1] + _qp)
+#             for _n in range(len(_qp_cum) - 1):
+#                 _slope_qp = _qp_cum[_n + 1] - _qp_cum[_n]
+#                 model.addConstr(
+#                     _reward_expr <= A_par_ub[constrained_request]
+#                                     * ((_qp_cum[_n] - _slope_qp * _n) + _slope_qp * _xsum),
+#                     name=f"cut_qpenv_{req_name}_n{_n}")
+
+#         # --- PROPORTIONAL floor + protected log (fix of the floor trap) --------
+#         A_prot = model.addVar(lb=max(math.exp(lb_ln_A), 1e-30),
+#                               ub=A_prot_ub[constrained_request],
+#                               vtype=GRB.CONTINUOUS, name=f"A_prot_{req_name}")
+#         A_prot_vars[constrained_request] = A_prot
+#         model.addConstr(
+#             A_prot == end_to_end_success[constrained_request] * (1.0 - epsilon)
+#                       + epsilon * ancestor_success_prob[constrained_request],
+#             name=f"prot_{req_name}")
+#         # Log machinery only where ln_S(r) is actually consumed downstream.
+#         if needs_log:
+#             model.addGenConstrLog(A_prot, ln_A_vars[constrained_request], name=f"log_{req_name}")
+#             # Log deduction identity (paper Eq. 32), now always satisfiable.
+#             model.addConstr(
+#                 ln_S_vars[constrained_request]
+#                 == ln_A_vars[constrained_request] - ln_A_parents_vars[constrained_request],
+#                 name=f"lnS_{req_name}")
+
+#     # === OBJECTIVE =============================================================
+#     # Maximize sum_k Q_k * theta_k * W_abs_k
+#     #         - sum_k (c_sub_k + c_exec_k * theta_acc_k + c_tax_k) * x_k
+#     #
+#     # Costs use Q_MAX_task (max quality over all passes for the task) for
+#     # provider-rate billing, decoupled from per-pass geometry. Matches
+#     # realized metrics billing in compute_metrics_v3.
+#     #
+#     # Execution cost uses theta_acc (= p_acc), NOT theta (= p_acc * p_exec):
+#     # the simulator bills execution cost for both DATA_RECEIVED and
+#     # EXECUTION_FAILED — both require acceptance, so expected cost = p_acc.
+#     objective_terms = []
+#     for constrained_request in topo:
+#         if not solution_holder[constrained_request]:
+#             continue
+
+#         _q_max_task = max(
+#             solution_holder[constrained_request][s][p]['quality']
+#             for s, p in task_to_passes[constrained_request]
+#         )
+#         _has_success_parent = any(
+#             'SUCCESS' in str(e.get('constraint_class', ''))
+#             for p in workflow_graph.predecessors(constrained_request)
+#             for e in workflow_graph.get_edge_data(p, constrained_request).values()
+#         )
+#         if _has_success_parent:
+#             _parent_passes = [sp.highest.time for p in workflow_graph.predecessors(constrained_request) for sat, sp in task_to_passes.get(p, [])]
+#             _t_dispatch = min(_parent_passes) if _parent_passes else current_time
+#         else:
+#             _t_dispatch = current_time
+
+#         for satellite, satpass in task_to_passes[constrained_request]:
+#             x_var = solution_holder[constrained_request][satellite][satpass]['x']
+#             quality = solution_holder[constrained_request][satellite][satpass]['quality']
+#             theta = solution_holder[constrained_request][satellite][satpass]['theta']
+#             theta_acc = solution_holder[constrained_request][satellite][satpass]['theta_acc']
+#             w_abs = effective_pass_realization[(constrained_request, satellite, satpass)]
+
+#             c_sub = submission_cost_rate * _q_max_task
+#             if execution_cost_fn is not None:
+#                 try:
+#                     c_exec_k = execution_cost_fn(constrained_request, satellite, satpass, _t_dispatch, q_max=_q_max_task)
+#                 except Exception:
+#                     c_exec_k = cancellation_cost_rate * _q_max_task
+#             else:
+#                 c_exec_k = cancellation_cost_rate * _q_max_task
+#             c_tax = tax_rate * _q_max_task
+
+#             # Expected best-success quality credit for this pass.
+#             objective_terms.append(quality * theta * w_abs)
+#             # Unconditional submission overhead (paid regardless of acceptance).
+#             objective_terms.append(-c_sub * x_var)
+#             # Execution cost, conditional on acceptance (theta_acc = p_acc).
+#             objective_terms.append(-c_exec_k * theta_acc * x_var)
+#             if c_tax:
+#                 objective_terms.append(-c_tax * x_var)
+
+#     model.setObjective(gp.quicksum(objective_terms), GRB.MAXIMIZE)
 
 
 def _add_workflow_constraints(

@@ -450,6 +450,7 @@ def create_volcano_workflow(
                     detection_task
                 ),
             ]
+            
 
             # Volume Follow-up Task (Targeted at vent location)
             # Full planning window: timing is enforced by START_AFTER/BEFORE_OFFSET

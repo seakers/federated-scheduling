@@ -86,19 +86,19 @@ from benchmarking_utils import (
 SIMULATION_START = dt.datetime(2026, 8, 1, 0, 0, 0)  # fixed for reproducibility; override with --start
 
 
-lookahead_horizon_h = 12
+lookahead_horizon_h = 6
 FOLLOW_UP_INTERVAL_H = 2
 HOURS_TO_DETECT = 3
-MAX_SOLVER_TIME_S = 120
+MAX_SOLVER_TIME_S = 300
 MAX_NUM_INSTANCES = 10
-NUM_MC_RUNS = 3
+NUM_MC_RUNS = 1
 
 # === COST CONFIGURATION ===
 TAX_RATE = 0.0              # Legacy per-booking tax (disabled)
-SUBMISSION_COST = 0.005      # Unconditional booking submission overhead (fraction of Q_MAX_task)
+SUBMISSION_COST = 0.02      # Unconditional booking submission overhead (fraction of Q_MAX_task)
 
 # Per-provider execution cost rates (fraction of Q_MAX_task at reference lead time).
-# PROVIDER_RATES = {
+# PROVIDER_RATES = { #Stochastic wins, but deterinistic does worse than greedy
 #     "Planet":          0.08,
 #     "Umbra":           0.20,
 #     "Capella":         0.25,
@@ -109,22 +109,32 @@ SUBMISSION_COST = 0.005      # Unconditional booking submission overhead (fracti
 #     "ICEYE":           0.20,
 # }
 PROVIDER_RATES = {
-    "Planet":          0.01,
-    "Umbra":           0.02,
-    "Capella":         0.03,
-    "LOFT":            0.01,
-    "Ubotica":         0.015,
-    "Mission Control": 0.010,
-    "AC":              0.008,
-    "ICEYE":           0.020,
+    "Planet":          0.05,
+    "Umbra":           0.15,
+    "Capella":         0.20,
+    "LOFT":            0.08,
+    "Ubotica":         0.10,
+    "Mission Control": 0.08,
+    "AC":              0.08,
+    "ICEYE":           0.15,
 }
+# PROVIDER_RATES = { #Stochastic > deterministic > Greedy > Random
+#     "Planet":          0.01,
+#     "Umbra":           0.02,
+#     "Capella":         0.03,
+#     "LOFT":            0.01,
+#     "Ubotica":         0.015,
+#     "Mission Control": 0.010,
+#     "AC":              0.008,
+#     "ICEYE":           0.020,
+# }
 
 PROVIDER_RATE_DEFAULT = 0.020  # fallback for unknown providers
 
 # Lead-time multiplier: cost = rate × Q_MAX × (1 + LEAD_K × max(0, 1 - lead_h / LEAD_T_REF_H))
 # At lead >= LEAD_T_REF_H: multiplier = 1.0 (base cost)
 # At lead = 0: multiplier = 1 + LEAD_K (maximum cost)
-LEAD_K = 10.0          # extra cost fraction at zero lead
+LEAD_K = 3.0          # extra cost fraction at zero lead
 LEAD_T_REF_H = 6.0   # reference lead horizon in hours
 
 # === ACCEPTANCE NOTIFICATION DELAY ===
@@ -144,8 +154,8 @@ P_ACC_MAX = 0.95          # Maximum acceptance probability (low-demand / quiet)
 # Execution probability range: even an accepted pass may fail (cloud cover, sensor issue).
 # The function maps look-angle → p_exec in [P_EXEC_MIN, P_EXEC_MAX].
 # At nadir (best geometry) → P_EXEC_MAX; at worst geometry → P_EXEC_MIN.
-P_EXEC_MIN = 0.50           # Minimum execution probability (worst geometry)
-P_EXEC_MAX = 0.80           # Maximum execution probability (best geometry)
+P_EXEC_MIN = 0.70           # Minimum execution probability (worst geometry)
+P_EXEC_MAX = 0.90           # Maximum execution probability (best geometry)
 
 SCHEDULERS = ['stochastic_log', 'greedy','deterministic', 'random']
 #SCHEDULERS = ['greedy']

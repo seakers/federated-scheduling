@@ -92,6 +92,7 @@ class Broker():
         self._workflow_graph = None
         self._timeline_graph = None
         self._workflow_schedule_epoch = 0
+        self._planning_sessions = []
 
     def __deepcopy__(self, memo):
         new_broker = Broker(constellations=self.constellations, world=self.world, name=self.name)
@@ -112,6 +113,7 @@ class Broker():
             # find_unpicklable(self._timeline_graph)
             import pdb; pdb.set_trace()
         new_broker._workflow_schedule_epoch = copy.deepcopy(self._workflow_schedule_epoch, memo)
+        new_broker._planning_sessions = copy.deepcopy(self._planning_sessions, memo)
 
         return new_broker
 
@@ -634,6 +636,15 @@ class Broker():
 
         self._workflow_schedule_epoch += 1
 
+        # Record planning session diagnostics written by the solver onto workflow_graph.graph
+        _g = self._workflow_graph.graph if self._workflow_graph is not None else {}
+        _solve_t = _g.get('solve_time_s', float('nan'))
+        self._planning_sessions.append({
+            'solve_time_s': _solve_t,
+            'wall_s': _solve_t,   # same value; fame_metrics reads 'wall_s'
+            'mip_gap': _g.get('mip_gap', float('nan')),
+        })
+
         if plot_schedule:
             plot_workflow_schedule(
                 workflow_graph=self._workflow_graph,
@@ -1109,6 +1120,14 @@ class Broker():
                     )
 
             self._workflow_schedule_epoch += 1
+
+            # Record planning session diagnostics written by the solver onto workflow_graph.graph
+            _g = self._workflow_graph.graph if self._workflow_graph is not None else {}
+            self._planning_sessions.append({
+                'solve_time_s': _g.get('solve_time_s', float('nan')),
+                'wall_s':       _g.get('solve_time_s', float('nan')),
+                'mip_gap':      _g.get('mip_gap',      float('nan')),
+            })
 
             # Step 3: Plot schedule if requested
             if plot_schedule:
