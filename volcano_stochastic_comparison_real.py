@@ -86,10 +86,10 @@ from benchmarking_utils import (
 SIMULATION_START = dt.datetime(2026, 8, 1, 0, 0, 0)  # fixed for reproducibility; override with --start
 
 
-lookahead_horizon_h = 6
+lookahead_horizon_h = 18
 FOLLOW_UP_INTERVAL_H = 2
 HOURS_TO_DETECT = 3
-MAX_SOLVER_TIME_S = 300
+MAX_SOLVER_TIME_S = 120
 MAX_NUM_INSTANCES = 10
 NUM_MC_RUNS = 1
 
@@ -134,7 +134,7 @@ PROVIDER_RATE_DEFAULT = 0.020  # fallback for unknown providers
 # Lead-time multiplier: cost = rate × Q_MAX × (1 + LEAD_K × max(0, 1 - lead_h / LEAD_T_REF_H))
 # At lead >= LEAD_T_REF_H: multiplier = 1.0 (base cost)
 # At lead = 0: multiplier = 1 + LEAD_K (maximum cost)
-LEAD_K = 3.0          # extra cost fraction at zero lead
+LEAD_K = 2.0          # extra cost fraction at zero lead
 LEAD_T_REF_H = 6.0   # reference lead horizon in hours
 
 # === ACCEPTANCE NOTIFICATION DELAY ===
@@ -154,11 +154,13 @@ P_ACC_MAX = 0.95          # Maximum acceptance probability (low-demand / quiet)
 # Execution probability range: even an accepted pass may fail (cloud cover, sensor issue).
 # The function maps look-angle → p_exec in [P_EXEC_MIN, P_EXEC_MAX].
 # At nadir (best geometry) → P_EXEC_MAX; at worst geometry → P_EXEC_MIN.
-P_EXEC_MIN = 0.70           # Minimum execution probability (worst geometry)
-P_EXEC_MAX = 0.90           # Maximum execution probability (best geometry)
+P_EXEC_MIN = 0.60           # Minimum execution probability (worst geometry)
+P_EXEC_MAX = 0.80           # Maximum execution probability (best geometry)
 
-SCHEDULERS = ['stochastic_log', 'greedy','deterministic', 'random']
+SCHEDULERS = ['stochastic_log', 'greedy','deterministic', 'random', 'super_random']
 #SCHEDULERS = ['greedy']
+SCHEDULERS = ['deterministic']
+#SCHEDULERS = ['super_random', 'greedy']
 
 # Set to True to cancel inferior pending passes once a better/sufficient one succeeds.
 # Only applies to stochastic_log (redundant scheduling). Saves execution cost at the
@@ -454,6 +456,21 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
                 results_path=plots_dir,
                 use_random=True,
+                random_seed=seed,
+            )
+        elif scheduler == 'super_random':
+            broker.schedule_workflow_redundant(
+                current_time=world.time, use_ilp=False, use_stochastic=False,
+                max_solver_time_s=MAX_SOLVER_TIME_S,
+                update_timelines=False, update_requests=False, tax_rate=TAX_RATE,
+                receding_horizon_duration=_horizon,
+                submission_cost_rate=SUBMISSION_COST,
+                execution_cost_fn=execution_cost_fn,
+                max_reschedule_depth=5,
+                plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
+                results_path=plots_dir,
+                use_random=True,
+                super_random=True,
                 random_seed=seed,
             )
         else:

@@ -374,7 +374,7 @@ def create_volcano_workflow(
     wind_speed_kph: float = 40.0,
     wind_heading_deg: float = 45.0,
     plume_alt_km: float = 12.0
-) -> Workflow:
+) -> Workflow:  
     """
     Generates the complete Volcano Eruption Monitoring workflow:
     1. Eruption Detection Task per volcano (hours 0-6).
@@ -392,9 +392,9 @@ def create_volcano_workflow(
         ConstraintClass.GEOMETRY: True,
     }
     policy_dispatch = {
-        ConstraintClass.TEMPORAL: False,
+        ConstraintClass.TEMPORAL: True,
         ConstraintClass.SUCCESS: False,
-        ConstraintClass.GEOMETRY: False,
+        ConstraintClass.GEOMETRY: True,
     }
 
     for volcano in volcano_locations:

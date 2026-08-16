@@ -149,6 +149,45 @@ class Broker():
         # return True
 
 
+    def _cancel_booking_row(self, idx, row, current_time: dt.datetime) -> bool:
+        """Best-effort cancel of ONE booking row. Returns True if it was cancelled.
+
+        Works off the `requested_*` columns, which are populated at DISPATCH time,
+        so it is valid for a row that is still SUBMITTED (awaiting ACK) as well as
+        one already SCHEDULED. The constellation may still refuse -- it may not
+        hold the booking yet, or the pass may have started -- in which case the
+        row is left alone.
+        """
+        candidate_pass    = row['requested_pass']
+        candidate_sat     = row['requested_satellite']
+        constellation     = row['requested_constellation']
+        constellation_req = row['constellation_request']
+
+        if (candidate_pass is None or candidate_sat is None
+                or constellation is None or constellation_req is None):
+            return False
+        if not hasattr(constellation, 'cancel_request'):
+            return False
+
+        if not constellation.cancel_request(
+                request=constellation_req,
+                target_satellite=candidate_sat,
+                target_pass=candidate_pass,
+                current_time=current_time):
+            return False
+
+        self._requests.loc[idx, 'status'] = ObservationStatus.CANCELLED
+        # Release broker-side satellite busy timeline
+        tl = self._satellite_busy_timelines.get(candidate_sat)
+        if tl is not None:
+            obs_start = candidate_pass.highest.time
+            obs_end   = candidate_pass.highest.time + candidate_pass.highest.duration
+            tl.impact_container = [
+                imp for imp in tl.impact_container
+                if imp.time != obs_start and imp.time != obs_end
+            ]
+        return True
+
     def _try_cancel_inferior_passes(
         self,
         dispatchable_task,
@@ -156,7 +195,7 @@ class Broker():
         current_time: dt.datetime,
     ) -> int:
         """
-        After a pass succeeds for `dispatchable_task`, cancel all other SCHEDULED
+        After a pass succeeds for `dispatchable_task`, cancel all other outstanding
         passes for the same task whose quality is <= the winning pass quality AND
         whose observation has not yet started (cancellation window still open).
 
@@ -164,20 +203,26 @@ class Broker():
         """
         winning_quality = dispatchable_task.rewarder(winning_pass.highest)
 
-        # All submitted/scheduled rows for this task that are NOT DATA_RECEIVED
+        # BOTH statuses, not just SCHEDULED. A booking that has been submitted but
+        # whose AcceptNotify has not yet fired is still SUBMITTED; filtering on
+        # SCHEDULED alone left those rows untouched, they were then accepted,
+        # executed, and charged full execution cost for a product that
+        # callback_request_ready discards as "already completed by a prior pass".
+        # _count_passes_in_flight has always used both statuses, so the hold logic
+        # knew about these rows while the cancel logic did not.
+        #
+        # The constellation will refuse to cancel one it has not accepted yet; the
+        # late-accept sweep in callback_request_scheduled is what catches those.
         task_rows = self._requests.loc[
             (self._requests['request'] == dispatchable_task.observation_request) &
-            (self._requests['status'] == ObservationStatus.SCHEDULED)
+            (self._requests['status'].isin([ObservationStatus.SUBMITTED,
+                                            ObservationStatus.SCHEDULED]))
         ]
 
         n_cancelled = 0
         for idx, row in task_rows.iterrows():
             candidate_pass = row['requested_pass']
-            candidate_sat  = row['requested_satellite']
-            constellation  = row['requested_constellation']
-            constellation_req = row['constellation_request']
-
-            if candidate_pass is None or candidate_sat is None or constellation is None or constellation_req is None:
+            if candidate_pass is None:
                 continue
 
             candidate_quality = dispatchable_task.rewarder(candidate_pass.highest)
@@ -186,29 +231,10 @@ class Broker():
             if candidate_quality > winning_quality:
                 continue
 
-            if not hasattr(constellation, 'cancel_request'):
-                continue
-
-            success = constellation.cancel_request(
-                request=constellation_req,
-                target_satellite=candidate_sat,
-                target_pass=candidate_pass,
-                current_time=current_time,
-            )
-            if success:
-                self._requests.loc[idx, 'status'] = ObservationStatus.CANCELLED
-                # Release broker-side satellite busy timeline
-                tl = self._satellite_busy_timelines.get(candidate_sat)
-                if tl is not None:
-                    obs_start = candidate_pass.highest.time
-                    obs_end   = candidate_pass.highest.time + candidate_pass.highest.duration
-                    tl.impact_container = [
-                        imp for imp in tl.impact_container
-                        if imp.time != obs_start and imp.time != obs_end
-                    ]
+            if self._cancel_booking_row(idx, row, current_time):
                 n_cancelled += 1
                 print(f" [{self.name}] Cancelled inferior pass for {dispatchable_task.name} "
-                      f"on {candidate_sat.name} (quality {candidate_quality:.2f} <= "
+                      f"on {row['requested_satellite'].name} (quality {candidate_quality:.2f} <= "
                       f"winner {winning_quality:.2f})")
 
         return n_cancelled
@@ -424,15 +450,37 @@ class Broker():
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'status'] = reason
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'constellation'] = None
                     self._requests.loc[((self._requests['request']==_request) & (self._requests['requested_pass']==__best_pass)), 'satellite'] = None
-                    # if reason == ObservationStatus.CONSTELLATION_REJECTED:
-                    #     _tl = self._satellite_busy_timelines.get(__best_satellite)
-                    #     if _tl is not None:
-                    #         _obs_start = __best_pass.highest.time
-                    #         _obs_end   = __best_pass.highest.time + __best_pass.highest.duration
-                    #         _tl.impact_container = [
-                    #             imp for imp in _tl.impact_container
-                    #             if imp.time != _obs_start and imp.time != _obs_end
-                    #         ]
+
+                    # TIMELINE RELEASE POLICY -- depends on WHO holds the slot.
+                    #
+                    #   CONSTELLATION_REJECTED: p_acc IS market congestion, so a
+                    #     NACK means a competitor took the slot. The capacity is
+                    #     gone; keep the lock. Releasing it caused a replan
+                    #     livelock -- the planner re-derived the same pass (a few
+                    #     seconds off, hence a different object), re-booked it,
+                    #     and the constellation refused on "conflicted/busy",
+                    #     wasting every other solve.
+                    #
+                    #   ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING: the slot is
+                    #     occupied by something else. Keep the lock.
+                    #
+                    #   BOOKING_TOO_LATE: NOBODY took the slot -- the booking
+                    #     simply arrived inside the lead-time window. The pass is
+                    #     still physically available, so the lock must be
+                    #     RELEASED. Holding it would compound the lead-time
+                    #     penalty with a phantom capacity loss and make the
+                    #     lead-time sweep measure two effects at once.
+                    if reason == ObservationStatus.BOOKING_TOO_LATE:
+                        _tl = self._satellite_busy_timelines.get(__best_satellite)
+                        if _tl is not None:
+                            _obs_start = __best_pass.highest.time
+                            _obs_end   = __best_pass.highest.time + __best_pass.highest.duration
+                            _tl.impact_container = [
+                                imp for imp in _tl.impact_container
+                                if not (imp.time in (_obs_start, _obs_end)
+                                        and getattr(imp, 'owner', None) is _request)
+                            ]
+
                     follow_up_action_failure(reason)
                     # Also reschedule
 
@@ -554,6 +602,7 @@ class Broker():
             max_reschedule_depth: int = 10,  # Maximum recursive rescheduling depth to prevent infinite loops
             results_path: str = "",
             use_random: bool = False,  # Use random scheduler as lower-bound baseline
+            super_random: bool = False,  # Skip feasibility/conflict checks (chaos baseline)
             random_seed: int = None,
     ):
         # Prevent infinite rescheduling loops (rejection/timeout triggering more rescheduling)
@@ -623,6 +672,7 @@ class Broker():
                     current_time=current_time,
                     verbose=1,
                     seed=random_seed,
+                    super_random=super_random,
                 )
             else:
                 _ = greedy_schedule_workflow(
@@ -735,6 +785,7 @@ class Broker():
                     max_reschedule_depth=max_reschedule_depth,
                     results_path=results_path,
                     use_random=use_random,
+                    super_random=super_random,
                     random_seed=random_seed,
                 )
 
@@ -1029,8 +1080,10 @@ class Broker():
                 max_reschedule_depth: int = 10,
                 results_path: str = "",
                 use_random: bool = False,
+                super_random: bool = False,
                 random_seed: int = None,
                 enable_cancellations: bool = False,
+                greedy_max_instances: int = 1,
         ):
             """
             Full redundant workflow scheduling and dispatching method for Broker.
@@ -1108,8 +1161,13 @@ class Broker():
                         current_time=current_time,
                         verbose=1,
                         seed=random_seed,
+                        super_random=super_random,
                     )
                 else:
+                    # greedy_max_instances = 1  -> reactive baseline (serial retry)
+                    # greedy_max_instances = N  -> redundancy ablation: same budget
+                    #                              as the stochastic planner, but
+                    #                              purely local, gate-blind selection
                     _ = greedy_schedule_workflow(
                         workflow_graph=self._workflow_graph,
                         timeline_graph=self._timeline_graph,
@@ -1117,6 +1175,7 @@ class Broker():
                         feasibility_screener=self._screen_pass_for_feasibility,
                         current_time=current_time,
                         verbose=1,
+                        max_instances_per_task=greedy_max_instances,
                     )
 
             self._workflow_schedule_epoch += 1
@@ -1200,8 +1259,10 @@ class Broker():
                         max_reschedule_depth=max_reschedule_depth,
                         results_path=results_path,
                         use_random=use_random,
+                        super_random=super_random,
                         random_seed=random_seed,
                         enable_cancellations=enable_cancellations,
+                        greedy_max_instances=greedy_max_instances,
                     )
 
                 # --- EXTRACT SOLVED PASSES FROM STOCHASTIC PLANNER ---
@@ -1234,6 +1295,31 @@ class Broker():
                         self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'satellite'] = __best_satellite
                         _dispatchable_task.scheduled = True
                         _dispatchable_task.dispatched = True
+
+                        # LATE ACCEPT on a task that has ALREADY committed. The
+                        # cancellation sweep at commit time could not act on this
+                        # booking because the constellation had not accepted it yet,
+                        # so cancel it now: the ACK lands well before the pass (tens
+                        # of minutes in practice), and without this the observation
+                        # executes and is charged full execution cost for a product
+                        # callback_request_ready then discards as "already completed
+                        # by a prior pass".
+                        #
+                        # This biases the comparison, not just the totals: the
+                        # stochastic planner books the most redundancy, so it eats
+                        # the most of this waste, inflating the cost of exactly the
+                        # scheduler under test.
+                        if _enable_cancellations and _dispatchable_task.completed:
+                            _rows = self._requests.loc[
+                                (self._requests['request'] == _request) &
+                                (self._requests['requested_pass'] == __best_pass) &
+                                (self._requests['status'] == ObservationStatus.SCHEDULED)
+                            ]
+                            for _idx, _row in _rows.iterrows():
+                                if self._cancel_booking_row(_idx, _row, self.world.time):
+                                    print(f" [{self.name}] Cancelled late-accepted pass for "
+                                          f"{_request.name} on {__best_satellite.name}: task "
+                                          f"already committed.")
                         return
 
                     def callback_request_unscheduled(reason, _request=request, __best_pass=_pass_obj, __best_constellation=_pass_constellation, __best_satellite=_pass_satellite, _dispatchable_task=dispatchable_task):
@@ -1242,19 +1328,27 @@ class Broker():
                         self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'status'] = reason
                         self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'constellation'] = None
                         self._requests.loc[((self._requests['request'] == _request) & (self._requests['requested_pass'] == __best_pass)), 'satellite'] = None
+                        # The broker timeline is NEVER released on unscheduling.
+                        #   CONSTELLATION_REJECTED means a competitor took the slot
+                        #   (p_acc IS market congestion), so the capacity is gone.
+                        #   ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING means it is
+                        #   occupied by something else.
+                        # Releasing it caused a replan LIVELOCK: the planner re-derived
+                        # the same pass (seconds off, hence a different object), re-booked
+                        # it, and the constellation refused on "conflicted/busy" -- every
+                        # other solve wasted.  Keeping the impacts works across the
+                        # re-derivation because the screener is an INTERVAL test on
+                        # rise..fall, not an equality test on highest.time.
+                        # if reason == ObservationStatus.CONSTELLATION_REJECTED:
+                        #     _tl = self._satellite_busy_timelines.get(__best_satellite)
+                        #     if _tl is not None:
+                        #         _obs_start = __best_pass.highest.time
+                        #         _obs_end   = __best_pass.highest.time + __best_pass.highest.duration
+                        #         _tl.impact_container = [
+                        #             imp for imp in _tl.impact_container
+                        #             if imp.time != _obs_start and imp.time != _obs_end
+                        #         ]
 
-                        # Only release broker timeline on CONSTELLATION_REJECTED (acceptance roll).
-                        # For ALL_OBSERVATION_OPPORTUNITIES_ARE_CONFLICTING the constellation slot
-                        # is occupied by something else; keeping the lock prevents re-trying the same slot.
-                        if reason == ObservationStatus.CONSTELLATION_REJECTED:
-                            _tl = self._satellite_busy_timelines.get(__best_satellite)
-                            if _tl is not None:
-                                _obs_start = __best_pass.highest.time
-                                _obs_end   = __best_pass.highest.time + __best_pass.highest.duration
-                                _tl.impact_container = [
-                                    imp for imp in _tl.impact_container
-                                    if imp.time != _obs_start and imp.time != _obs_end
-                                ]
 
                         _still_in_flight = self._requests.loc[
                             (self._requests['request'] == _request) &
@@ -1354,13 +1448,27 @@ class Broker():
                                 _replan()
                                 self._reschedule_depth -= 1
                             else:
-                                # Spatial miss: the satellite executed but nothing was in the
-                                # FOV.  Not a p_exec failure, so no replan is needed - but if
-                                # this was the last outstanding attempt, any held-back success
-                                # must be released now.
-                                if self._count_passes_in_flight(_request) == 0:
-                                    self._commit_provisional_success(_dispatchable_task, _replan,
-                                                                     enable_cancellations=_enable_cancellations)
+                                # Spatial miss: the satellite executed but nothing was in
+                                # the FOV. Not a p_exec failure -- but if this was the LAST
+                                # outstanding attempt, the task has failed and the workflow
+                                # must move on. Without the replan the task stays
+                                # dispatched=True with completed=False, no further event is
+                                # queued, and the simulation simply stops with hours of
+                                # horizon unused.
+                                if self._count_passes_in_flight(_request) > 0:
+                                    return
+                                if self._commit_provisional_success(
+                                        _dispatchable_task, _replan,
+                                        enable_cancellations=_enable_cancellations):
+                                    return
+                                _dispatchable_task.scheduled = False
+                                _dispatchable_task.dispatched = False
+                                _dispatchable_task.successful_execution = False
+                                follow_up_action_failure(ObservationStatus.DATA_RECEIVED)
+                                self._n_replans += 1
+                                self._reschedule_depth += 1
+                                _replan()
+                                self._reschedule_depth -= 1
                             return
 
                         if _dispatchable_task.completed:

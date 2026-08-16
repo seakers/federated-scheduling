@@ -20,7 +20,20 @@ from typing import Callable, Optional
 from dotenv import load_dotenv
 
 from fame_geometry import ObservationPass, Satellite
-from fame_workflow import ConstrainedObservationRequest, TaskTimelineImpact, TaskImpactTime, Impact, Timeline
+from fame_workflow import (
+    ConstrainedObservationRequest, TaskTimelineImpact, TaskImpactTime, Impact,
+    Timeline, opportunity_satisfies_task,
+)
+
+# Booking lead time is a property of the MARKET, so the planner must respect the
+# same rule the constellation enforces: a pass it cannot legally book must not
+# become a decision variable, or the model assigns expected reward to passes
+# that will be refused at submission and ObjVal stops bounding anything
+# realisable.
+try:
+    from fame_constellation_scheduler import BOOKING_LEAD_TIME_H
+except ImportError:
+    BOOKING_LEAD_TIME_H = 0.0
 
 # Load environment variables from .env file
 load_dotenv()
@@ -332,7 +345,7 @@ def ilp_schedule_workflow_stochastic(
         detection_probability_function: Callable = None,   # p_det: prob target present / in footprint (entry-boundary factor). None => 1.0. Only used by "general_logical_dag".
         epsilon: float = 1e-3,
         pwl_tolerance: float = 1e-1,  # SCIP path only; the Gurobi path now uses exact MINLP handling (FuncNonlinear=1)
-        mip_gap: float = 0.02,
+        mip_gap: float = 0.05,
         default_max_instances: int = 3,  # Redundancy cap when a request has no max_num_instances attribute. >1 is REQUIRED for the stochastic planner to hedge.
         solver_engine: str = "GUROBI",
         tax_rate: float = 0.0,  # Cost per scheduled obs as fraction of max quality (dynamic, per-request). Set to 0 to disable.
@@ -486,26 +499,32 @@ def _solve_with_gurobi(
         with gp.Model(model_name, env=env) as model:
 
             # === Solver parameters (single authoritative block) ===
-            # FuncNonlinear=1: exp()/log() general constraints are handled EXACTLY by
-            # Gurobi's global MINLP engine (outer approximation + spatial branching)
-            # instead of a static PWL translation. This is the fix for the large
-            # constraint-violation warnings: PWL error compounds around the DAG through
-            # the log->sum->exp round trip at every task boundary, so approximation
-            # tolerances that look small per-constraint blow up globally. Exactness
-            # here is required; speed is recovered via the real-space cuts added in
-            # _build_log_linearized_formulation.
             model.setParam('TimeLimit', max_solver_time_s)
             model.setParam('MIPGap', mip_gap)
-            # general_logical_dag uses FuncNonlinear=1 (exact MINLP via outer
-            # approximation + spatial branching). The base log_linearized path
-            # relies on cuts/tightening that work best with PWL (FuncNonlinear=0).
+            # general_logical_dag needs exact MINLP handling (outer approximation
+            # + spatial branching): its DSOP chains stack ~45 exp constraints
+            # deep, and PWL error compounds through the log->sum->exp round trip
+            # at every task boundary.
+            #
+            # log_linearized relies on cuts/tightening that work best with PWL,
+            # AND -- with single-parent (chain) workflows -- the node classifier
+            # prunes the log machinery to zero, so most windows build as a PURE
+            # MILP with no nonlinear constraints at all.
             if stochastic_formulation == "general_logical_dag":
                 model.setParam('FuncNonlinear', 1)
+                # model.setParam('FuncPieceError', 1e-2)  # Tighten tolerance (default: 1e-3)
+                # model.setParam('FuncPieces', -2)
             else:
                 model.setParam('FuncNonlinear', 0)
+                model.setParam('FuncPieceError', 1e-2)  # Tighten tolerance (default: 1e-3)
+                model.setParam('FuncPieces', -2)
             model.setParam('Cuts', 1)
             model.setParam('Threads', N_THREADS)
             model.setParam('OutputFlag', 1)
+            # Favour finding good incumbents over proving optimality: a schedule
+            # that is 2% off is worth far more here than a proof.
+            model.setParam('MIPFocus', 1)
+            model.setParam('Heuristics', 0.5)
             if results_dir:
                 model.setParam('LogFile', os.path.join(results_dir, "gurobi_stochastic.log"))
 
@@ -516,12 +535,31 @@ def _solve_with_gurobi(
             # Step 3: Find observation opportunities and create variables
             solution_holder = {}
             task_to_passes = {}
-
+            # Bookings already dispatched in an earlier solve. They are excluded
+            # from the model (no decision left to make) but still consume the
+            # satellite, so their windows must block new variables -- otherwise
+            # this solve re-books an occupied slot and the constellation rejects
+            # it at submission time.
+            committed_bookings = []   # (satellite, obs_start, obs_end)
 
             for constrained_request in workflow_graph.nodes():
                 if (constrained_request.dispatched == True) or (constrained_request.completed == True):
                     if verbose > 0:
                         print(f"[Stochastic Scheduler] Skipping {constrained_request.observation_request.name} (dispatched/completed)")
+                    _bookings = getattr(constrained_request, 'scheduled_bookings', None) or []
+                    if (not _bookings) and getattr(constrained_request, 'observation_opportunity_pass', None) is not None:
+                        _bookings = [{
+                            'satellite': getattr(constrained_request, 'observation_opportunity_satellite', None),
+                            'pass': constrained_request.observation_opportunity_pass,
+                        }]
+                    for _b in _bookings:
+                        _sp = _b.get('pass')
+                        _bsat = _b.get('satellite')
+                        if _sp is None or _bsat is None:
+                            continue
+                        committed_bookings.append((
+                            _bsat, _sp.highest.time,
+                            _sp.highest.time + _sp.highest.duration))
                     continue
 
                 # Find observation opportunities
@@ -567,44 +605,55 @@ def _solve_with_gurobi(
                     for satellite, satpasses in passes.items()
                     for satpass in satpasses
                 ]
-                allsatpasses.sort(key=lambda x: x[2], reverse=True)  # Sort by quality
+                # Sort by quality DESCENDING. This is load-bearing: the
+                # diminishing recurrence credits the FIRST success in this order,
+                # so descending quality == best-of-N crediting rather than
+                # first-in-time.
+                allsatpasses.sort(key=lambda x: x[2], reverse=True)
 
                 solution_holder[constrained_request] = {}
                 task_to_passes[constrained_request] = []
 
                 for (satellite, satpass, _quality) in allsatpasses:
-                    if feasibility_screener(satellite, satpass):
+                    # Inside the lead-time window this pass cannot be booked, so
+                    # it must not become a variable.
+                    if BOOKING_LEAD_TIME_H > 0 and current_time is not None:
+                        if ((satpass.highest.time - current_time).total_seconds() / 3600.0
+                                < BOOKING_LEAD_TIME_H):
+                            continue
+                    if (feasibility_screener(satellite, satpass)
+                            and opportunity_satisfies_task(
+                                constrained_request, satellite, satpass)):
                         _found_a_pass = True
 
                         if satellite not in solution_holder[constrained_request].keys():
                             solution_holder[constrained_request][satellite] = {}
 
-                        # Binary decision variable: schedule this pass?
                         var_name = f"x_{constrained_request.observation_request.name}_{satellite.name}_{satpass.highest.time}"
                         x_var = model.addVar(vtype=GRB.BINARY, name=var_name)
 
                         # Compute two-stage probabilities
                         if acceptance_probability_function is not None and execution_probability_function is not None:
-                            # New two-stage model
                             p_acc = acceptance_probability_function(constrained_request, satellite, satpass)
                             p_exec = execution_probability_function(constrained_request, satellite, satpass)
                             p_total = p_acc * p_exec
                         else:
-                            # Fallback to legacy single-stage model
                             p_total = success_probability_function(constrained_request, satellite, satpass)
-                            p_acc = p_total  # Assume all uncertainty is in acceptance
+                            p_acc = p_total
                             p_exec = 1.0
 
-                        # NOTE: probabilities are used at full precision. Coefficient
-                        # rounding was considered and rejected: distinct objective
-                        # coefficients are normal and do not harm MILP structure.
-
+                        # NOTE: p_det is deliberately NOT folded into theta. It is
+                        # SHARED across a task's redundant passes (they all aim at
+                        # the same point, so if the target is absent they ALL
+                        # miss), whereas acceptance and execution fail
+                        # independently. p_det enters at the entry boundary
+                        # Y_0 = p_det * A_parents inside the formulation builder.
                         solution_holder[constrained_request][satellite][satpass] = {
                             'x': x_var,
                             'quality': _quality,
-                            'theta': p_total,      # End-to-end success probability
-                            'theta_acc': p_acc,    # Acceptance probability
-                            'theta_exec': p_exec   # Execution probability
+                            'theta': p_total,      # p_acc * p_exec
+                            'theta_acc': p_acc,
+                            'theta_exec': p_exec
                         }
 
                         task_to_passes[constrained_request].append((satellite, satpass))
@@ -627,7 +676,13 @@ def _solve_with_gurobi(
                 _build_log_linearized_formulation(
                     model, workflow_graph, solution_holder, task_to_passes,
                     epsilon, pwl_tolerance, tax_rate, submission_cost_rate, execution_cost_rate, verbose,
-                    execution_cost_fn=execution_cost_fn, current_time=current_time
+                    execution_cost_fn=execution_cost_fn, current_time=current_time,
+                    default_max_instances=default_max_instances,
+                    # p_det entry boundary. Without this the function defaults to
+                    # None -> 1.0 and the whole detection model is silently inert
+                    # (the log then reads "p_det inactive (all 1.0)" even though
+                    # the tasks carry real detection_prob values).
+                    detection_probability_function=detection_probability_function
                 )
             elif stochastic_formulation == "general_logical_dag":
                 _general_logical_warm_start_fn = _build_general_logical_formulation(
@@ -640,17 +695,15 @@ def _solve_with_gurobi(
             else:
                 raise ValueError(f"Unknown stochastic_formulation: {stochastic_formulation}")
 
-            # Step 5: Add constraints (temporal, timeline, etc.)
-            # NOTE: Only add constraints for tasks that are actually in solution_holder
-            # (tasks without passes are marked infeasible and excluded)
+            # Step 5: Add constraints (temporal, timeline, branch exclusivity, ...)
             _add_workflow_constraints(
                 model, workflow_graph, solution_holder, verbose,
-                default_max_instances=default_max_instances
+                default_max_instances=default_max_instances,
+                committed_bookings=committed_bookings
             )
 
             # Step 6: Solve
-            # CRITICAL: Must call model.update() before NumVars/NumConstrs return accurate counts
-            # Otherwise Gurobi's lazy variable tracking reports 0 even when vars have been added
+            # CRITICAL: model.update() before NumVars/NumConstrs are accurate.
             model.update()
 
             if verbose > 0:
@@ -662,37 +715,29 @@ def _solve_with_gurobi(
                     f"constrs={model.NumConstrs} genconstrs={model.NumGenConstrs} "
                     f"(logs={sum(1 for gc in model.getGenConstrs() if gc.GenConstrType == GRB.GENCONSTR_LOG)})")
 
-           # === MIP STARTS ===
-            # Two starts are supplied. Gurobi tries each and keeps whichever
-            # produces an incumbent.
+            # === MIP STARTS ===
+            # Two starts; Gurobi keeps whichever produces an incumbent.
+            #   0: temporal-aware greedy -- best-quality non-overlapping pass per
+            #      task, walked in DAG order so a child is only placed against an
+            #      already-placed parent.
+            #   1: mandatory-only fallback -- one pass per mandatory task, zeros
+            #      elsewhere. Trivially satisfies the recurrence (unbooked tasks
+            #      collapse to y=1, S=0) and is the safety net when 0 is rejected.
             #
-            #   Start 0: temporal-aware greedy -- best-quality non-overlapping
-            #            pass per task, walked in DAG order so a child is only
-            #            placed against an already-placed parent.
-            #   Start 1: mandatory-only fallback -- one pass per mandatory task,
-            #            zero elsewhere. Trivially satisfies the recurrence
-            #            (unbooked tasks collapse to y=1, S=0) and is the safety
-            #            net when the greedy start is rejected.
-            #
-            # The previous single greedy start ignored the pairwise TEMPORAL
+            # The original single greedy start ignored the pairwise TEMPORAL
             # exclusions and ordered tasks by quality rather than topologically,
-            # so it violated a constraint on essentially every solve ("User MIP
-            # start violates constraint R#### by 1.0"). Gurobi attempts repair
-            # but was not succeeding, leaving hard solves with NO incumbent --
-            # which is how a 120s run ends with a negative best objective, or
-            # none at all.
+            # so it violated a constraint on essentially every solve and left hard
+            # solves with NO incumbent.
             from fame_workflow import ConstraintClass, TemporalConstraintType
 
             def _temporal_ok(_child, _t_child, _placed_times):
-                """True if t_child satisfies every TEMPORAL relation to placed parents."""
                 if workflow_graph is None or _child not in workflow_graph:
                     return True
                 for _parent in workflow_graph.predecessors(_child):
                     _t_parent = _placed_times.get(_parent)
                     if _t_parent is None:
-                        continue    # parent unplaced -> relation is vacuous here
-                    _edges = workflow_graph.get_edge_data(_parent, _child) or {}
-                    for _k, _c in _edges.items():
+                        continue
+                    for _k, _c in (workflow_graph.get_edge_data(_parent, _child) or {}).items():
                         if _c.get('constraint_class') != ConstraintClass.TEMPORAL:
                             continue
                         _off = (_c.get('parameters') or {}).get('offset', dt.timedelta(0))
@@ -711,16 +756,9 @@ def _solve_with_gurobi(
                 return all(_e0 <= s or _s0 >= e for (s, e) in _busy.get(_sat, []))
 
             def _build_start(mandatory_only: bool):
-                """Return ({(req,sat,sp): 0/1}, ok) for one start vector."""
-                _busy = {}
-                _placed_times = {}
-                _x_vals = {}
-                _ok = True
-
-                # DAG order so parents are placed before their children.
+                _busy, _placed_times, _x_vals, _ok = {}, {}, {}, True
                 try:
-                    _order = [r for r in nx.topological_sort(workflow_graph)
-                              if r in solution_holder]
+                    _order = [r for r in nx.topological_sort(workflow_graph) if r in solution_holder]
                     _order += [r for r in solution_holder if r not in set(_order)]
                 except Exception:
                     _order = list(solution_holder.keys())
@@ -731,12 +769,8 @@ def _solve_with_gurobi(
                         _x_vals[(_req, _sat, _sp)] = 0.0
                     if mandatory_only and not getattr(_req, 'is_mandatory', False):
                         continue
-
-                    # Best-quality compatible pass, respecting satellite
-                    # occupancy and the temporal relations to placed parents.
-                    _cands = sorted(
-                        _passes,
-                        key=lambda sp_: -solution_holder[_req][sp_[0]][sp_[1]]['quality'])
+                    _cands = sorted(_passes,
+                                    key=lambda sp_: -solution_holder[_req][sp_[0]][sp_[1]]['quality'])
                     _placed = False
                     for _sat, _sp in _cands:
                         _s0 = _sp.highest.time
@@ -750,10 +784,7 @@ def _solve_with_gurobi(
                         _placed_times[_req] = _s0
                         _placed = True
                         break
-
                     if (not _placed) and getattr(_req, 'is_mandatory', False) and _passes:
-                        # A mandatory task with no compatible pass makes this
-                        # start infeasible; report rather than submit garbage.
                         _ok = False
                 return _x_vals, _ok
 
@@ -772,11 +803,15 @@ def _solve_with_gurobi(
                         model.params.StartNumber = _i
                         for (_req, _sat, _sp), _v in _xv.items():
                             solution_holder[_req][_sat][_sp]['x'].Start = _v
-                        # Propagate the binary assignment through the continuous
-                        # chain so the start is complete, not just the binaries.
-                        if _general_logical_warm_start_fn is not None:
+                        # Propagate the continuous chain ONLY under PWL. With
+                        # FuncNonlinear=1 the numerical forward pass cannot satisfy
+                        # the exact exp/log constraints to tolerance, and a single
+                        # violated value invalidates the whole start -- binaries
+                        # alone let Gurobi solve the continuous completion itself.
+                        if (_general_logical_warm_start_fn is not None
+                                and stochastic_formulation != "general_logical_dag"):
                             _general_logical_warm_start_fn(_xv)
-                    model.params.StartNumber = -1   # back to "all starts"
+                    model.params.StartNumber = -1
                     if verbose > 0:
                         print(f"[Stochastic Scheduler] MIP starts: "
                               f"{', '.join(l for l, _ in _starts)}")
@@ -786,17 +821,14 @@ def _solve_with_gurobi(
             except Exception as _e:
                 if verbose > 0:
                     print(f"[Stochastic Scheduler] MIP start skipped: {_e}")
+
             # Skip optimization if there are no variables (nothing to schedule)
             if model.NumVars == 0:
                 if verbose > 0:
                     print("[Stochastic Scheduler] No pending tasks to schedule. Skipping optimization.")
-                # Mark model as optimal with 0 objective for consistency
                 workflow_graph.graph['objective_value'] = 0.0
-                workflow_graph.graph['solve_time_s'] = 0.0
-                workflow_graph.graph['mip_gap'] = 0.0
             else:
                 model.optimize()
-                # Store solver diagnostics for planning-session metrics
                 try:
                     workflow_graph.graph['solve_time_s'] = model.Runtime
                 except Exception:
@@ -807,45 +839,48 @@ def _solve_with_gurobi(
                     workflow_graph.graph['mip_gap'] = float('nan')
 
             # Step 7: Extract solution
-            if model.NumVars > 0:  # Only extract if we actually solved something
+            if model.NumVars > 0:
                 if model.Status == GRB.OPTIMAL:
                     if verbose > 0:
                         print(f"[Stochastic Scheduler] Optimal solution found! Objective value: {model.ObjVal:.2f}")
-                        print(f"[Stochastic Scheduler] (Reward - tax_rate={tax_rate}*max_quality_per_request*NumScheduled)")
 
                     _extract_solution(
                         model, workflow_graph, solution_holder, verbose, timeline_graph,
                         task_to_passes=task_to_passes
                     )
-
-                    # Store objective value on workflow graph for later analysis
                     workflow_graph.graph['objective_value'] = model.ObjVal
+
                 elif model.Status in [GRB.TIME_LIMIT, GRB.SOLUTION_LIMIT, GRB.INTERRUPTED]:
-                    # Solver hit time limit but may have found a feasible solution
-                    if model.SolCount > 0:  # At least one feasible solution found
+                    if model.SolCount > 0:
                         if verbose > 0:
                             print(f"[Stochastic Scheduler] Time limit reached, but feasible solution found! Objective: {model.ObjVal:.2f}")
                             print(f"[Stochastic Scheduler] Current MIP Gap: {model.MIPGap * 100:.2f}% (Best Bound: {model.ObjBound:.2f})")
-                            print(f"[Stochastic Scheduler] (Not proven optimal, but using best solution found)")
+                            if model.MIPGap > 0.20:
+                                print("[Stochastic Scheduler] WARNING: gap > 20% -- ObjVal is NOT a "
+                                      "trustworthy planning value; do not compare it against realized utility.")
 
                         _extract_solution(
                             model, workflow_graph, solution_holder, verbose, timeline_graph,
                             task_to_passes=task_to_passes
                         )
-
                         workflow_graph.graph['objective_value'] = model.ObjVal
                     else:
                         if verbose > 0:
-                            print(f"[Stochastic Scheduler] Time limit reached with no feasible solution found")
+                            print("[Stochastic Scheduler] Time limit reached with no feasible solution found")
+                        # SolCount == 0 after a full time limit usually means
+                        # infeasibility, not difficulty: booking one pass per
+                        # mandatory task and nothing else satisfies the recurrence,
+                        # so if Gurobi found NO incumbent something is structurally
+                        # blocking it. Probe with a bounded re-solve.
                         if verbose > 1:
                             print("[Stochastic Scheduler] Probing feasibility (bounded)...")
-                            model.setParam('TimeLimit', 10)
+                            model.setParam('TimeLimit', 120)
                             model.setParam('SolutionLimit', 1)
                             model.optimize()
                             if model.Status == GRB.INFEASIBLE:
                                 print("[Stochastic Scheduler] INFEASIBLE. Computing IIS...")
-                                model.setParam('IISMethod', 1)   # heuristic, much faster
                                 try:
+                                    model.setParam('IISMethod', 1)   # heuristic: far faster
                                     model.computeIIS()
                                     _ilp = os.path.join(results_dir, "infeasible_model.ilp") if results_dir else "infeasible_model.ilp"
                                     model.write(_ilp)
@@ -859,21 +894,21 @@ def _solve_with_gurobi(
                                 except Exception as _e:
                                     print(f"[Stochastic Scheduler] IIS failed: {_e}")
                             elif model.SolCount > 0:
-                                print("[Stochastic Scheduler] Feasible after all -- 70s was just "
-                                      "too short to find an incumbent.")
+                                print("[Stochastic Scheduler] Feasible after all -- the time limit "
+                                      "was simply too short to find an incumbent.")
                             else:
-                                print(f"[Stochastic Scheduler] Still undetermined (status {model.Status}) "
-                                      f"after the probe. Use the LP-relaxation test instead.")
+                                print(f"[Stochastic Scheduler] Still undetermined (status {model.Status}).")
+
                 elif model.Status == GRB.INFEASIBLE:
                     if verbose > 0:
-                        print(f"[Stochastic Scheduler] Model is infeasible (no valid schedule found)")
+                        print("[Stochastic Scheduler] Model is infeasible (no valid schedule found)")
                     if verbose > 2:
-                        print(f"[Stochastic Scheduler] Computing IIS to diagnose infeasibility...")
                         try:
+                            model.setParam('IISMethod', 1)
                             model.computeIIS()
                             model.write("infeasible_model.ilp")
-                            print(f"[Stochastic Scheduler] IIS written to infeasible_model.ilp")
-                        except:
+                            print("[Stochastic Scheduler] IIS written to infeasible_model.ilp")
+                        except Exception:
                             pass
                 else:
                     if verbose > 0:
@@ -1008,7 +1043,15 @@ def _solve_with_scip(
         task_to_passes[constrained_request] = []
 
         for (satellite, satpass, _quality) in allsatpasses:
-            if feasibility_screener(satellite, satpass):
+            # See the note in _solve_with_gurobi: the planner respects the same
+            # lead-time rule the constellation enforces.
+            if BOOKING_LEAD_TIME_H > 0 and current_time is not None:
+                if ((satpass.highest.time - current_time).total_seconds() / 3600.0
+                        < BOOKING_LEAD_TIME_H):
+                    continue
+            if (feasibility_screener(satellite, satpass)
+                    and opportunity_satisfies_task(
+                        constrained_request, satellite, satpass)):
                 _found_a_pass = True
 
                 if satellite not in solution_holder[constrained_request].keys():
@@ -1258,7 +1301,7 @@ def _manual_pwl_log(solver, x_var, result_var, epsilon=1e-5, num_segments=5):
     # Sum of lambdas = 1
     solver.Add(sum(lambda_vars) == 1)
 
-    # Exactly one segment is active
+    # Exactly one segment is
     solver.Add(sum(z_vars) == 1)
 
     # === SOS2 CONSTRAINTS ===
@@ -2095,6 +2138,29 @@ def _build_general_logical_formulation(
 
     # Helper: two-sided protected logs of a local-success source (var or const).
     def _emit_logs(node, name, s_source):
+        # A CONSTANT source (an already-resolved task) pins S_prot to an ENDPOINT
+        # of the contracted domain: realized=1 -> S_prot = 1-eps, realized=0 ->
+        # S_prot = eps. At those points ln_S and ln_F sit EXACTLY on their own
+        # variable bounds -- zero slack -- while addGenConstrLog is satisfied only
+        # to within FuncPieceError. Presolve fixes the variables, evaluates the
+        # curve, lands outside the bounds, and the model is infeasible before a
+        # single simplex iteration. Every resolved literal is a landmine, and they
+        # accumulate as the run proceeds, which is why this fires mid-simulation
+        # rather than at the first solve.
+        #
+        # The two logs are KNOWN NUMBERS here. Fix them; emit no curve. This also
+        # removes two gen-constraints per settled node, which is most of them late
+        # in a run.
+        if isinstance(s_source, (int, float)):
+            sv = min(1.0 - epsilon,
+                     max(epsilon, float(s_source) * (1.0 - 2.0 * epsilon) + epsilon))
+            ln_s_v, ln_f_v = math.log(sv), math.log(1.0 - sv)
+            ln_S[node] = model.addVar(lb=ln_s_v, ub=ln_s_v,
+                                      vtype=GRB.CONTINUOUS, name=f"ln_S_{name}")
+            ln_F[node] = model.addVar(lb=ln_f_v, ub=ln_f_v,
+                                      vtype=GRB.CONTINUOUS, name=f"ln_F_{name}")
+            return
+
         s_prot = model.addVar(lb=epsilon, ub=1.0 - epsilon,
                               vtype=GRB.CONTINUOUS, name=f"S_prot_{name}")
         model.addConstr(s_prot == s_source * (1.0 - 2.0 * epsilon) + epsilon,
@@ -2281,7 +2347,16 @@ def _build_general_logical_formulation(
             objective_terms.append(-c_exec_k * theta_acc * x_var)
             if c_tax:
                 objective_terms.append(-c_tax * x_var)
-
+    model.update()
+    for node in ordered_nodes:
+        if is_logic[node]:
+            continue
+        _nm = _node_name(node)
+        _pd = _p_det_for(node)
+        _apub = A_parents[node].UB if node in A_parents else None
+        _np = len(task_to_passes.get(node, []))
+        print(f"[GL-DBG] {_nm:34s} p_det={_pd:.3f} passes={_np:2d} "
+              f"A_parents.ub={_apub}")
     model.setObjective(gp.quicksum(objective_terms), GRB.MAXIMIZE)
 
     # === Return a warm-start closure ==========================================
@@ -2706,7 +2781,7 @@ def _build_log_linearized_formulation(
             name=f"e2e_{req_name}")
 
         # Union-bound cut, scaled by pi_r.
-        if K_r > 0:
+        if K_r > 0 and (pi_r * A_par_ub[constrained_request]) >= 1e-9:
             model.addConstr(
                 end_to_end_success[constrained_request]
                 <= pi_r * A_par_ub[constrained_request] * gp.quicksum(
@@ -2716,7 +2791,8 @@ def _build_log_linearized_formulation(
                 name=f"cut_union_{req_name}")
 
         # DRAIN CUT: no integer solution can exceed pi_r * (top-M union prob).
-        if tighten_bounds and K_r > 0 and (pi_r * lmax_ub[constrained_request]) < 1.0:
+        if (tighten_bounds and K_r > 0
+                and 1e-9 <= (pi_r * lmax_ub[constrained_request]) < 1.0):
             model.addConstr(
                 end_to_end_success[constrained_request]
                 <= pi_r * lmax_ub[constrained_request]
@@ -2724,7 +2800,20 @@ def _build_log_linearized_formulation(
                 name=f"cut_drain_{req_name}")
 
         # REWARD / SURVIVAL / QUALITY-PROBABILITY ENVELOPE CUTS, all scaled by pi_r.
-        if reward_envelope_cuts and tighten_bounds and K_r > 0:
+        # Envelope cuts are SKIPPED when their scale is numerically meaningless.
+        # _base = A_par_ub * pi_r can reach ~1e-11 when a small p_det multiplies a
+        # small ancestor product; coefficients that size pollute the constraint
+        # matrix (observed range [5e-11, 1e+02]) and Gurobi treats those rows as
+        # noise -- which is also why the IIS came back "non-minimal" with
+        # "Numerical troubles encountered".  Dropping them costs only bound
+        # tightness on tasks that are worth ~nothing anyway.
+        _base_scale = A_par_ub[constrained_request] * pi_r
+        _cuts_ok = _base_scale >= 1e-6
+        if reward_envelope_cuts and tighten_bounds and K_r > 0 and not _cuts_ok and verbose > 1:
+            print(f"  [Log-Linearized] envelope cuts skipped for {req_name} "
+                  f"(scale {_base_scale:.2e} below 1e-6)")
+
+        if reward_envelope_cuts and tighten_bounds and K_r > 0 and _cuts_ok:
             _thetas_desc = sorted(
                 (solution_holder[constrained_request][sat][sp]['theta'] for (sat, sp) in passes),
                 reverse=True)
@@ -3312,31 +3401,36 @@ def _add_workflow_constraints(
         workflow_graph: nx.MultiDiGraph,
         solution_holder: dict,
         verbose: int,
-        default_max_instances: int = 3
+        default_max_instances: int = 3,
+        committed_bookings=None,
+        slew_margin: dt.timedelta = dt.timedelta(0)
 ):
     """
-    Add temporal, success, and timeline constraints from workflow graph.
+    Add instance caps, mandatory coverage, satellite conflicts, temporal
+    relations, committed-booking exclusion, and branch exclusivity.
 
     Constraints:
     - At most max_num_instances per task (defaulting to `default_max_instances`
       when the request does not specify one -- MUST be > 1 for the stochastic
-      planner to be able to book redundant passes, which is the entire
-      mechanism the stochastic formulation exists to price)
-    - No overlapping observations on same satellite
-    - Temporal constraints (START_AFTER, START_BEFORE, etc.)
-    - Success constraints (conditional execution)
-    - Timeline resource constraints
+      planner to book redundant passes, which is the entire mechanism the
+      stochastic formulation exists to price)
+    - Mandatory tasks book at least one pass
+    - No overlapping observations on the same satellite
+    - Committed bookings (already dispatched) block colliding variables
+    - Temporal relations, EXISTENTIALLY (see below)
+    - BRANCH EXCLUSIVITY between the imaging and search arms of a window
     """
 
     from fame_workflow import ConstraintClass, TemporalConstraintType, SuccessConstraintType
+    import re
+
+    committed_bookings = committed_bookings or []
 
     # === MAX INSTANCES CONSTRAINT ===
     for constrained_request in solution_holder.keys():
-        x_vars = []
-        for satellite in solution_holder[constrained_request].keys():
-            for satpass in solution_holder[constrained_request][satellite].keys():
-                x_vars.append(solution_holder[constrained_request][satellite][satpass]['x'])
-
+        x_vars = [solution_holder[constrained_request][sat][sp]['x']
+                  for sat in solution_holder[constrained_request]
+                  for sp in solution_holder[constrained_request][sat]]
         if len(x_vars) > 0:
             max_instances = _effective_max_instances(constrained_request, default_max_instances)
             model.addConstr(
@@ -3347,11 +3441,9 @@ def _add_workflow_constraints(
     # === MANDATORY TASK CONSTRAINT ===
     for constrained_request in solution_holder.keys():
         if constrained_request.is_mandatory:
-            x_vars = []
-            for satellite in solution_holder[constrained_request].keys():
-                for satpass in solution_holder[constrained_request][satellite].keys():
-                    x_vars.append(solution_holder[constrained_request][satellite][satpass]['x'])
-
+            x_vars = [solution_holder[constrained_request][sat][sp]['x']
+                      for sat in solution_holder[constrained_request]
+                      for sp in solution_holder[constrained_request][sat]]
             if len(x_vars) > 0:
                 model.addConstr(
                     gp.quicksum(x_vars) >= 1,
@@ -3359,13 +3451,10 @@ def _add_workflow_constraints(
                 )
 
     # === SATELLITE CONFLICT CONSTRAINTS ===
-    # Group passes by satellite
     solution_holder_by_satellite = {}
     for constrained_request in solution_holder.keys():
         for satellite in solution_holder[constrained_request].keys():
-            if satellite not in solution_holder_by_satellite:
-                solution_holder_by_satellite[satellite] = []
-
+            solution_holder_by_satellite.setdefault(satellite, [])
             for satpass in solution_holder[constrained_request][satellite].keys():
                 solution_holder_by_satellite[satellite].append((
                     satpass,
@@ -3373,13 +3462,12 @@ def _add_workflow_constraints(
                     constrained_request
                 ))
 
-    # For each satellite, prevent overlapping passes
     for satellite in solution_holder_by_satellite.keys():
         passes = solution_holder_by_satellite[satellite]
-        passes.sort(key=lambda x: x[0].highest.time)  # Sort by time
+        passes.sort(key=lambda x: x[0].highest.time)
 
-        # Track the max end time seen up to index i so the inner loop can break
-        # correctly even when passes from different tasks have non-monotonic end times.
+        # Max end time seen up to index i, so the inner loop breaks correctly
+        # even when passes from different tasks have non-monotonic end times.
         max_end_so_far = {}
         running_max = passes[0][0].highest.time + passes[0][0].highest.duration if passes else None
         for i, (p, _, _r) in enumerate(passes):
@@ -3390,64 +3478,170 @@ def _add_workflow_constraints(
             pass_i, x_i, req_i = passes[i]
             for j in range(i + 1, len(passes)):
                 pass_j, x_j, req_j = passes[j]
-                if pass_j.highest.time >= max_end_so_far[i]:
+                if pass_j.highest.time >= max_end_so_far[i] + slew_margin:
                     break
                 end_i = pass_i.highest.time + pass_i.highest.duration
                 start_j = pass_j.highest.time
-                if start_j < end_i:
-                    model.addConstr(
-                        x_i + x_j <= 1,
-                        name=f"conflict_{satellite.name}_{i}_{j}"
-                    )
+                if start_j < end_i + slew_margin:
+                    model.addConstr(x_i + x_j <= 1,
+                                    name=f"conflict_{satellite.name}_{i}_{j}")
 
-    # === TEMPORAL CONSTRAINTS ===
+    # === COMMITTED-BOOKING EXCLUSION ===
+    # Variables colliding with an already-dispatched booking on the same
+    # satellite are fixed to zero. ub=0 rather than deletion keeps
+    # solution_holder / task_to_passes structurally intact for _extract_solution
+    # and the MIP starts; presolve removes them anyway. Without this the model
+    # assigns expected reward to passes that can never be flown, so ObjVal stops
+    # being an upper bound on anything realizable.
+    if committed_bookings:
+        _n_blocked = 0
+        for constrained_request in solution_holder.keys():
+            for satellite in solution_holder[constrained_request].keys():
+                for satpass, entry in solution_holder[constrained_request][satellite].items():
+                    s = satpass.highest.time
+                    e = s + satpass.highest.duration
+                    for (c_sat, c_s, c_e) in committed_bookings:
+                        if c_sat is not satellite:
+                            continue
+                        if s < c_e + slew_margin and c_s < e + slew_margin:
+                            entry['x'].ub = 0.0
+                            _n_blocked += 1
+                            break
+        if verbose > 0 and _n_blocked:
+            print(f"  [Constraints] Blocked {_n_blocked} pass variable(s) colliding with "
+                  f"{len(committed_bookings)} committed booking(s)")
+
+    # === TEMPORAL CONSTRAINTS (EXISTENTIAL) ===
+    # The old pairwise form (x_child + x_parent <= 1 for each violating pair)
+    # required EVERY selected parent pass to satisfy the offset, so with K
+    # redundant parent passes the child's admissible window shrank to
+    # [max_p t_p + h, min_p t_p + h + delta] -- the offset window MINUS the
+    # parent spread -- and could go empty. That charges redundancy a downstream
+    # feasibility cost the objective never sees, and only the stochastic planner
+    # books redundantly, so only it pays.
+    #
+    # The child needs ONE compatible parent, not all of them:
+    #     x_child <= sum over temporally-compatible parent passes of x_parent
+    #
+    # All relations on an edge are tested JOINTLY -- a parent satisfying
+    # START_AFTER while a different parent satisfies START_BEFORE is not a
+    # feasible anchor.
+    #
+    # This is the planning-time relaxation; the exact anchor is resolved after
+    # the fact by the GEOMETRY re-anchor collapsing the child window onto the
+    # realised parent time, followed by a replan.
     for constrained_request in solution_holder.keys():
         for parent_request in workflow_graph.predecessors(constrained_request):
+
+            inedges = workflow_graph.get_edge_data(parent_request, constrained_request) or {}
+            temporal = []
+            for _key, constraint in inedges.items():
+                if constraint.get('constraint_class') != ConstraintClass.TEMPORAL:
+                    continue
+                temporal.append((
+                    constraint['constraint_type'],
+                    (constraint.get('parameters') or {}).get('offset', dt.timedelta(0)),
+                ))
+            if not temporal:
+                continue
+
+            def _compatible(t_parent, t_child, _temporal=temporal):
+                for ctype, off in _temporal:
+                    if ctype == TemporalConstraintType.START_AFTER and t_parent > t_child:
+                        return False
+                    if ctype == TemporalConstraintType.START_AFTER_OFFSET and t_parent + off > t_child:
+                        return False
+                    if ctype == TemporalConstraintType.START_BEFORE and t_parent < t_child:
+                        return False
+                    if ctype == TemporalConstraintType.START_BEFORE_OFFSET and t_parent + off < t_child:
+                        return False
+                return True
+
+            # --- Parent already dispatched: its pass time is REALISED, so this
+            # is a constant test rather than a pairwise one. Previously the whole
+            # edge was skipped here, which left follow-up timing completely
+            # unconstrained on every solve after the first.
             if parent_request not in solution_holder:
-                if verbose > 2:
-                    print(f"  [Constraints] Skipping parent {parent_request.observation_request.name} -> {constrained_request.observation_request.name} (parent not in solution_holder)")
-                continue  # Parent not in solution holder (no passes or already dispatched)
+                _oo = getattr(parent_request, 'observation_opportunity', None)
+                _t_parent = getattr(_oo, 'time', None)
+                if _t_parent is None:
+                    _op = getattr(parent_request, 'observation_opportunity_pass', None)
+                    _t_parent = getattr(getattr(_op, 'highest', None), 'time', None)
+                if _t_parent is None:
+                    if verbose > 2:
+                        print(f"  [Constraints] {parent_request.observation_request.name} -> "
+                              f"{constrained_request.observation_request.name}: dispatched parent "
+                              f"with no realised time; edge left unconstrained")
+                    continue
+                _n_fixed = 0
+                for _sat in solution_holder[constrained_request]:
+                    for _sp, _entry in solution_holder[constrained_request][_sat].items():
+                        if not _compatible(_t_parent, _sp.highest.time):
+                            _entry['x'].ub = 0.0
+                            _n_fixed += 1
+                if verbose > 2 and _n_fixed:
+                    print(f"  [Constraints] {constrained_request.observation_request.name}: "
+                          f"{_n_fixed} pass(es) excluded by realised parent time {_t_parent}")
+                continue
 
-            inedges = workflow_graph.get_edge_data(parent_request, constrained_request)
+            # --- Parent still schedulable: existential over its candidate passes.
+            _n_blocked = 0
+            for child_sat in solution_holder[constrained_request]:
+                for child_pass, child_entry in solution_holder[constrained_request][child_sat].items():
+                    x_child = child_entry['x']
+                    t_child = child_pass.highest.time
+                    compatible_parents = [
+                        solution_holder[parent_request][psat][ppass]['x']
+                        for psat in solution_holder[parent_request]
+                        for ppass in solution_holder[parent_request][psat]
+                        if _compatible(ppass.highest.time, t_child)
+                    ]
+                    if not compatible_parents:
+                        x_child.ub = 0.0
+                        _n_blocked += 1
+                    else:
+                        model.addConstr(
+                            x_child <= gp.quicksum(compatible_parents),
+                            name=f"temporal_{constrained_request.observation_request.name}"
+                                 f"_{child_sat.name}_{t_child:%H%M%S}"
+                        )
+            if verbose > 2 and _n_blocked:
+                print(f"  [Constraints] {constrained_request.observation_request.name}: "
+                      f"{_n_blocked} pass(es) have no compatible parent pass")
+    # === NO BRANCH EXCLUSIVITY UNDER general_logical_dag ===
+    # The gates already encode the branch: imaging is gated on Lit(K_w), search
+    # on Not(Lit(K_w)), so the DSOP compilation zeroes whichever arm the belief
+    # state rules out. Forcing sum(x_img) <= M*z and sum(x_srch) <= M*(1-z) on
+    # top of that ALSO forbids booking a search while tracked -- which is exactly
+    # the option-value play the general formulation exists to price. A successful
+    # search restores K, unlocking imaging in every later window, and that is
+    # worth an order of magnitude more than a search's direct reward.
+    # _by_window = {}
+    # for _req in solution_holder:
+    #     _nm = getattr(getattr(_req, 'observation_request', _req), 'name', '')
+    #     _m = re.search(r'Follow-up (imaging|search) (\d+)', _nm)
+    #     if _m:
+    #         _by_window.setdefault(int(_m.group(2)),
+    #                               {'imaging': [], 'search': []})[_m.group(1)].append(_req)
 
-            for constraint_key, constraint in inedges.items():
-                if constraint['constraint_class'] == ConstraintClass.TEMPORAL:
-                    constraint_type = constraint['constraint_type']
-
-                    # Get offset if present
-                    offset = dt.timedelta(0)
-                    if 'parameters' in constraint and 'offset' in constraint['parameters']:
-                        offset = constraint['parameters']['offset']
-
-                    # Iterate over child passes
-                    for child_sat in solution_holder[constrained_request].keys():
-                        for child_pass in solution_holder[constrained_request][child_sat].keys():
-                            x_child = solution_holder[constrained_request][child_sat][child_pass]['x']
-
-                            # Iterate over parent passes
-                            for parent_sat in solution_holder[parent_request].keys():
-                                for parent_pass in solution_holder[parent_request][parent_sat].keys():
-                                    x_parent = solution_holder[parent_request][parent_sat][parent_pass]['x']
-
-                                    if constraint_type == TemporalConstraintType.START_AFTER:
-                                        # Child must start after parent
-                                        if parent_pass.highest.time > child_pass.highest.time:
-                                            model.addConstr(x_child + x_parent <= 1)
-
-                                    elif constraint_type == TemporalConstraintType.START_AFTER_OFFSET:
-                                        # Child must start after parent + offset
-                                        if parent_pass.highest.time + offset > child_pass.highest.time:
-                                            model.addConstr(x_child + x_parent <= 1)
-
-                                    elif constraint_type == TemporalConstraintType.START_BEFORE:
-                                        # Child must start before parent
-                                        if parent_pass.highest.time < child_pass.highest.time:
-                                            model.addConstr(x_child + x_parent <= 1)
-
-                                    elif constraint_type == TemporalConstraintType.START_BEFORE_OFFSET:
-                                        # Child must start before parent + offset
-                                        if parent_pass.highest.time + offset < child_pass.highest.time:
-                                            model.addConstr(x_child + x_parent <= 1)
+    # _n_branch = 0
+    # for _w in sorted(_by_window):
+    #     _arms = _by_window[_w]
+    #     _img_x = [solution_holder[r][s][p]['x'] for r in _arms['imaging']
+    #               for s in solution_holder[r] for p in solution_holder[r][s]]
+    #     _srch_x = [solution_holder[r][s][p]['x'] for r in _arms['search']
+    #                for s in solution_holder[r] for p in solution_holder[r][s]]
+    #     if not _img_x or not _srch_x:
+    #         continue   # only one arm is live this solve -- nothing to exclude
+    #     _z = model.addVar(vtype=GRB.BINARY, name=f"branch_w{_w}")
+    #     model.addConstr(gp.quicksum(_img_x) <= len(_img_x) * _z,
+    #                     name=f"branch_img_w{_w}")
+    #     model.addConstr(gp.quicksum(_srch_x) <= len(_srch_x) * (1 - _z),
+    #                     name=f"branch_srch_w{_w}")
+    #     _n_branch += 1
+    # if verbose > 0 and _n_branch:
+    #     print(f"  [Constraints] Branch exclusivity on {_n_branch} window(s) "
+    #           f"(imaging XOR search)")
 
 
 def _extract_solution(

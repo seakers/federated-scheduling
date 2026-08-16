@@ -34,6 +34,7 @@ class ObservationStatus(Enum):
     CONSTELLATION_REJECTED = 8  # Constellation manager rejected broker request
     CANCELLED = 9               # Broker cancelled pass after a better/sufficient pass succeeded
     EXECUTION_FAILED = 10       # Accepted and executed but execution failed (p_exec coin flip)
+    BOOKING_TOO_LATE = 11
 
 requests_data_frame_columns = ['request', 'satellite', 'observation', 'uplink', 'downlink', 'status', 'data_product', 'scheduled_callback', 'unscheduled_callback', 'ready_callback']
 

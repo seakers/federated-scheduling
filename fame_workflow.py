@@ -1,4 +1,3 @@
-
 import numpy as np
 
 import networkx as nx
@@ -65,7 +64,13 @@ class GeometryConstraintType(Enum):
     LLA = 0
 
 class Constraint():
-    def __init__(self, constraint_class: ConstraintClass, constraint_type, parent: ObservationRequest, parameters: dict={'offset': 0, 'geometry_generator': lambda _obs_req, _data_product: _obs_req}):
+    def __init__(self, constraint_class: ConstraintClass, constraint_type,
+                 parent: ObservationRequest, parameters: dict=None):
+        if parameters is None:
+            parameters = {
+                'offset': dt.timedelta(0),
+                'geometry_generator': lambda _obs_req, _data_product: _obs_req,
+            }
         self.constraint_class = constraint_class
         self.constraint_type = constraint_type
         self.parent = parent
@@ -148,8 +153,35 @@ class ConstrainedObservationRequest():
 
     def __str__(self):
         return f"{self.name}"
+
     def __repr__(self):
         return self.__str__()
+
+
+def opportunity_satisfies_task(constrained_request, satellite, observation_pass):
+    """Apply an optional task-specific opportunity feasibility test.
+
+    Core orbital feasibility answers whether a satellite can see a target.  A
+    workflow may impose product-level requirements as well (for example a
+    maximum GSD, daylight, or a sensor-specific incidence limit).  Builders can
+    attach a callable named ``opportunity_feasibility`` to a constrained task;
+    every scheduler calls it here so random, greedy, deterministic, and
+    stochastic comparisons use the same candidate set.
+
+    The callable receives ``(satellite, observation_pass)`` and must return a
+    boolean.  Tasks without the hook preserve the historical behaviour.
+    """
+    checker = getattr(constrained_request, 'opportunity_feasibility', None)
+    if checker is None:
+        return True
+    try:
+        return bool(checker(satellite, observation_pass))
+    except Exception as exc:
+        name = getattr(getattr(constrained_request, 'observation_request', None),
+                       'name', str(constrained_request))
+        raise ValueError(
+            f"Opportunity feasibility failed for task {name}: {exc}"
+        ) from exc
     
 
 class ImpactType(Enum):
@@ -433,9 +465,29 @@ def greedy_schedule_workflow(
         feasibility_screener = lambda satellite, observation_pass: True,
         current_time: dt.datetime=None,
         verbose: int=99,
-        receding_horizon_duration: dt.timedelta=dt.timedelta(weeks=52)
+        receding_horizon_duration: dt.timedelta=dt.timedelta(weeks=52),
+        max_instances_per_task: int = 1,
         ):
-    
+    """Greedy quality-first scheduling.
+
+    `max_instances_per_task` controls the REDUNDANCY BUDGET:
+
+        1  (default)  one pass per task -- the REACTIVE baseline. A failure is
+                      recovered by replanning and booking again, i.e. SERIALLY.
+        N > 1         the top N non-overlapping passes by quality per task, capped
+                      by the task's own max_num_instances -- the ABLATION baseline.
+
+    The N > 1 variant exists to separate two things the comparison against the
+    stochastic planner otherwise confounds: booking redundancy at all, and seeing
+    the DAG's gate structure. Expected best-of-successes is monotone submodular in
+    the horizontal track, so quality-ordered greedy is NEAR-OPTIMAL there -- which
+    makes greedy-N a strong baseline, and makes any remaining gap attributable to
+    the AND/OR/NOT structure rather than to the redundancy itself.
+
+    Selection is still purely LOCAL either way: no cross-task contention
+    reasoning, no acceptance/execution probabilities, no gates.
+    """
+
     # Build a dependency graph
     # requests_to_skip_data_not_ready = []
 
@@ -607,7 +659,12 @@ def greedy_schedule_workflow(
                         case ConstraintClass.SUCCESS:
                             # The current node needs to know if the parent succeeded. So we constrain the current node to start after the parent
                             min_time = max(min_time, parent_request.observation_opportunity.time)
-                            if (parent_request.completed is True):
+                            # A task-level gate owns the Boolean combination of
+                            # SUCCESS parents. Keep the time bound above, but do
+                            # not let one failed member of an OR invalidate the
+                            # whole child here.
+                            if (parent_request.completed is True
+                                    and getattr(constrained_request, 'gate', None) is None):
                                 if (
                                     (
                                         (constraint['constraint_type'] == SuccessConstraintType.START_IF_FAILED) and 
@@ -675,9 +732,18 @@ def greedy_schedule_workflow(
         _best_pass = None
         allsatpasses = [(satellite, satpass, constrained_request.rewarder(satpass.highest)) for satellite, satpasses in passes.items() for satpass in satpasses]
         allsatpasses.sort(key=lambda x: x[2], reverse=True) # Sort by observation quality
+
+        # Redundancy budget for THIS task: the caller's cap, never more than the
+        # task itself allows. At 1 this loop keeps its original behaviour exactly
+        # (break on the first feasible pass).
+        _n_wanted = max(1, min(int(max_instances_per_task),
+                               int(getattr(constrained_request, 'max_num_instances', 1) or 1)))
+        _chosen = []   # [(satellite, satpass, quality)], best first
+
         for (satellite, satpass, _quality) in allsatpasses:
             # Use an external check for feasibility
-            if feasibility_screener(satellite, satpass):
+            if (feasibility_screener(satellite, satpass)
+                    and opportunity_satisfies_task(constrained_request, satellite, satpass)):
                 # Now also use an INTERNAL check for feasibility: do not try to clobber existing requests
                 there_is_overlap = False
                 for existing_request in workflow_graph:
@@ -699,11 +765,25 @@ def greedy_schedule_workflow(
                         else:
                             if verbose>6:
                                 print(f"Pass {satpass.highest} for {constrained_request} does not overlap with scheduled pass {existing_request.observation_opportunity} for {existing_request} ")
+                # Redundant passes for the SAME task must not clobber each other
+                # either. The loop above only compares against OTHER requests,
+                # because with one pass per task there was nothing else to hit.
+                if not there_is_overlap:
+                    for (_s_prev, _p_prev, _q_prev) in _chosen:
+                        if (_s_prev == satellite and
+                                _p_prev.highest.time <= satpass.highest.time + satpass.highest.duration and
+                                _p_prev.highest.time + _p_prev.highest.duration > satpass.highest.time):
+                            there_is_overlap = True
+                            break
+
                 if (not there_is_overlap):
-                    _best_quality = _quality
-                    _best_satellite = satellite
-                    _best_pass = satpass
-                    break
+                    _chosen.append((satellite, satpass, _quality))
+                    if _best_pass is None:          # first (= highest quality) one
+                        _best_quality = _quality
+                        _best_satellite = satellite
+                        _best_pass = satpass
+                    if len(_chosen) >= _n_wanted:
+                        break
             # TODO check timeline constraints here
         # for satellite, satpasses in passes.items():
         #     for satpass in satpasses:
@@ -716,15 +796,34 @@ def greedy_schedule_workflow(
         if _best_pass is None:
             constrained_request.scheduled=True
             constrained_request.feasible=False
+            # Clear any bookings left over from an earlier planning cycle: this
+            # task has no feasible pass NOW, and a stale list would otherwise be
+            # re-dispatched by the broker.
+            constrained_request.scheduled_bookings = []
             if verbose>0:
                 print("   [Scheduler] Could not schedule {} (all conflicts)".format(constrained_request))
             continue
             raise ValueError("Could not schedule {} (all conflicts)".format(constrained_request))
 
-        # Pick the best opportunity
+        # Pick the best opportunity. observation_opportunity stays the BEST pass:
+        # the backward constraint propagation above reads it as the task's
+        # representative time, and the broker falls back to it when there are no
+        # scheduled_bookings.
         constrained_request.observation_opportunity_pass = _best_pass
         constrained_request.observation_opportunity = _best_pass.highest
         constrained_request.observation_opportunity_satellite = _best_satellite
+        # The broker's redundant dispatch path reads scheduled_bookings when it is
+        # non-empty. Only publish it when we actually booked more than one, so
+        # greedy-1 keeps taking the identical single-pass code path it always did.
+        if len(_chosen) > 1:
+            constrained_request.scheduled_bookings = [
+                {'satellite': _s, 'pass': _p} for (_s, _p, _q) in _chosen]
+            if verbose > 0:
+                print(f"   [Scheduler] {constrained_request} booked {len(_chosen)} "
+                      f"redundant pass(es), quality "
+                      f"{', '.join(f'{_q:.1f}' for (_s, _p, _q) in _chosen)}")
+        else:
+            constrained_request.scheduled_bookings = []
         constrained_request.scheduled = True
         # Apply timeline impacts
         if constrained_request in timeline_graph.nodes():
@@ -759,10 +858,12 @@ def random_schedule_workflow(
         verbose: int=0,
         receding_horizon_duration: dt.timedelta=dt.timedelta(weeks=52),
         seed: int=None,
+        super_random: bool=False,
         ):
-    """Random feasible scheduler — picks a uniformly random feasible pass per task.
-    Produces valid (conflict-free, constraint-respecting) solutions with no quality
-    optimisation, suitable as a lower-bound baseline."""
+    """Random scheduler. By default picks a uniformly random feasible (conflict-free,
+    constraint-respecting) pass per task.  With super_random=True all checks are skipped:
+    any pass in the full observation window is eligible, including infeasible ones and
+    satellite conflicts — useful as a true chaos lower-bound baseline."""
 
     rng = random.Random(seed)
 
@@ -863,7 +964,8 @@ def random_schedule_workflow(
                                     max_time = min(max_time, parent_request.observation_opportunity.time + offset)
                         case ConstraintClass.SUCCESS:
                             min_time = max(min_time, parent_request.observation_opportunity.time)
-                            if parent_request.completed is True:
+                            if (parent_request.completed is True
+                                    and getattr(constrained_request, 'gate', None) is None):
                                 if (
                                     (constraint['constraint_type'] == SuccessConstraintType.START_IF_FAILED and
                                      parent_request.successful_execution == True) or
@@ -905,35 +1007,43 @@ def random_schedule_workflow(
                 print(f"   [RandomScheduler] Could not schedule {constrained_request} (no passes)")
             continue
 
-        # Collect all feasible (satellite, pass) pairs then pick one at random
+        # Collect all (satellite, pass) pairs then pick one at random
         allsatpasses = [
             (satellite, satpass)
             for satellite, satpasses in passes.items()
             for satpass in satpasses
+            if opportunity_satisfies_task(constrained_request, satellite, satpass)
         ]
         rng.shuffle(allsatpasses)
 
         chosen_satellite = None
         chosen_pass = None
-        for (satellite, satpass) in allsatpasses:
-            if not feasibility_screener(satellite, satpass):
-                continue
-            there_is_overlap = False
-            for existing_request in workflow_graph:
-                if (existing_request.scheduled == True and
-                        existing_request.feasible == True and
-                        existing_request.observation_opportunity is not None):
-                    if (
-                        existing_request.observation_opportunity.satellite == satellite and
-                        existing_request.observation_opportunity.time <= satpass.highest.time + satpass.highest.duration and
-                        existing_request.observation_opportunity.time + existing_request.observation_opportunity.duration > satpass.highest.time
-                    ):
-                        there_is_overlap = True
-                        break
-            if not there_is_overlap:
-                chosen_satellite = satellite
-                chosen_pass = satpass
-                break
+        if super_random:
+            # Ignore feasibility screener and satellite conflicts — pick any pass at random
+            if allsatpasses:
+                chosen_satellite, chosen_pass = allsatpasses[0]
+        else:
+            for (satellite, satpass) in allsatpasses:
+                if (not feasibility_screener(satellite, satpass)
+                        or not opportunity_satisfies_task(
+                            constrained_request, satellite, satpass)):
+                    continue
+                there_is_overlap = False
+                for existing_request in workflow_graph:
+                    if (existing_request.scheduled == True and
+                            existing_request.feasible == True and
+                            existing_request.observation_opportunity is not None):
+                        if (
+                            existing_request.observation_opportunity.satellite == satellite and
+                            existing_request.observation_opportunity.time <= satpass.highest.time + satpass.highest.duration and
+                            existing_request.observation_opportunity.time + existing_request.observation_opportunity.duration > satpass.highest.time
+                        ):
+                            there_is_overlap = True
+                            break
+                if not there_is_overlap:
+                    chosen_satellite = satellite
+                    chosen_pass = satpass
+                    break
 
         if chosen_pass is None:
             constrained_request.scheduled = True
@@ -1102,7 +1212,8 @@ def ilp_schedule_workflow(
         _t_dispatch = current_time
 
         for (satellite, satpass, _quality) in allsatpasses:
-            if feasibility_screener(satellite, satpass):
+            if (feasibility_screener(satellite, satpass)
+                    and opportunity_satisfies_task(constrained_request, satellite, satpass)):
                 _found_a_pass = True
 
                 if satellite not in solution_holder[constrained_request].keys():
@@ -1257,7 +1368,11 @@ def ilp_schedule_workflow(
                                             print(f"    [Scheduler] Ignoring parent {parent_request}, that's odd")
 
                     case ConstraintClass.SUCCESS:
-                        if (parent_request.completed == True):
+                        # Explicit gates replace the flat Boolean combination of
+                        # SUCCESS edges, while the edge still supplies pairwise
+                        # time ordering for candidate passes below.
+                        if (parent_request.completed == True
+                                and getattr(constrained_request, 'gate', None) is None):
                             if (
                                 (
                                     (constraint['constraint_type'] == SuccessConstraintType.START_IF_FAILED) and 
@@ -1319,7 +1434,9 @@ def ilp_schedule_workflow(
         for satellite in solution_holder[constrained_request].keys():
             for satpass in solution_holder[constrained_request][satellite].keys():
                 this_decision_variable = solution_holder[constrained_request][satellite][satpass]
-                if feasibility_screener(satellite, satpass):
+                if (feasibility_screener(satellite, satpass)
+                        and opportunity_satisfies_task(
+                            constrained_request, satellite, satpass)):
 
                     # For each constraint, invoke get_value_at on the timeline and constrain the outcome. You need to do this AFTER all the impacts have 
                     #  been tabulated. This is the follow-up pass
@@ -1443,7 +1560,7 @@ def ilp_schedule_workflow(
                 # --- Authenticate and start Gurobi Env ---
                 env = gp.Env(empty=True)
                 env.setParam('OutputFlag', 0) 
-                env.setParam('MIPGap', 0.05)  
+                env.setParam('MIPGap', 0.5)  
                 env.setParam('OutputFlag', 1)
                 
                 if os.environ.get("WLSACCESSID"):
@@ -1726,11 +1843,17 @@ def plot_workflow_schedule(
             for _, constraint in inedges.items():
                 if constraint['constraint_class'] != ConstraintClass.TEMPORAL:
                     continue
-                offset = constraint['parameters'].get('offset')
+                ctype = constraint['constraint_type']
+                if ctype not in (
+                        TemporalConstraintType.START_AFTER_OFFSET,
+                        TemporalConstraintType.START_BEFORE_OFFSET):
+                    continue
+                offset = (constraint.get('parameters') or {}).get('offset')
                 if offset is None:
                     continue
+                if isinstance(offset, (int, float, np.number)):
+                    offset = dt.timedelta(hours=float(offset))
                 boundary_time = parent_request.observation_opportunity.time + offset
-                ctype = constraint['constraint_type']
                 if ctype == TemporalConstraintType.START_AFTER_OFFSET:
                     ax_tasks.axvline(boundary_time, color=request_group_colors[request.request_group],
                                      linewidth=0.8, linestyle='--', alpha=0.7)
@@ -1801,7 +1924,10 @@ def plot_workflow_schedule(
         # Plot other times where it could have been scheduled.
         for _sat, _opportunities in request.observation_opportunities.items():
             for _opportunity in _opportunities:
-                _pass_is_feasible = feasibility_screener(_sat, _opportunity)
+                _pass_is_feasible = (
+                    feasibility_screener(_sat, _opportunity)
+                    and opportunity_satisfies_task(request, _sat, _opportunity)
+                )
                 _min_time = _opportunity.rise.time
                 _max_time = _opportunity.fall.time
                  
@@ -1922,6 +2048,60 @@ def plot_workflow_schedule(
         plt.close(fig)
 
 
+def _dispatch_gate_value(gate):
+    """Evaluate a logical gate with three-valued execution semantics.
+
+    ``True`` means the branch is live, ``False`` means it is resolved against
+    the task, and ``None`` means at least one literal is still pending.  The
+    implementation intentionally uses the gate protocol (class name plus
+    attributes) instead of importing ``fame_workflow_stochastic`` here, which
+    would create an import cycle.
+    """
+    def node_value(node):
+        # LogicNode: recursively derive its state from its own gate.
+        if (hasattr(node, 'gate') and not hasattr(node, 'observation_request')):
+            return gate_value(node.gate)
+
+        if getattr(node, 'completed', False):
+            return bool(getattr(node, 'successful_execution', False))
+
+        # A task whose scheduling/execution branch has resolved infeasible is a
+        # definite local failure.  An unscheduled task is still pending: a later
+        # replan may find a pass for it.
+        if (getattr(node, 'scheduled', False)
+                and not getattr(node, 'feasible', True)):
+            return False
+        return None
+
+    def gate_value(expr):
+        if expr is None:
+            return True
+        kind = expr.__class__.__name__
+        if kind == 'Lit':
+            return node_value(expr.node)
+        if kind == 'Not':
+            value = gate_value(expr.operand)
+            return None if value is None else not value
+        if kind == 'And':
+            values = [gate_value(x) for x in expr.operands]
+            if any(v is False for v in values):
+                return False
+            if all(v is True for v in values):
+                return True
+            return None
+        if kind in ('Or', 'ExclusiveOr'):
+            members = getattr(expr, 'operands', getattr(expr, 'members', ()))
+            values = [gate_value(x) for x in members]
+            if any(v is True for v in values):
+                return True
+            if all(v is False for v in values):
+                return False
+            return None
+        raise TypeError(f"Unsupported logical gate at dispatch: {type(expr)}")
+
+    return gate_value(gate)
+
+
 def find_dispatchable_tasks(workflow_graph = nx.MultiDiGraph(), timeline_graph: nx.MultiDiGraph=nx.MultiDiGraph(), verbose: int=1):
     dispatchable_requests = []
     for request in workflow_graph.nodes():
@@ -1931,11 +2111,59 @@ def find_dispatchable_tasks(workflow_graph = nx.MultiDiGraph(), timeline_graph: 
                 print(f"     [Dispatcher] Request {request} not dispatchable (scheduled: {request.scheduled}, feasible: {request.feasible}, dispatched {request.dispatched}, completed {request.completed})")
              _dispatchable = False
              continue
+
+        # The general-logical planner evaluates `.gate`; execution must use the
+        # same Boolean expression.  Without this block a nested prerequisite such
+        # as VHR AND (optical-access OR SAR-access) is optimized correctly but
+        # dispatched with the legacy flat all/any rule.
+        _logical_gate = getattr(request, 'gate', None)
+        _gate_controls_success = (_logical_gate is not None)
+        if _gate_controls_success:
+            _gate_state = _dispatch_gate_value(_logical_gate)
+            if _gate_state is None:
+                if verbose > 1:
+                    print(f"     [Dispatcher] Request {request} waiting for logical gate")
+                continue
+            if _gate_state is False:
+                if verbose > 1:
+                    print(f"     [Dispatcher] Request {request} unreachable: logical gate resolved false")
+                request.scheduled = True
+                request.feasible = False
+                continue
+        # SUCCESS-constraint combination mode.
+        #   'all' (default): every SUCCESS parent must be satisfied. This is the
+        #                    historical behaviour and is what volcano and MSA get.
+        #   'any':           at least ONE SUCCESS parent must be satisfied.
+        # Needed when a task's real prerequisite is a DISJUNCTION over parents.
+        # Under 'all'
+        # the dispatcher demands both, which is the opposite of the gate the MILP
+        # evaluates: when one modality runs out of passes the task is blocked
+        # permanently, the solver re-books it every replan, nothing is ever
+        # submitted, and the event queue drains short of the horizon.
+        #
+        # Only SUCCESS-class edges are affected. TEMPORAL and GEOMETRY stay ANDed,
+        # so a task with TEMPORAL on a root and SUCCESS on a disjunctive group
+        # still waits for the root.
+        #
+        # NOTE: this is a single per-task flag, so a task cannot mix a MANDATORY
+        # success parent with a disjunctive group -- that would need grouping keys
+        # on the Constraint itself. No current workflow needs it.
+        _success_mode = getattr(request, 'success_constraint_mode', 'all')
+        _success_satisfied = []   # one entry per checked SUCCESS edge, 'any' mode only
+
         for parent_request in workflow_graph.predecessors(request):
             constraint_edges = workflow_graph.get_edge_data(parent_request, request)
             for constraint_key, constraint in constraint_edges.items():
+                # A task-level logical gate replaces only the flat combination of
+                # SUCCESS edges.  Temporal, geometry, and timeline constraints
+                # retain their historical AND semantics.
+                if (_gate_controls_success
+                        and constraint['constraint_class'] == ConstraintClass.SUCCESS):
+                    continue
                 # If we need to check this type of constraint
                 if request.dispatch_policy[constraint['constraint_class']] is False:
+                    _is_success_edge = (constraint['constraint_class'] == ConstraintClass.SUCCESS)
+                    _defer_to_group = (_is_success_edge and _success_mode == 'any')
                     # Add a special case where
                     # If a task is infeasible
                     # and the constraint is specifically "START_IF_FAILED"
@@ -1943,14 +2171,36 @@ def find_dispatchable_tasks(workflow_graph = nx.MultiDiGraph(), timeline_graph: 
                     if ((parent_request.scheduled is False or (parent_request.scheduled is True and parent_request.feasible is False)) and constraint['constraint_class']==ConstraintClass.SUCCESS and (constraint['constraint_type']==SuccessConstraintType.START_IF_FAILED or constraint['constraint_type']==SuccessConstraintType.WAIT_FOR_COMPLETION_IF_FEASIBLE)):
                         if verbose>2:
                             print(f"     [Dispatcher] Special case for request {request}: parent {parent_request} is infeasible and constraint is {constraint['constraint_type']}, unscheduled/infeasible counts toward this.")
+                        if _defer_to_group:
+                            # An infeasible parent SATISFIES this edge, so it is a
+                            # live disjunct.
+                            _success_satisfied.append(True)
                         continue
-                    elif (parent_request.scheduled is False or parent_request.dispatched is False or parent_request.completed is False):
+
+                    _edge_satisfied = not (parent_request.scheduled is False
+                                           or parent_request.dispatched is False
+                                           or parent_request.completed is False)
+
+                    if _defer_to_group:
+                        # Do not fail the task here: the group is resolved after
+                        # every parent has been visited.
+                        _success_satisfied.append(_edge_satisfied)
+                        continue
+
+                    if not _edge_satisfied:
                         if verbose>1:
                             print(f"     [Dispatcher] Request {request} not dispatchable (parent {parent_request} scheduled {parent_request.scheduled}, dispatched {parent_request.dispatched}, completed {parent_request.completed}). Constraint: {constraint['constraint_class']} {constraint['constraint_type']}")
                         _dispatchable = False
                         break
             if _dispatchable == False:
                 break
+
+        # Resolve the any-of SUCCESS group, if the task opted into one.
+        if _dispatchable is True and _success_satisfied and not any(_success_satisfied):
+            if verbose>1:
+                print(f"     [Dispatcher] Request {request} not dispatchable: none of its "
+                      f"{len(_success_satisfied)} SUCCESS parents are satisfied (any-of mode)")
+            _dispatchable = False
         
         # This is kind of a hack.
         # If a task has all constraints satisfied, _but_ is rejected because of a timeline, 
@@ -2008,4 +2258,3 @@ def find_dispatchable_tasks(workflow_graph = nx.MultiDiGraph(), timeline_graph: 
                 print(f"     [Dispatcher] We marked some tasks as infeasible. Rerunning the dispatcher")
             return find_dispatchable_tasks(workflow_graph = workflow_graph, timeline_graph=timeline_graph, verbose=verbose)
     return dispatchable_requests
-

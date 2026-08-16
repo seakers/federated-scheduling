@@ -87,7 +87,7 @@ def load_satellites_once(sim_start: dt.datetime, horizon_h: float) -> list:
         "LOFT YAM-6": 19.8, "LOFT YAM-7": 70, "LOFT YAM-8": 19.8,
         "Ubotica CogniSat-6 HAMMER": 20, "Ubotica ACCENTURE-1 SUAC": 20,
         "Mission Control Persistence": 100,
-        "LEMUR 2 KRISH": 17.5,
+        #"LEMUR 2 KRISH": 17.5,
         "AEROCUBE 18A": 80, "AEROCUBE 18B": 80,
     }
     for name in flock_names:

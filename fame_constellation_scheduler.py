@@ -21,6 +21,25 @@ import json
 from fame_workflow import AssignmentTimeline, Impact, ImpactType
 
 from fame_agents_base import *
+
+# === BOOKING LEAD TIME ===
+# Minimum time between SUBMITTING a booking and the pass flying. Real commercial
+# tasking requires hours to days of lead time; modelling it as zero is what lets
+# a reactive planner grab a replacement pass minutes before it executes, which
+# makes anticipatory redundancy worthless by construction.
+#
+# The lockout condition is
+#       BOOKING_LEAD_TIME_H  >  acceptance-notification lead  +  gap to next pass
+# Above that, a NACK arriving d hours before the pass CANNOT be recovered: the
+# next usable pass is already inside the lead-time window. A planner that
+# pre-booked a backup keeps the window; a reactive one loses it.
+#
+# This applies IDENTICALLY to every planner -- it is a property of the market,
+# not of the scheduler. The advantage, if any, emerges from the decision to
+# hedge, not from differential treatment.
+#
+# Set to 0.0 to recover the previous behaviour exactly.
+BOOKING_LEAD_TIME_H = 1.0
 COMPETITOR_OWNER = "competitor"
 class ConstellationGroundScheduler():
     def __init__(self, satellites: list, ground_stations: list, world, name="Constellation", ack_probability_if_scheduled: float=1., ack_probability_if_unscheduled: float=1., acceptance_probability: float=1.0, acceptance_probability_function=None, execution_probability_function=None, acceptance_notification_delay_h: tuple = (0.0, 0.0)):
@@ -157,6 +176,22 @@ class ConstellationGroundScheduler():
         _pdrequest = pd.DataFrame([_request_dict])
         self._requests = pd.concat([self._requests, _pdrequest], ignore_index=True)
 
+        # Step 0: Reject bookings submitted inside the lead-time window.
+        # Checked BEFORE feasibility so a late booking is reported as late rather
+        # than as a slot conflict -- the two have different meanings for the
+        # planner and for the metrics.
+        if BOOKING_LEAD_TIME_H > 0:
+            _lead = (target_pass.highest.time - current_time).total_seconds() / 3600.0
+            if _lead < BOOKING_LEAD_TIME_H:
+                print(f"   [{self.name}] Booking for {request.name} on {target_satellite.name} "
+                      f"arrived {_lead:.2f}h before the pass, inside the "
+                      f"{BOOKING_LEAD_TIME_H}h lead time")
+                self._requests.loc[self._requests['request'] == request, 'status'] = \
+                    ObservationStatus.BOOKING_TOO_LATE
+                if random.random() < self.ack_probability_if_unscheduled:
+                    callback_request_unscheduled(ObservationStatus.BOOKING_TOO_LATE)
+                return -6
+
         # Step 1: Screen ONLY the target satellite pass for feasibility
         _pass_is_feasible = self.screen_opportunity_for_feasibility(target_satellite, target_pass.highest)
         if not _pass_is_feasible:
@@ -282,6 +317,7 @@ class ConstellationGroundScheduler():
             _obs_tl=_obs_timeline, _comm_tl=_comm_timeline,
             _obs_imps=_obs_impacts, _comm_imps=_comm_impacts,
         ):
+
             if random.random() > _theta:
                 # REJECTED — a competitor took this slot, so the capacity is
                 # consumed: re-own the obs reservation instead of releasing it,
