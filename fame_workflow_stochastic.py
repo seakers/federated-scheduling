@@ -3608,6 +3608,100 @@ def _add_workflow_constraints(
             if verbose > 2 and _n_blocked:
                 print(f"  [Constraints] {constrained_request.observation_request.name}: "
                       f"{_n_blocked} pass(es) have no compatible parent pass")
+
+    # === SUCCESS PRECEDENCE (ZERO DELAY) ===
+    # A SUCCESS edge also means that the child cannot start before the parent
+    # observation has ended.  Keep this separate from the TEMPORAL block above:
+    # TEMPORAL edges define campaign windows, while SUCCESS edges identify the
+    # immediate operational predecessor.
+    #
+    # For the default "all" mode, every SUCCESS parent supplies one compatible
+    # predecessor.  For "any" (e.g. earthquake TRIAGE), one compatible pass from
+    # any SUCCESS parent is sufficient, preserving the optical-OR-SAR semantics.
+    for constrained_request in solution_holder.keys():
+        if not getattr(constrained_request, 'enforce_success_precedence', False):
+            continue
+        success_parents = []
+        for parent_request in workflow_graph.predecessors(constrained_request):
+            inedges = workflow_graph.get_edge_data(parent_request, constrained_request) or {}
+            if any(c.get('constraint_class') == ConstraintClass.SUCCESS
+                   for c in inedges.values()):
+                success_parents.append(parent_request)
+
+        if not success_parents:
+            continue
+
+        success_mode = getattr(constrained_request, 'success_constraint_mode', 'all')
+
+        def _compatible_success_passes(parent_request, t_child):
+            """Decision variables for parent passes ending no later than child."""
+            if parent_request not in solution_holder:
+                return []
+            return [
+                solution_holder[parent_request][psat][ppass]['x']
+                for psat in solution_holder[parent_request]
+                for ppass in solution_holder[parent_request][psat]
+                if ppass.highest.time + ppass.highest.duration <= t_child
+            ]
+
+        def _fixed_parent_precedes(parent_request, t_child):
+            """Whether an already-dispatched/completed parent can precede child."""
+            if parent_request in solution_holder:
+                return False
+            if (getattr(parent_request, 'completed', False)
+                    and not getattr(parent_request, 'successful_execution', False)):
+                return False
+
+            bookings = getattr(parent_request, 'scheduled_bookings', None) or []
+            fixed_passes = [b.get('pass') for b in bookings if b.get('pass') is not None]
+            if not fixed_passes:
+                fixed_pass = getattr(parent_request, 'observation_opportunity_pass', None)
+                if fixed_pass is not None:
+                    fixed_passes = [fixed_pass]
+
+            return any(
+                p.highest.time + p.highest.duration <= t_child
+                for p in fixed_passes
+            )
+
+        for child_sat in solution_holder[constrained_request]:
+            for child_pass, child_entry in solution_holder[constrained_request][child_sat].items():
+                x_child = child_entry['x']
+                t_child = child_pass.highest.time
+
+                if success_mode == 'any':
+                    if any(_fixed_parent_precedes(p, t_child) for p in success_parents):
+                        continue
+                    compatible = [
+                        x_parent
+                        for parent_request in success_parents
+                        for x_parent in _compatible_success_passes(parent_request, t_child)
+                    ]
+                    if compatible:
+                        model.addConstr(
+                            x_child <= gp.quicksum(compatible),
+                            name=f"success_precedence_any_"
+                                 f"{constrained_request.observation_request.name}_"
+                                 f"{child_sat.name}_{t_child:%H%M%S}"
+                        )
+                    else:
+                        x_child.ub = 0.0
+                else:
+                    for parent_request in success_parents:
+                        if _fixed_parent_precedes(parent_request, t_child):
+                            continue
+                        compatible = _compatible_success_passes(parent_request, t_child)
+                        if compatible:
+                            model.addConstr(
+                                x_child <= gp.quicksum(compatible),
+                                name=f"success_precedence_all_"
+                                     f"{constrained_request.observation_request.name}_"
+                                     f"{parent_request.observation_request.name}_"
+                                     f"{child_sat.name}_{t_child:%H%M%S}"
+                            )
+                        else:
+                            x_child.ub = 0.0
+                            break
     # === NO BRANCH EXCLUSIVITY UNDER general_logical_dag ===
     # The gates already encode the branch: imaging is gated on Lit(K_w), search
     # on Not(Lit(K_w)), so the DSOP compilation zeroes whichever arm the belief

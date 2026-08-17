@@ -86,7 +86,7 @@ from benchmarking_utils import (
 SIMULATION_START = dt.datetime(2026, 8, 1, 0, 0, 0)  # fixed for reproducibility; override with --start
 
 
-lookahead_horizon_h = 18
+lookahead_horizon_h = 24
 FOLLOW_UP_INTERVAL_H = 2
 HOURS_TO_DETECT = 3
 MAX_SOLVER_TIME_S = 120
@@ -142,7 +142,7 @@ LEAD_T_REF_H = 6.0   # reference lead horizon in hours
 # MIN_H = minimum lead before pass → latest possible notification (closest to pass).
 # MAX_H = maximum lead before pass → earliest possible notification (furthest from pass).
 # Set ACCEPT_NOTIFY_MAX_H = 0.0 to restore synchronous (immediate) accept/reject.
-ACCEPT_NOTIFY_MIN_H = 0.50   # min hours before pass  →  latest notification  (e.g. 1h before)
+ACCEPT_NOTIFY_MIN_H = 0.25   # min hours before pass  →  latest notification  (e.g. 1h before)
 ACCEPT_NOTIFY_MAX_H = 1.0   # max hours before pass  →  earliest notification (e.g. 6h before)
 
 # === PROBABILITY CONFIGURATION ===
@@ -157,9 +157,9 @@ P_ACC_MAX = 0.95          # Maximum acceptance probability (low-demand / quiet)
 P_EXEC_MIN = 0.60           # Minimum execution probability (worst geometry)
 P_EXEC_MAX = 0.80           # Maximum execution probability (best geometry)
 
-SCHEDULERS = ['stochastic_log', 'greedy','deterministic', 'random', 'super_random']
+SCHEDULERS = ['greedy_n','stochastic_log', 'greedy','deterministic', 'random', 'super_random']
 #SCHEDULERS = ['greedy']
-SCHEDULERS = ['deterministic']
+#SCHEDULERS = ['deterministic']
 #SCHEDULERS = ['super_random', 'greedy']
 
 # Set to True to cancel inferior pending passes once a better/sufficient one succeeds.

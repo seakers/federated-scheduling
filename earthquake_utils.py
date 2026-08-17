@@ -126,22 +126,23 @@ from fame_workflow_stochastic import Lit, And, Or, Not, LogicNode
 
 
 # =============================================================================
-# TIMING  -- the golden 72 hours
+# TIMING  -- 24-hour response campaign
 # =============================================================================
-EXTENT_WINDOW_H = 8.0                          # footprint feeds USAR deployment
+CAMPAIGN_HORIZON_H = 24.0
+EXTENT_WINDOW_H = 6.0
 
-URBAN_OPEN_H,  URBAN_CLOSE_H  = 1.0,  12.0     # characterisation inside day 1
-TRIAGE_OPEN_H, TRIAGE_CLOSE_H = 6.0,  24.0     # grading drives day-2 relief
-FINAL_OPEN_H,  FINAL_CLOSE_H  = 12.0, 48.0     # everything closes inside 72 h
+# A phase may open as soon as its immediate SUCCESS predecessor completes.
+# The close offsets remain EXTENT-relative campaign deadlines.
+URBAN_OPEN_H, URBAN_CLOSE_H = 0.0, 4.5
+TRIAGE_OPEN_H, TRIAGE_CLOSE_H = 0.0, 8.25
+FINAL_OPEN_H, FINAL_CLOSE_H = 0.0, 12.0
 
 # Usable-GSD floor. At 15 deg the planner books 1500 km slant ranges, which is
 # not a product anyone would grade buildings from; at 25 deg a mandatory EXTENT
 # can starve. 20 is the compromise.
 #
-# THIS AND EXTENT_WINDOW_H ARE THE TWO KNOBS. If a mandatory EXTENT comes up with
-# fewer than ~3 candidate passes, widen EXTENT_WINDOW_H FIRST -- the 8 h window is
-# the softer claim, and a mandatory root with no passes silently kills all six of
-# its tasks.
+# This and EXTENT_WINDOW_H control pass availability. A mandatory EXTENT with no
+# feasible pass makes every downstream task unreachable.
 MIN_ELEVATION_DEG = 20.0
 
 # Value decay with acquisition age, floored: a 48 h product is worth much less
@@ -617,11 +618,11 @@ def _phase_constraints(temporal_parent, open_h, close_h, success_parents):
     two direct predecessors and defeats the single-parent CHAIN shortcut in the
     formulation, forcing an exp()/log join at every node.
 
-    SUCCESS constraints are what make the phases sequential AT DISPATCH TIME, and
-    they are not redundant with the gates: the gates tell the MILP what a task is
-    WORTH, the SUCCESS edges tell the broker when it may be SUBMITTED. Without them
-    a follow-up is dispatched while still aimed at the wrong scale, because its
-    true aim point does not exist until the parent's product arrives.
+    SUCCESS constraints make the phases sequential. The stochastic Gurobi
+    scheduler treats them as zero-delay precedence relations while the dispatcher
+    waits for the parent result. They are not redundant with the gates: the gates
+    tell the MILP what a task is worth, while the SUCCESS edges identify the
+    immediate predecessor whose product makes the child actionable.
 
     CAUTION: the dispatcher ANDs these BY DEFAULT. `success_parents` means ALL of
     them must be satisfied, never any of them. A task whose real prerequisite is a
@@ -641,6 +642,38 @@ def _phase_constraints(temporal_parent, open_h, close_h, success_parents):
     return cons
 
 
+def _validate_24h_timing(min_time, max_time):
+    """Reject a driver horizon or phase window inconsistent with this scenario."""
+    horizon_h = (max_time - min_time).total_seconds() / 3600.0
+    if not math.isclose(horizon_h, CAMPAIGN_HORIZON_H, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError(
+            f"Earthquake scenario requires a {CAMPAIGN_HORIZON_H:g} h horizon; "
+            f"received {horizon_h:g} h."
+        )
+
+    phase_windows = {
+        "URBAN": (URBAN_OPEN_H, URBAN_CLOSE_H),
+        "TRIAGE": (TRIAGE_OPEN_H, TRIAGE_CLOSE_H),
+        "FINAL": (FINAL_OPEN_H, FINAL_CLOSE_H),
+    }
+    for phase, (open_h, close_h) in phase_windows.items():
+        if open_h < 0.0 or close_h <= open_h:
+            raise ValueError(
+                f"Invalid {phase} window [{open_h:g}, {close_h:g}] h: "
+                "the close offset must be greater than the open offset."
+            )
+
+    latest_possible_close_h = EXTENT_WINDOW_H + max(
+        close_h for _, close_h in phase_windows.values()
+    )
+    if latest_possible_close_h > CAMPAIGN_HORIZON_H + 1e-9:
+        raise ValueError(
+            "Configured EXTENT-relative windows can exceed the campaign horizon: "
+            f"latest possible close is Event +{latest_possible_close_h:g} h, "
+            f"but the horizon is {CAMPAIGN_HORIZON_H:g} h."
+        )
+
+
 def create_earthquake_workflow(targets, min_time, max_time, max_num_instances=3,
                                satellites=None):
     """AND/OR/NOT damage-assessment workflow: six tasks per settlement.
@@ -658,6 +691,8 @@ def create_earthquake_workflow(targets, min_time, max_time, max_num_instances=3,
     """
     if not targets:
         raise ValueError("create_earthquake_workflow: no targets")
+
+    _validate_24h_timing(min_time, max_time)
 
     # The OR gate's justification is that SAR and optical are GENUINE substitutes.
     # If the fleet carries only one modality the gate still holds structurally but
@@ -690,6 +725,7 @@ def create_earthquake_workflow(targets, min_time, max_time, max_num_instances=3,
 
     def _add(task, settlement_name, kind):
         task.eq_meta = (settlement_name, kind)
+        task.enforce_success_precedence = (kind != 'extent')
         tasks.append(task)
 
     for tgt in targets:

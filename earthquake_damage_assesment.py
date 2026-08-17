@@ -48,15 +48,15 @@ from benchmarking_utils import (
 
 # ============================ Configuration =================================
 SIMULATION_START = dt.datetime(2026, 8, 1, 0, 0, 0)
-LOOKAHEAD_HORIZON_H = 60.0   # Exact workflow lifespan
+LOOKAHEAD_HORIZON_H = 24.0   # Exact workflow lifespan
 MAX_SOLVER_TIME_S = 120       # Fast solver timeout cap
 MAX_NUM_INSTANCES = 5        # Backup passes per task
-NUM_MC_RUNS = 3
+NUM_MC_RUNS = 2
 
 # === COST CONFIGURATION ===
 TAX_RATE = 0.0              
 SUBMISSION_COST = 0.01      
-ACCEPT_NOTIFY_MIN_H = 0.25
+ACCEPT_NOTIFY_MIN_H = 0.0
 ACCEPT_NOTIFY_MAX_H = 1.50
 
 PROVIDER_RATES = {
@@ -75,11 +75,11 @@ LEAD_K = 3.0
 LEAD_T_REF_H = 6.0   
 
 # === PROBABILITY CONFIGURATION ===
-P_ACC_MIN = 0.70   
-P_ACC_MAX = 0.95  
+P_ACC_MIN = 0.75  
+P_ACC_MAX = 0.95 
 
-P_EXEC_MIN = 0.65  
-P_EXEC_MAX = 0.85 
+P_EXEC_MIN = 0.75  
+P_EXEC_MAX = 0.95
 
 # Ablation ladder -- each rung adds exactly one capability, so a gap between
 # adjacent rungs is attributable to that one thing:
@@ -91,8 +91,9 @@ P_EXEC_MAX = 0.85
 #                        gate-blind. THE control for "the gain is just backups".
 #   deterministic      + cross-task optimisation, but no uncertainty model
 #   stochastic_logical + uncertainty model AND the AND/OR/NOT gates  <- the claim
-SCHEDULERS = ['stochastic_logical', 'deterministic', 'greedy_n', 'greedy', 'random']
+SCHEDULERS = ['stochastic_logical','deterministic', 'greedy_n', 'greedy', 'random']
 #SCHEDULERS = ['stochastic_logical']
+#SCHEDULERS = ['deterministic']
 ENABLE_CANCELLATIONS = True  # Immediately releases unneeded backup passes on primary success
 
 
@@ -102,8 +103,8 @@ def load_satellites_for_earthquake(sim_start: dt.datetime, horizon_h: float) -> 
     """
     full_fleet = _load_satellites_once_shared(sim_start, horizon_h)
     
-    rgb_sats = [s for s in full_fleet if InstrumentType.RGB in s.instruments][:30]
-    sar_sats = [s for s in full_fleet if InstrumentType.SAR in s.instruments][:30]
+    rgb_sats = [s for s in full_fleet if InstrumentType.RGB in s.instruments]
+    sar_sats = [s for s in full_fleet if InstrumentType.SAR in s.instruments]
     
     pruned_fleet = rgb_sats + sar_sats
     print(f"[Fleet Tuning] Selected {len(pruned_fleet)} satellites ({len(rgb_sats)} RGB, {len(sar_sats)} SAR) out of {len(full_fleet)} total.")
