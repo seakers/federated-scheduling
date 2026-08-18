@@ -33,14 +33,17 @@ import pandas as pd
 
 
 # ==============================================================================
-# CONFIGURATION — same pattern as plot_runs_results.py
+# CONFIGURATION â€” same pattern as plot_runs_results.py
 # ==============================================================================
 BASE_DIR = "/Users/davidf/Code/federated-scheduling/results"
 
 RUN_FOLDERS = [
-    "earthquake_2026-08-16_235139",
+    "volcano_campaign_20260817_015417",
+    "volcano_2026-08-17_194449"
 ]
-
+# RUN_FOLDERS = [
+#     "earthquake_campaign_20260817_002759",
+# ]
 HEDGING_SCHEDULER_ALIASES = {"stochastic_log", "stochastic_logical"}
 HEDGING_SCHEDULER_ID = "hedging_milp"
 
@@ -283,7 +286,7 @@ def load_corrected_results(folders: list[str], base_dir: str = ".") -> pd.DataFr
             folder_path = Path(base_dir) / folder
 
         if not folder_path.exists():
-            print(f"  [Warning] Folder not found: {folder_path} — skipping")
+            print(f"  [Warning] Folder not found: {folder_path} â€” skipping")
             continue
 
         loaded = skipped = 0
@@ -291,7 +294,7 @@ def load_corrected_results(folders: list[str], base_dir: str = ".") -> pd.DataFr
         for run_file in sorted(folder_path.glob("run_*.json")):
             execution_file = _find_execution_file(run_file)
             if execution_file is None:
-                print(f"  [Warning] No unique execution file for {run_file.name} — skipping")
+                print(f"  [Warning] No unique execution file for {run_file.name} â€” skipping")
                 skipped += 1
                 continue
 
@@ -414,6 +417,196 @@ def save_corrected_metrics(df: pd.DataFrame, output_dir: Path) -> None:
     print("  [Saved] corrected_run_metrics.csv and corrected_runs/*.json")
 
 
+def save_hedging_timing_summary(df: pd.DataFrame, output_dir: Path) -> dict[str, Any] | None:
+    """Report computational averages for the Hedging MILP runs only.
+
+    Other schedulers do not currently save comparable solver statistics, so
+    these values are intentionally reported as a standalone Hedging MILP
+    summary rather than as a cross-scheduler performance comparison.
+    """
+    hedging = df[df["scheduler"] == HEDGING_SCHEDULER_ID].copy()
+    if hedging.empty:
+        print("  [Timing] No Hedging MILP runs found; timing summary skipped")
+        return None
+
+    metric_specs = [
+        ("avg_solve_time_s", "mean_solve_time_s"),
+        ("avg_wall_time_s", "mean_wall_time_s"),
+        ("avg_mip_gap_pct", "mean_mip_gap_pct"),
+        ("final_mip_gap_pct", "mean_final_mip_gap_pct"),
+        ("n_planning_sessions", "mean_planning_sessions_per_run"),
+    ]
+
+    summary: dict[str, Any] = {
+        "scheduler": "Hedging MILP",
+        "n_runs": int(len(hedging)),
+        "aggregation": "arithmetic mean across run-level summaries",
+    }
+    available = False
+    for source, destination in metric_specs:
+        if source not in hedging.columns:
+            continue
+        values = pd.to_numeric(hedging[source], errors="coerce").dropna()
+        if values.empty:
+            continue
+        summary[destination] = float(values.mean())
+        summary[f"n_runs_with_{source}"] = int(len(values))
+        available = True
+
+    if not available:
+        print("  [Timing] Hedging MILP runs contain no solver timing fields")
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "hedging_milp_timing_summary.json").open(
+        "w", encoding="utf-8"
+    ) as stream:
+        json.dump(summary, stream, indent=2, allow_nan=False)
+
+    lines = [
+        "",
+        "HEDGING MILP COMPUTATIONAL PERFORMANCE",
+        "--------------------------------------",
+        f"Runs included: {summary['n_runs']}",
+    ]
+    display_specs = [
+        ("mean_solve_time_s", "Mean solve time per planning session", "s", 3),
+        ("mean_wall_time_s", "Mean wall time per planning session", "s", 3),
+        ("mean_mip_gap_pct", "Mean MIP gap", "%", 3),
+        ("mean_final_mip_gap_pct", "Mean final MIP gap", "%", 3),
+        ("mean_planning_sessions_per_run", "Mean planning sessions per run", "", 2),
+    ]
+    for key, label, unit, decimals in display_specs:
+        if key in summary:
+            suffix = f" {unit}" if unit else ""
+            lines.append(f"{label}: {summary[key]:.{decimals}f}{suffix}")
+    lines.extend(
+        [
+            "Note: comparable solver statistics were not saved for the other schedulers.",
+            "These values therefore describe Hedging MILP performance only.",
+        ]
+    )
+
+    timing_text = "\n".join(lines) + "\n"
+    (output_dir / "hedging_milp_timing_summary.txt").write_text(
+        timing_text, encoding="utf-8"
+    )
+
+    report_path = output_dir / "summary_report.txt"
+    with report_path.open("a", encoding="utf-8") as stream:
+        stream.write(timing_text)
+
+    print(timing_text.rstrip())
+    print("  [Saved] hedging_milp_timing_summary.json/.txt")
+    print("  [Updated] summary_report.txt with Hedging MILP timing averages")
+    return summary
+
+
+def load_replan_records(folders: list[str], base_dir: str = ".") -> pd.DataFrame:
+    """Read replans from every run JSON, independent of execution-file pairing."""
+    records: list[dict[str, Any]] = []
+    for folder in folders:
+        folder_path = Path(folder)
+        if not folder_path.is_absolute():
+            folder_path = Path(base_dir) / folder
+        if not folder_path.exists():
+            continue
+
+        for run_file in sorted(folder_path.glob("run_*.json")):
+            try:
+                run = _load_json(run_file)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(run, dict) or "scheduler" not in run:
+                continue
+
+            replans = run.get("replans", run.get("n_replans"))
+            if replans is None:
+                continue
+
+            source_scheduler = str(run["scheduler"])
+            scheduler = (
+                HEDGING_SCHEDULER_ID
+                if source_scheduler in HEDGING_SCHEDULER_ALIASES
+                else _canonical_plot_scheduler(source_scheduler)
+            )
+            records.append(
+                {
+                    "scheduler": scheduler,
+                    "replans": replans,
+                    "seed": run.get("seed"),
+                    "folder": folder_path.name,
+                    "source_file": run_file.name,
+                }
+            )
+
+    return pd.DataFrame(records)
+
+
+def save_replans_by_scheduler(
+    replan_df: pd.DataFrame, output_dir: Path
+) -> dict[str, Any] | None:
+    """Append mean replan counts for all schedulers to the main report."""
+    if replan_df.empty or "replans" not in replan_df.columns:
+        print("  [Replans] No usable replan records found")
+        return None
+
+    available = set(replan_df["scheduler"].dropna().astype(str))
+    ordered = [scheduler for scheduler in SCHEDULER_ORDER if scheduler in available]
+    ordered.extend(sorted(available - set(SCHEDULER_ORDER)))
+
+    rows: list[dict[str, Any]] = []
+    for scheduler in ordered:
+        values = pd.to_numeric(
+            replan_df.loc[replan_df["scheduler"] == scheduler, "replans"],
+            errors="coerce",
+        ).dropna()
+        if values.empty:
+            continue
+        rows.append(
+            {
+                "scheduler": scheduler,
+                "label": SCHEDULER_LABELS.get(scheduler, scheduler),
+                "n_runs": int(len(values)),
+                "mean_replans": float(values.mean()),
+                "std_replans": float(values.std(ddof=1)) if len(values) > 1 else 0.0,
+                "min_replans": int(values.min()),
+                "max_replans": int(values.max()),
+            }
+        )
+
+    if not rows:
+        print("  [Replans] No scheduler contains numeric replan values")
+        return None
+
+    summary = {"metric": "replans", "schedulers": rows}
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "replans_by_scheduler.json").open(
+        "w", encoding="utf-8"
+    ) as stream:
+        json.dump(summary, stream, indent=2, allow_nan=False)
+
+    lines = ["", "MEAN REPLANS BY SCHEDULER", "-------------------------"]
+    for row in rows:
+        lines.append(
+            f"{row['label']}: {row['mean_replans']:.2f} replans/run "
+            f"(n={row['n_runs']}, std={row['std_replans']:.2f}, "
+            f"range={row['min_replans']}-{row['max_replans']})"
+        )
+    report_text = "\n".join(lines) + "\n"
+
+    (output_dir / "replans_by_scheduler.txt").write_text(
+        report_text, encoding="utf-8"
+    )
+    with (output_dir / "summary_report.txt").open("a", encoding="utf-8") as stream:
+        stream.write(report_text)
+
+    print(report_text.rstrip())
+    print("  [Saved] replans_by_scheduler.json/.txt")
+    print("  [Updated] summary_report.txt with every scheduler's replans")
+    return summary
+
+
 def _plot_mean_bars_total_first(df: pd.DataFrame, output_dir: str, plots) -> None:
     """Plot overall metrics first and per-completed-task metrics second."""
     print("  Generating mean bar charts...")
@@ -471,7 +664,7 @@ def _plot_mean_bars_total_first(df: pd.DataFrame, output_dir: str, plots) -> Non
             )
 
     plots.plt.suptitle(
-        "Scheduler Comparison — Means ± Std (Overall and Per-Completed-Task Metrics)",
+        "Scheduler Comparison â€” Means Â± Std (Overall and Per-Completed-Task Metrics)",
         fontsize=18, y=1.02,
     )
     plots.plt.tight_layout()
@@ -616,6 +809,9 @@ def main() -> None:
 
     print(f"\nGenerating standard plots in: {output_dir}\n")
     failures = generate_plots(plot_df, output_dir, folders)
+    save_hedging_timing_summary(df, output_dir)
+    replan_df = load_replan_records(folders, args.base_dir)
+    save_replans_by_scheduler(replan_df, output_dir)
 
     print("\n" + "=" * 72)
     if failures:
