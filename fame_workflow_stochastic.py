@@ -1,9 +1,9 @@
 """
 Stochastic MILP Scheduling for FAME
 
-This module implements stochastic Mixed-Integer Linear Programming (MILP) scheduling
+This module implements Hedging Mixed-Integer Linear Programming (MILP) scheduling
 that accounts for observation success probabilities due to constellation manager
-acceptance/rejection uncertainty.
+acceptance/rejection uncertainty and execution failures.
 
 Two formulations are supported:
 1. Non-convex: Uses quadratic constraints (exact, requires Gurobi NonConvex=2)

@@ -9,18 +9,8 @@ and this workflow is built to supply them and nothing else:
 
     1. an AND cascade   -- a mandatory root whose worth is mostly downstream
     2. an OR            -- two substitutable parents
-    3. a NOT            -- a task worth more when a sibling FAILED
     4. scarcity         -- more settlements than the fleet can fully serve, so
                            allocation is a real decision
-
-Everything beyond those four was removed deliberately. Earlier drafts carried a
-tiled rupture (shared mandatory roots across settlements) and a belief state that
-updated mission value as observations landed. Both were operationally plausible
-and both were pure cost: the shared root meant one failed acquisition killed
-every settlement under it, and the moving objective made every solve harder to
-reason about. Neither is needed for any claim the paper makes. If this case study
-is to be the LEGIBLE one -- the counterweight to the maritime study, where the
-particle filter makes the gates hard to follow -- it has to stay this small.
 
 THE SCENARIO, IN TWO SENTENCES
 ==============================
@@ -53,8 +43,7 @@ PHASES  (offsets relative to the REALISED parent acquisition)
               ACCESS     SAR,     [ext+12h, ext+48h]     aim: DISTRICT
               Route and infrastructure assessment for ground logistics.
 
-Six tasks per settlement. K = 10 gives 60 tasks, comparable to the volcano case
-study.
+Six tasks per settlement.
 
 The three aim points are the reason the phases must run in order: each is
 genuinely unknown until its parent's product arrives, so the dispatcher blocks on
@@ -123,6 +112,39 @@ from fame_workflow import (
     TemporalConstraintType, SuccessConstraintType, Workflow,
 )
 from fame_workflow_stochastic import Lit, And, Or, Not, LogicNode
+
+
+class EarthquakeFeature(Phenomenon):
+    """Persistent, typed evidence returned by an earthquake observation.
+
+    ``phase`` identifies the spatial product represented by the feature.  A
+    feature may also carry the next aim point revealed by that product.  The
+    coordinates remain hidden inside the simulated world until a successful
+    parent observation returns the feature in its data product.
+    """
+
+    def __init__(self, *, lon_deg, lat_deg, start_time, end_time, name,
+                 settlement, phase, evidence_strength=1.0,
+                 reveals_phase=None, reveals_lat_deg=None,
+                 reveals_lon_deg=None):
+        super().__init__(
+            lon_deg=lon_deg,
+            lat_deg=lat_deg,
+            alt_km=0.0,
+            start_time=start_time,
+            end_time=end_time,
+            name=name,
+        )
+        self.settlement = str(settlement)
+        self.phase = str(phase)
+        self.evidence_strength = float(evidence_strength)
+        self.reveals_phase = reveals_phase
+        self.reveals_lat_deg = (
+            None if reveals_lat_deg is None else float(reveals_lat_deg)
+        )
+        self.reveals_lon_deg = (
+            None if reveals_lon_deg is None else float(reveals_lon_deg)
+        )
 
 
 # =============================================================================
@@ -503,7 +525,9 @@ def register_earthquake_phenomena(world, targets, min_time, max_time,
     rng = random.Random(seed)
     n_total = 0
 
-    def _scatter(lat0, lon0, spread_km, n, tag, label):
+    def _scatter(lat0, lon0, spread_km, n, tag, label, phase,
+                 reveals_phase=None, reveals_lat_deg=None,
+                 reveals_lon_deg=None):
         """Scatter n phenomena over a disc, CONCENTRATED toward the centre.
 
         r = spread * u**2, not spread * sqrt(u). Uniform-over-area scattering
@@ -518,20 +542,44 @@ def register_earthquake_phenomena(world, targets, min_time, max_time,
             r = spread_km * (rng.random() ** 2)
             b = rng.uniform(0.0, 2.0 * math.pi)
             lat, lon = _offset_latlon(lat0, lon0, r * math.cos(b), r * math.sin(b))
-            world.add_phenomenon(Phenomenon(
-                lon_deg=lon, lat_deg=lat, alt_km=0.0,
+            # Central evidence is clearer than evidence near the edge of the
+            # affected area.  This gives the updater a deterministic rule for
+            # choosing among several features returned by one observation.
+            evidence_strength = max(0.05, 1.0 - r / max(spread_km, 1e-9))
+            world.add_phenomenon(EarthquakeFeature(
+                lon_deg=lon, lat_deg=lat,
                 start_time=min_time, end_time=max_time,
-                name=f"{label}_{tag}_{i:03d}"))
+                name=f"{label}_{tag}_{i:03d}",
+                settlement=label,
+                phase=phase,
+                evidence_strength=evidence_strength,
+                reveals_phase=reveals_phase,
+                reveals_lat_deg=reveals_lat_deg,
+                reveals_lon_deg=reveals_lon_deg,
+            ))
             n_total += 1
 
     for tgt in targets:
         sev = max(0.25, tgt.severity)   # floor: even light damage is visible
-        _scatter(tgt.lat_deg, tgt.lon_deg, REGION_UNCERTAINTY_KM,
-                 round(n_region * sev), "rupture", tgt.name)
-        _scatter(tgt.urban_lat_deg, tgt.urban_lon_deg, URBAN_UNCERTAINTY_KM,
-                 round(n_urban * sev), "urban", tgt.name)
-        _scatter(tgt.district_lat_deg, tgt.district_lon_deg, DISTRICT_UNCERTAINTY_KM,
-                 round(n_district * sev), "district", tgt.name)
+        _scatter(
+            tgt.lat_deg, tgt.lon_deg, REGION_UNCERTAINTY_KM,
+            round(n_region * sev), "rupture", tgt.name, "region",
+            reveals_phase="urban",
+            reveals_lat_deg=tgt.urban_lat_deg,
+            reveals_lon_deg=tgt.urban_lon_deg,
+        )
+        _scatter(
+            tgt.urban_lat_deg, tgt.urban_lon_deg, URBAN_UNCERTAINTY_KM,
+            round(n_urban * sev), "urban", tgt.name, "urban",
+            reveals_phase="district",
+            reveals_lat_deg=tgt.district_lat_deg,
+            reveals_lon_deg=tgt.district_lon_deg,
+        )
+        _scatter(
+            tgt.district_lat_deg, tgt.district_lon_deg,
+            DISTRICT_UNCERTAINTY_KM, round(n_district * sev),
+            "district", tgt.name, "district",
+        )
 
     print(f"[Earthquake] Registered {n_total} damage phenomena over "
           f"{len(targets)} settlement(s), at three scales each")
@@ -590,8 +638,65 @@ def _rewarder(base_value, weight, t_event, optical):
     return _r
 
 
-def success_declarer(data_product):
-    return len(data_product) > 0
+def _flatten_product(data_product):
+    """Return a flat list for the simulator's scalar or nested products."""
+    if data_product is None:
+        return []
+    if not isinstance(data_product, (list, tuple, set)):
+        return [data_product]
+    flattened = []
+    for item in data_product:
+        if isinstance(item, (list, tuple, set)):
+            flattened.extend(_flatten_product(item))
+        elif item is not None:
+            flattened.append(item)
+    return flattened
+
+
+def _product_processor(expected_phase, settlement):
+    """Build the phase-specific product used by one workflow task.
+
+    A wide footprint may contain evidence from several spatial scales or nearby
+    settlements.  The requested product is successful only when it contains the
+    evidence type and settlement that the task was intended to collect.
+    """
+    def _processor(_observation, _spacecraft, phenomena):
+        is_collection = isinstance(phenomena, (list, tuple, set))
+        kept = [
+            item for item in _flatten_product(phenomena)
+            if isinstance(item, EarthquakeFeature)
+            and item.phase == expected_phase
+            and item.settlement == settlement
+        ]
+        return kept if is_collection else (kept[0] if kept else None)
+    return _processor
+
+
+def _success_for(expected_phase, settlement):
+    """Require the correct product, rather than any object in the footprint."""
+    def _success(data_product):
+        return any(
+            isinstance(item, EarthquakeFeature)
+            and item.phase == expected_phase
+            and item.settlement == settlement
+            for item in _flatten_product(data_product)
+        )
+    return _success
+
+
+def _best_reveal(data_products, settlement, destination_phase):
+    """Select the strongest returned feature that reveals an aim point."""
+    candidates = [
+        item for item in _flatten_product(data_products)
+        if isinstance(item, EarthquakeFeature)
+        and item.settlement == settlement
+        and item.reveals_phase == destination_phase
+        and item.reveals_lat_deg is not None
+        and item.reveals_lon_deg is not None
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item.evidence_strength)
 
 
 # =============================================================================
@@ -726,6 +831,11 @@ def create_earthquake_workflow(targets, min_time, max_time, max_num_instances=3,
     def _add(task, settlement_name, kind):
         task.eq_meta = (settlement_name, kind)
         task.enforce_success_precedence = (kind != 'extent')
+        task.target_stage = "region"
+        task.target_revealed = (kind == "extent")
+        task.retarget_count = 0
+        task.geometry_revision = 0
+        task.retarget_history = []
         tasks.append(task)
 
     for tgt in targets:
@@ -743,7 +853,8 @@ def create_earthquake_workflow(targets, min_time, max_time, max_num_instances=3,
             dispatch_policy_if_constraint_unsatisfied=policy_dispatch,
             timeline_constraints=[], timeline_impacts=[],
             rewarder=_rewarder(VALUE_EXTENT, w, t_event, optical=False),
-            success_declarer=success_declarer,
+            success_declarer=_success_for("region", g),
+            phenomenon_processor=_product_processor("region", g),
             request_group=f"{g}_extent",
             max_num_instances=max_num_instances,
         )
@@ -766,7 +877,8 @@ def create_earthquake_workflow(targets, min_time, max_time, max_num_instances=3,
             dispatch_policy_if_constraint_unsatisfied=policy_dispatch,
             timeline_constraints=[], timeline_impacts=[],
             rewarder=_rewarder(VALUE_URBAN_OPT, w, t_event, optical=True),
-            success_declarer=success_declarer,
+            success_declarer=_success_for("urban", g),
+            phenomenon_processor=_product_processor("urban", g),
             request_group=f"{g}_urban",
             max_num_instances=max_num_instances,
         )
@@ -784,7 +896,8 @@ def create_earthquake_workflow(targets, min_time, max_time, max_num_instances=3,
             dispatch_policy_if_constraint_unsatisfied=policy_dispatch,
             timeline_constraints=[], timeline_impacts=[],
             rewarder=_rewarder(VALUE_URBAN_SAR, w, t_event, optical=False),
-            success_declarer=success_declarer,
+            success_declarer=_success_for("urban", g),
+            phenomenon_processor=_product_processor("urban", g),
             request_group=f"{g}_urban",
             max_num_instances=max_num_instances,
         )
@@ -807,14 +920,15 @@ def create_earthquake_workflow(targets, min_time, max_time, max_num_instances=3,
             name=f"{g}_triage",
             observation_request=_req(tgt, f"{g}_triage", triage_lo, triage_hi,
                                      InstrumentType.RGB),
-            is_mandatory=False,
+            is_mandatory=True,
             task_constraints=_phase_constraints(extent, TRIAGE_OPEN_H, TRIAGE_CLOSE_H,
                                                 [urban_opt, urban_sar]),
             schedule_policy_if_constraint_unsatisfied=policy_schedule,
             dispatch_policy_if_constraint_unsatisfied=policy_dispatch,
             timeline_constraints=[], timeline_impacts=[],
             rewarder=_rewarder(VALUE_TRIAGE, w, t_event, optical=True),
-            success_declarer=success_declarer,
+            success_declarer=_success_for("district", g),
+            phenomenon_processor=_product_processor("district", g),
             request_group=f"{g}_triage",
             max_num_instances=max_num_instances,
         )
@@ -834,14 +948,15 @@ def create_earthquake_workflow(targets, min_time, max_time, max_num_instances=3,
             name=f"{g}_hires",
             observation_request=_req(tgt, f"{g}_hires", final_lo, final_hi,
                                      InstrumentType.RGB),
-            is_mandatory=False,
+            is_mandatory=True,
             task_constraints=_phase_constraints(extent, FINAL_OPEN_H, FINAL_CLOSE_H,
                                                 [triage]),
             schedule_policy_if_constraint_unsatisfied=policy_schedule,
             dispatch_policy_if_constraint_unsatisfied=policy_dispatch,
             timeline_constraints=[], timeline_impacts=[],
             rewarder=_rewarder(VALUE_HIRES, w, t_event, optical=True),
-            success_declarer=success_declarer,
+            success_declarer=_success_for("district", g),
+            phenomenon_processor=_product_processor("district", g),
             request_group=f"{g}_hires",
             max_num_instances=max_num_instances,
         )
@@ -856,14 +971,15 @@ def create_earthquake_workflow(targets, min_time, max_time, max_num_instances=3,
             name=f"{g}_access",
             observation_request=_req(tgt, f"{g}_access", final_lo, final_hi,
                                      InstrumentType.SAR),
-            is_mandatory=False,
+            is_mandatory=True,
             task_constraints=_phase_constraints(extent, FINAL_OPEN_H, FINAL_CLOSE_H,
                                                 [triage]),
             schedule_policy_if_constraint_unsatisfied=policy_schedule,
             dispatch_policy_if_constraint_unsatisfied=policy_dispatch,
             timeline_constraints=[], timeline_impacts=[],
             rewarder=_rewarder(VALUE_ACCESS, w, t_event, optical=False),
-            success_declarer=success_declarer,
+            success_declarer=_success_for("district", g),
+            phenomenon_processor=_product_processor("district", g),
             request_group=f"{g}_access",
             max_num_instances=max_num_instances,
         )
@@ -877,60 +993,148 @@ def create_earthquake_workflow(targets, min_time, max_time, max_num_instances=3,
     # ---------------------------------------------------------------------
     # PROGRESSIVE RETARGETING
     # ---------------------------------------------------------------------
-    target_by_name = {t.name: t for t in targets}
-
     def request_updater_earthquake(current_time, requests, timelines):
-        """Narrow each unbooked task's aim point as the campaign learns.
+        """Reveal and apply aim points from successful parent data products.
 
             region (+-30 km) -> urban area (+-8 km) -> district (+-2 km)
 
-        PHASE 1 retargets to the affected built-up area once EXTENT has mapped the
-        footprint; PHASE 2/3 retarget to the worst-hit district once the area has
-        been characterised. Before the parent completes the aim point genuinely
-        does not exist -- which is why the dispatch policy blocks on SUCCESS. The
-        sequencing is physical, not conventional.
+        PHASE 1 reads the urban aim point from the EXTENT product. PHASE 2/3 read
+        the district aim point from whichever urban product succeeds. The hidden
+        truth lives on EarthquakeFeature objects in the simulated world; this
+        callback cannot access it until those objects appear in a returned data
+        product.
 
         MUTATES observation_request IN PLACE. Rebinding would orphan every booking
         row already recorded against the task in broker._requests, since those hold
         the object as it was at DISPATCH time -- and the more a planner replans, the
         more of its own bookings it would lose from its own metrics.
         """
-        done = set()
-        for r in requests:
-            if getattr(r, 'completed', False) and getattr(r, 'successful_execution', False):
-                done.add(r.observation_request.name)
+        del timelines
+        by_group = {}
+        for task in requests:
+            group, kind = getattr(task, "eq_meta", (None, None))
+            if group is not None:
+                by_group.setdefault(group, {})[kind] = task
 
-        n_urban = n_district = 0
-        for r in requests:
-            if getattr(r, 'completed', False) or getattr(r, 'dispatched', False):
-                continue
-            g, kind = getattr(r, 'eq_meta', (None, None))
-            if g is None:
-                continue
-            tgt = target_by_name.get(g)
-            if tgt is None:
-                continue
+        changes = []
 
-            if kind in ('urban_opt', 'urban_sar'):
-                if f"{g}_extent" in done:
-                    r.observation_request.lat_deg = float(tgt.urban_lat_deg)
-                    r.observation_request.lon_deg = float(tgt.urban_lon_deg)
-                    n_urban += 1
-            elif kind in ('triage', 'hires', 'access'):
-                if (f"{g}_urban_opt" in done) or (f"{g}_urban_sar" in done):
-                    r.observation_request.lat_deg = float(tgt.district_lat_deg)
-                    r.observation_request.lon_deg = float(tgt.district_lon_deg)
-                    n_district += 1
-                elif f"{g}_extent" in done:
-                    # Footprint known but not yet characterised: the best available
-                    # aim point is the urban area.
-                    r.observation_request.lat_deg = float(tgt.urban_lat_deg)
-                    r.observation_request.lon_deg = float(tgt.urban_lon_deg)
-                    n_urban += 1
+        def _returned_product(task):
+            if (task is None
+                    or not getattr(task, "completed", False)
+                    or not getattr(task, "successful_execution", False)):
+                return []
+            return _flatten_product(getattr(task, "data_product", []))
 
-        if n_urban or n_district:
-            print(f"    [Retarget] {n_urban} task(s) -> urban area, "
-                  f"{n_district} task(s) -> district")
+        def _retarget(task, reveal, stage, source_name):
+            if (task is None or reveal is None
+                    or getattr(task, "completed", False)
+                    or getattr(task, "dispatched", False)):
+                return False
+
+            old_lat = float(task.observation_request.lat_deg)
+            old_lon = float(task.observation_request.lon_deg)
+            new_lat = float(reveal.reveals_lat_deg)
+            new_lon = float(reveal.reveals_lon_deg)
+            old_stage = getattr(task, "target_stage", "region")
+
+            # Do not report the same reveal at every event-driven replan.
+            if (old_stage == stage
+                    and math.isclose(old_lat, new_lat, abs_tol=1e-12)
+                    and math.isclose(old_lon, new_lon, abs_tol=1e-12)):
+                return False
+
+            task.observation_request.lat_deg = new_lat
+            task.observation_request.lon_deg = new_lon
+            task.target_stage = stage
+            task.target_revealed = True
+            task.retarget_count = int(getattr(task, "retarget_count", 0)) + 1
+            task.geometry_revision = int(
+                getattr(task, "geometry_revision", 0)
+            ) + 1
+            task.retarget_source = source_name
+            task.retarget_feature = reveal.name
+
+            # This task has not been dispatched, so any opportunity selected for
+            # its previous aim point is only a stale internal plan.  Clear the
+            # task-level geometry cache and selection fields so the next solve
+            # must rebuild them for the revealed point.
+            task.observation_opportunities = {}
+            task.observation_opportunity = None
+            task.observation_opportunity_pass = None
+            task.observation_opportunity_satellite = None
+            task.pending_dispatch_passes = []
+            task.scheduled = False
+
+            moved_km = _km_between(old_lat, old_lon, new_lat, new_lon)
+            history = getattr(task, "retarget_history", None)
+            if history is None:
+                history = []
+                task.retarget_history = history
+            history.append({
+                "time": current_time.isoformat()
+                if hasattr(current_time, "isoformat") else str(current_time),
+                "from_stage": old_stage,
+                "to_stage": stage,
+                "from_lat_deg": old_lat,
+                "from_lon_deg": old_lon,
+                "to_lat_deg": new_lat,
+                "to_lon_deg": new_lon,
+                "distance_km": moved_km,
+                "source_task": source_name,
+                "source_feature": reveal.name,
+            })
+            changes.append((task.name, old_stage, stage, moved_km, source_name))
+            return True
+
+        for group, parts in by_group.items():
+            extent = parts.get("extent")
+            extent_product = _returned_product(extent)
+            urban_reveal = _best_reveal(extent_product, group, "urban")
+
+            if urban_reveal is not None:
+                source = extent.name
+                for kind in ("urban_opt", "urban_sar"):
+                    _retarget(parts.get(kind), urban_reveal, "urban", source)
+
+            urban_products = []
+            successful_urban_names = []
+            for kind in ("urban_opt", "urban_sar"):
+                parent = parts.get(kind)
+                product = _returned_product(parent)
+                if product:
+                    urban_products.extend(product)
+                    successful_urban_names.append(parent.name)
+            district_reveal = _best_reveal(urban_products, group, "district")
+
+            if district_reveal is not None:
+                source = "|".join(successful_urban_names)
+                for kind in ("triage", "hires", "access"):
+                    _retarget(parts.get(kind), district_reveal, "district", source)
+            elif urban_reveal is not None:
+                # These tasks are still blocked on urban SUCCESS. Moving their
+                # nominal look-ahead target to the best currently known area
+                # makes the intermediate plan less fictional without dispatching
+                # anything early.
+                source = extent.name
+                for kind in ("triage", "hires", "access"):
+                    _retarget(parts.get(kind), urban_reveal, "urban", source)
+
+        if changes:
+            counts = {
+                stage: sum(1 for _, _, new_stage, _, _ in changes
+                           if new_stage == stage)
+                for stage in ("urban", "district")
+            }
+            print(
+                f"    [Retarget] {counts['urban']} task(s) -> urban, "
+                f"{counts['district']} task(s) -> district; "
+                f"mean move={sum(c[3] for c in changes) / len(changes):.1f} km"
+            )
+            for task_name, old_stage, new_stage, moved_km, source in changes:
+                print(
+                    f"        {task_name}: {old_stage} -> {new_stage} "
+                    f"({moved_km:.1f} km), revealed by {source}"
+                )
         return requests
 
     n_not = sum(1 for t in tasks if _has_not(getattr(t, 'gate', None)))
