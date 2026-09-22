@@ -42,20 +42,24 @@ GROUND_STATIONS = [
 # SATELLITE LOADING
 # ===========================================================================
 
-def load_satellites_once(sim_start: dt.datetime, horizon_h: float) -> list:
+def load_satellites_once(sim_start: dt.datetime, horizon_h: float,
+                         tle_file: str | None = None) -> list:
     """
-    Load the full 8-constellation LEO fleet from the most recent TLE file.
+    Load the full 11-constellation LEO fleet from a TLE file.
 
     Uses display names as the canonical key (e.g. "SKYSAT-C1", "ICEYE-X4"),
     resolves TLE names via tle_to_display where they differ, and filters out
     decayed or invalid orbits by propagating to both sim_start and sim_start+horizon_h.
 
+    tle_file: optional explicit path. Default = most recent ``tles/all_tles_*.txt``.
+
     Returns a list of Satellite objects with instrument_fov_rad populated.
     """
-    tle_files = glob.glob("tles/all_tles_*.txt")
-    if not tle_files:
-        raise FileNotFoundError("No TLE files found in tles/")
-    tle_file = sorted(tle_files)[-1]
+    if tle_file is None:
+        tle_files = glob.glob("tles/all_tles_*.txt")
+        if not tle_files:
+            raise FileNotFoundError("No TLE files found in tles/")
+        tle_file = sorted(tle_files)[-1]
     print(f"[Init] Using TLE file: {tle_file}")
 
     min_time = sim_start
@@ -89,6 +93,31 @@ def load_satellites_once(sim_start: dt.datetime, horizon_h: float) -> list:
         "Mission Control Persistence": 100,
         #"LEMUR 2 KRISH": 17.5,
         "AEROCUBE 18A": 80, "AEROCUBE 18B": 80,
+        # OroraTech FOREST (SAFIRE-class TIR, 1x MWIR + 2x LWIR, 200 m GSD).
+        # Swath is the combined dual-telescope figure; the model has a single
+        # nadir cone per instrument, so it goes in as one 400 km footprint.
+        # OT-FOREST-3 also carries an RGB context imager, not modelled: it is
+        # not independently taskable.
+        "OT-FOREST-16 SIWITASGOHT": 400,
+        "OT-FOREST-17 TELPERION": 400,
+        "FOREST-18 MANGOSHRIKHAND": 400,
+        "OT-FOREST-19 PATADASTRA": 400,
+        "OT-FOREST-3 BJOERNTBW": 400,
+        # constellr SkyBee (cryocooled MCT TIR, 4 bands, 28.9 m GSD). The 10-11
+        # band VNIR imager (5 m GSD, 21 km swath) is georeferencing support
+        # only, so it is not modelled as a schedulable instrument.
+        "SKYBEE-A01": 17.5,
+        "SKYBEE-A02": 17.5,
+        # OroraTech OTC-P1 (FOREST-4P..11P) plus FOREST-2. These fly SAFIRE as a
+        # hosted payload on Spire buses, so the catalogue names them "LEMUR 2 *"
+        # -- see tle_to_display below. They are aliased to OT-FOREST-* display
+        # names so the "LEMUR" -> Mission Control/RGB rule cannot claim them.
+        "OT-FOREST-2": 410, "OT-FOREST-4P": 410, "OT-FOREST-5P": 410,
+        "OT-FOREST-6P": 410, "OT-FOREST-7P": 410, "OT-FOREST-8P": 410,
+        "OT-FOREST-9P": 410, "OT-FOREST-10P": 410, "OT-FOREST-11P": 410,
+        # SatVu HotSat (3.5 m TIR). Swath is a placeholder: SatVu has not
+        # published it, so treat the 25 km figure as UNVERIFIED.
+        "HOTSAT-1": 25, "HOTSAT-2": 25,
     }
     for name in flock_names:
         swaths_at_nadir_km[name] = 16.4
@@ -117,6 +146,16 @@ def load_satellites_once(sim_start: dt.datetime, horizon_h: float) -> list:
         "HAMMER": "Ubotica CogniSat-6 HAMMER",
         "ACCENTURE-1": "Ubotica ACCENTURE-1 SUAC",
         "LEMUR 2 KRISH": "Mission Control Persistence",
+        # OroraTech FOREST payloads on Spire buses (NORAD in comments).
+        "LEMUR 2 EMBRIONOVIS":  "OT-FOREST-2",    # 56970
+        "LEMUR 2 KREMPEL-BRO1": "OT-FOREST-4P",   # 63357
+        "LEMUR 2 THERMORAPTOR": "OT-FOREST-5P",   # 63354
+        "LEMUR 2 KREMPEL-BRO2": "OT-FOREST-6P",   # 63353
+        "LEMUR 2 LANGER2SPACE": "OT-FOREST-7P",   # 63358
+        "LEMUR 2 NEUROSPICY":   "OT-FOREST-8P",   # 63355
+        "LEMUR 2 ESPERANZA":    "OT-FOREST-9P",   # 63352
+        "LEMUR 2 TILLINFINITY": "OT-FOREST-10P",  # 63356
+        "LEMUR 2 UNTITLED-SC":  "OT-FOREST-11P",  # 63351
     }
     display_to_tle = {v: k for k, v in tle_to_display.items()}
 
@@ -137,6 +176,9 @@ def load_satellites_once(sim_start: dt.datetime, horizon_h: float) -> list:
         "PERSISTENCE": ("Mission Control", InstrumentType.RGB),
         "AEROCUBE":    ("Aerospace",       InstrumentType.RGB),
         "ICEYE":       ("ICEYE",           InstrumentType.SAR),
+        "FOREST":      ("OroraTech",       InstrumentType.TIR),
+        "SKYBEE":      ("constellr",       InstrumentType.TIR),
+        "HOTSAT":      ("SatVu",           InstrumentType.TIR),
     }
 
     satellites = []
@@ -179,7 +221,7 @@ def create_world_and_constellations(
     acceptance_notification_delay_h: tuple = (0.0, 0.0),
 ):
     """
-    Spin up a fresh World + 8 ConstellationGroundSchedulers from deep-copied satellites.
+    Spin up a fresh World + 11 ConstellationGroundSchedulers from deep-copied satellites.
 
     demand_field: if provided, its make_simulator_acceptance_function() is wired as
                   the simulator-side acceptance draw (same model the planner uses).
@@ -199,6 +241,9 @@ def create_world_and_constellations(
     mc_sats       = [s for s in local_sats if "PERSISTENCE" in s.name.upper() or "LEMUR"        in s.name.upper()]
     aero_sats     = [s for s in local_sats if "AEROCUBE"    in s.name.upper()]
     iceye_sats    = [s for s in local_sats if "ICEYE"       in s.name.upper()]
+    ororatech_sats= [s for s in local_sats if "FOREST"      in s.name.upper()]
+    constellr_sats= [s for s in local_sats if "SKYBEE"      in s.name.upper()]
+    satvu_sats    = [s for s in local_sats if "HOTSAT"      in s.name.upper()]
 
     sim_acc_fn = demand_field.make_simulator_acceptance_function() if demand_field is not None else None
 
@@ -220,10 +265,14 @@ def create_world_and_constellations(
     sched_mc      = _make(mc_sats,      "Mission Control", 0.74)
     sched_aero    = _make(aero_sats,    "AC",              0.77)
     sched_iceye   = _make(iceye_sats,   "ICEYE",           0.74)
+    sched_orora   = _make(ororatech_sats, "OroraTech",     0.78)
+    sched_constellr = _make(constellr_sats, "constellr",   0.72)
+    sched_satvu   = _make(satvu_sats,   "SatVu",           0.70)
 
     all_constellations = [
         sched_planet, sched_umbra, sched_capella, sched_loft,
         sched_ubotica, sched_mc, sched_aero, sched_iceye,
+        sched_orora, sched_constellr, sched_satvu,
     ]
     for c in all_constellations:
         world.add_constellation(c)
