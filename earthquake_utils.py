@@ -150,14 +150,11 @@ class EarthquakeFeature(Phenomenon):
 # =============================================================================
 # TIMING  -- 24-hour response campaign
 # =============================================================================
-CAMPAIGN_HORIZON_H = 24.0
-EXTENT_WINDOW_H = 6.0
-
-# A phase may open as soon as its immediate SUCCESS predecessor completes.
-# The close offsets remain EXTENT-relative campaign deadlines.
-URBAN_OPEN_H, URBAN_CLOSE_H = 0.0, 4.5
-TRIAGE_OPEN_H, TRIAGE_CLOSE_H = 0.0, 8.25
-FINAL_OPEN_H, FINAL_CLOSE_H = 0.0, 12.0
+CAMPAIGN_HORIZON_H = 18.0          # and LOOKAHEAD_HORIZON_H = 56.0
+EXTENT_WINDOW_H = 3.0
+URBAN_OPEN_H,  URBAN_CLOSE_H  = 0.0, 6.0
+TRIAGE_OPEN_H, TRIAGE_CLOSE_H = 6.0, 12.0
+FINAL_OPEN_H,  FINAL_CLOSE_H  = 12.0, 15.0
 
 # Usable-GSD floor. At 15 deg the planner books 1500 km slant ranges, which is
 # not a product anyone would grade buildings from; at 25 deg a mandatory EXTENT
@@ -210,6 +207,12 @@ VALUE_URBAN_SAR = 70.0        # coarser: no building-level detail
 VALUE_TRIAGE    = 130.0
 VALUE_HIRES     = 100.0
 VALUE_ACCESS    = 80.0
+# VALUE_EXTENT    = 60.0
+# VALUE_URBAN_OPT = 60.0
+# VALUE_URBAN_SAR = 60.0        # coarser: no building-level detail
+# VALUE_TRIAGE    = 60.0
+# VALUE_HIRES     = 60.0
+# VALUE_ACCESS    = 60.0
 
 # Rewarder geometry weights (each group sums to 1.0)
 W_LOOK, W_ILLUM, W_RANGE = 0.35, 0.25, 0.40
@@ -870,7 +873,7 @@ def create_earthquake_workflow(targets, min_time, max_time, max_num_instances=3,
             name=f"{g}_urban_opt",
             observation_request=_req(tgt, f"{g}_urban_opt", urban_lo, urban_hi,
                                      InstrumentType.RGB),
-            is_mandatory=False,
+            is_mandatory=True,
             task_constraints=_phase_constraints(extent, URBAN_OPEN_H, URBAN_CLOSE_H,
                                                 [extent]),
             schedule_policy_if_constraint_unsatisfied=policy_schedule,
@@ -889,7 +892,7 @@ def create_earthquake_workflow(targets, min_time, max_time, max_num_instances=3,
             name=f"{g}_urban_sar",
             observation_request=_req(tgt, f"{g}_urban_sar", urban_lo, urban_hi,
                                      InstrumentType.SAR),
-            is_mandatory=False,
+            is_mandatory=True,
             task_constraints=_phase_constraints(extent, URBAN_OPEN_H, URBAN_CLOSE_H,
                                                 [extent]),
             schedule_policy_if_constraint_unsatisfied=policy_schedule,
@@ -964,7 +967,8 @@ def create_earthquake_workflow(targets, min_time, max_time, max_num_instances=3,
         # value of this task. No baseline can represent that. Pair this with a
         # raised c_exec on the hires group in the driver -- the gate is
         # cost-avoidance, not a logic demonstration.
-        hires.gate = And(Lit(triage), Not(Lit(urban_opt)))
+        #hires.gate = And(Lit(triage), Not(Lit(urban_opt)))
+        hires.gate = And(Lit(triage))
         _add(hires, g, 'hires')
 
         access = ConstrainedObservationRequest(

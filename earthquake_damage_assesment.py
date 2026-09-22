@@ -48,10 +48,10 @@ from benchmarking_utils import (
 
 # ============================ Configuration =================================
 SIMULATION_START = dt.datetime(2026, 8, 1, 0, 0, 0)
-LOOKAHEAD_HORIZON_H = 24.0   # Exact workflow lifespan
+LOOKAHEAD_HORIZON_H = 18.0    # Exact workflow lifespan
 MAX_SOLVER_TIME_S = 120       # Fast solver timeout cap
 MAX_NUM_INSTANCES = 5        # Backup passes per task
-NUM_MC_RUNS = 2
+NUM_MC_RUNS = 50
 
 # === COST CONFIGURATION ===
 TAX_RATE = 0.0              
@@ -72,13 +72,13 @@ PROVIDER_RATES = {
 
 PROVIDER_RATE_DEFAULT = 0.020
 LEAD_K = 3.0          
-LEAD_T_REF_H = 6.0   
+LEAD_T_REF_H = 12.0   
 
 # === PROBABILITY CONFIGURATION ===
-P_ACC_MIN = 0.75  
+P_ACC_MIN = 0.70  
 P_ACC_MAX = 0.95 
 
-P_EXEC_MIN = 0.75  
+P_EXEC_MIN = 0.65  
 P_EXEC_MAX = 0.95
 
 # Ablation ladder -- each rung adds exactly one capability, so a gap between
@@ -103,8 +103,8 @@ def load_satellites_for_earthquake(sim_start: dt.datetime, horizon_h: float) -> 
     """
     full_fleet = _load_satellites_once_shared(sim_start, horizon_h)
     
-    rgb_sats = [s for s in full_fleet if InstrumentType.RGB in s.instruments]
-    sar_sats = [s for s in full_fleet if InstrumentType.SAR in s.instruments]
+    rgb_sats = [s for s in full_fleet if InstrumentType.RGB in s.instruments][:50]
+    sar_sats = [s for s in full_fleet if InstrumentType.SAR in s.instruments][:30]
     
     pruned_fleet = rgb_sats + sar_sats
     print(f"[Fleet Tuning] Selected {len(pruned_fleet)} satellites ({len(rgb_sats)} RGB, {len(sar_sats)} SAR) out of {len(full_fleet)} total.")
@@ -538,7 +538,8 @@ def aggregate(results_dir, records=None):
     return records
 
 
-def run_comparison(num_monte_carlo_runs=NUM_MC_RUNS, results_dir=None, plot_schedule=True):
+def run_comparison(num_monte_carlo_runs=NUM_MC_RUNS, results_dir=None, plot_schedule=True,
+                   write_scene_map=False):
     if results_dir is None:
         timestamp = dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
         results_dir = os.path.join("results", f"earthquake_{timestamp}")
@@ -549,6 +550,13 @@ def run_comparison(num_monte_carlo_runs=NUM_MC_RUNS, results_dir=None, plot_sche
     max_time = SIMULATION_START + dt.timedelta(hours=LOOKAHEAD_HORIZON_H)
 
     targets = load_earthquake_targets(min_time)
+    from earthquake_visualize import (
+        targets_to_scenario, dump_scenario_json, write_map_for_results_dir,
+    )
+    scenario = targets_to_scenario(targets, sim_start=min_time)
+    dump_scenario_json(scenario, os.path.join(results_dir, "scenario.json"))
+    if write_scene_map:
+        write_map_for_results_dir(results_dir, scenario=scenario)
     demand_field = build_demand_field(targets, min_time)
 
     all_records = []
@@ -582,16 +590,36 @@ def main():
                         help="Number of seeds for the in-process loop.")
     parser.add_argument('--no-schedule-plots', action='store_true',
                         help="Skip per-run schedule plots.")
+    parser.add_argument('--viz', action='store_true',
+                        help="Write Leaflet scene map (epicentre / settlements / "
+                             "districts / access) into the results dir.")
+    parser.add_argument('--viz-only', action='store_true',
+                        help="Only write the scene map (no scheduling runs).")
     args = parser.parse_args()
 
     if args.aggregate:
         if not args.results_dir:
             parser.error("--aggregate requires --results-dir")
         aggregate(args.results_dir)
+        if args.viz:
+            from earthquake_visualize import write_map_for_results_dir
+            write_map_for_results_dir(args.results_dir)
         return
 
     if args.start:
         SIMULATION_START = dt.datetime.fromisoformat(args.start)
+
+    if args.viz_only:
+        results_dir = args.results_dir or os.path.join(
+            "results", f"earthquake_{dt.datetime.now().strftime('%Y-%m-%d_%H%M%S')}")
+        os.makedirs(results_dir, exist_ok=True)
+        targets = load_earthquake_targets(SIMULATION_START)
+        from earthquake_visualize import (
+            targets_to_scenario, write_map_for_results_dir,
+        )
+        scenario = targets_to_scenario(targets, sim_start=SIMULATION_START)
+        write_map_for_results_dir(results_dir, scenario=scenario)
+        return
 
     if args.scheduler:
         if args.seed is None:
@@ -605,6 +633,11 @@ def main():
         max_time = SIMULATION_START + dt.timedelta(hours=LOOKAHEAD_HORIZON_H)
 
         targets = load_earthquake_targets(min_time)
+        from earthquake_visualize import targets_to_scenario, dump_scenario_json, write_map_for_results_dir
+        scenario = targets_to_scenario(targets, sim_start=min_time)
+        dump_scenario_json(scenario, os.path.join(results_dir, "scenario.json"))
+        if args.viz:
+            write_map_for_results_dir(results_dir, scenario=scenario)
         demand_field = build_demand_field(targets, min_time)
 
         run_one_scheduler(args.scheduler, args.seed, cached_satellites,
@@ -613,7 +646,8 @@ def main():
         return
 
     run_comparison(num_monte_carlo_runs=args.runs, results_dir=args.results_dir,
-                   plot_schedule=not args.no_schedule_plots)
+                   plot_schedule=not args.no_schedule_plots,
+                   write_scene_map=args.viz)
 
 
 if __name__ == "__main__":
