@@ -7,6 +7,9 @@ acceptance probability through a sigmoid so the value stays in a configurable ba
 
 Single source of truth: the same DemandField instance is used by both the simulator
 (to draw Bernoulli outcomes) and the stochastic planner (to set MILP coefficients).
+Optionally, the planner can be given a noisy view of p_accept via
+``install_planner_estimate_error`` / ``make_noisy_acceptance_prob_function`` while the
+simulator continues to use the true field — used only by acceptance_sensitivity_sweep.py.
 
 Two RNG streams are kept separate:
   _rng_demand  — drives the OU evolution of the demand field
@@ -20,7 +23,9 @@ identical accept/reject outcomes.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import math
+import struct
 import warnings
 from dataclasses import dataclass, field
 from typing import Optional
@@ -124,8 +129,11 @@ class DemandFieldConfig:
         "Mission Control": 0.55,
         "ICEYE":           0.48,
         "AC":              0.42,
+        "OroraTech":       0.75,
         # expensive / reliable — low demand → high p_accept
         "Umbra":           0.32,
+        "constellr":       0.24,
+        "SatVu":           0.22,
         "Capella":         0.20,
     })
     default_popularity: float = 0.50
@@ -423,6 +431,7 @@ class DemandField:
             "Planet": 0.40, "Umbra": 0.60, "Capella": 0.90,
             "LOFT": 0.71, "Ubotica": 0.50, "Mission Control": 0.64,
             "AC": 0.67, "ICEYE": 0.74,
+            "OroraTech": 0.45, "constellr": 0.85, "SatVu": 0.85,
         }
         return _LEGACY.get(constellation, 0.70)
 
@@ -481,8 +490,74 @@ class DemandField:
     def make_acceptance_prob_function(self):
         """Return a callable matching the planner signature:
         f(constrained_request, satellite, obs_pass) → float
+
+        If ``planner_relative_error`` is set on this instance (see
+        ``install_planner_estimate_error``), the returned callable applies a
+        multiplicative relative error to the *true* p_accept.  The simulator
+        path (``make_simulator_acceptance_function``) is never affected.
+        Default / unset → identical to the true demand field (no behaviour change).
         """
         demand_field = self
+        rel_error = float(getattr(self, "planner_relative_error", 0.0) or 0.0)
+        est_seed = int(getattr(self, "planner_estimate_seed", 0) or 0)
+
+        if rel_error <= 0.0:
+            def _f(constrained_request, satellite, obs_pass):
+                req = constrained_request.observation_request
+                lat = req.lat_deg
+                lon = req.lon_deg
+                t = obs_pass.highest.time
+                constellation = _constellation_name_from_satellite(satellite.name)
+                return demand_field.acceptance_probability(constellation, lat, lon, t)
+
+            return _f
+
+        return self.make_noisy_acceptance_prob_function(
+            relative_error=rel_error, estimate_seed=est_seed,
+        )
+
+    def make_noisy_acceptance_prob_function(
+        self,
+        relative_error: float,
+        estimate_seed: int = 0,
+    ):
+        """Planner-only approximate p_accept with a relative error margin.
+
+        For each coarse (constellation, lat, lon, time) key the planner sees
+        ``p_hat = clip(p_true * U(1-δ, 1+δ), 0, 1)`` where δ = ``relative_error``.
+        Factors are deterministic given ``estimate_seed`` (hash-based), so query
+        order does not matter and paired schedulers share the same estimate.
+
+        The simulator must keep using ``make_simulator_acceptance_function()``
+        (truth) so accept/reject outcomes stay calibrated to the true demand.
+        """
+        demand_field = self
+        if relative_error <= 0.0:
+            # Always return exact truth here (do not re-enter make_acceptance_prob_function,
+            # which may have planner_relative_error set).
+            def _exact(constrained_request, satellite, obs_pass):
+                req = constrained_request.observation_request
+                lat = req.lat_deg
+                lon = req.lon_deg
+                t = obs_pass.highest.time
+                constellation = _constellation_name_from_satellite(satellite.name)
+                return demand_field.acceptance_probability(constellation, lat, lon, t)
+
+            return _exact
+
+        delta = float(relative_error)
+        seed = int(estimate_seed)
+
+        def _factor(constellation: str, lat: float, lon: float, t: dt.datetime) -> float:
+            # Coarse bins → coherent regional mis-estimate of demand / p_accept.
+            t_h = (t - demand_field.reference_time).total_seconds() / 3600.0
+            key = (
+                f"{seed}|{constellation}|"
+                f"{round(lat, 1):.1f}|{round(lon, 1):.1f}|{round(t_h, 1):.1f}"
+            )
+            digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
+            u = struct.unpack("<Q", digest)[0] / 2**64  # [0, 1)
+            return 1.0 - delta + 2.0 * delta * u
 
         def _f(constrained_request, satellite, obs_pass):
             req = constrained_request.observation_request
@@ -490,9 +565,29 @@ class DemandField:
             lon = req.lon_deg
             t = obs_pass.highest.time
             constellation = _constellation_name_from_satellite(satellite.name)
-            return demand_field.acceptance_probability(constellation, lat, lon, t)
+            p_true = demand_field.acceptance_probability(constellation, lat, lon, t)
+            p_hat = p_true * _factor(constellation, lat, lon, t)
+            return float(np.clip(p_hat, 0.0, 1.0))
 
         return _f
+
+    def install_planner_estimate_error(
+        self,
+        relative_error: float = 0.0,
+        estimate_seed: int = 0,
+    ) -> None:
+        """Opt-in: make subsequent ``make_acceptance_prob_function()`` noisy.
+
+        Leave unset / ``relative_error=0`` for exact planner knowledge (default).
+        Does not affect ``make_simulator_acceptance_function``.
+        """
+        self.planner_relative_error = float(relative_error)
+        self.planner_estimate_seed = int(estimate_seed)
+
+    def clear_planner_estimate_error(self) -> None:
+        """Restore exact planner knowledge of p_accept."""
+        self.planner_relative_error = 0.0
+        self.planner_estimate_seed = 0
 
     def make_simulator_acceptance_function(self):
         """Return a callable matching the simulator signature:
@@ -504,6 +599,9 @@ class DemandField:
         used for the simulator path (stdlib random handles that draw), which is
         intentional: the simulator's accept/reject draw must remain tied to the
         shared stdlib random seed so all planners face identical outcomes.
+
+        Always returns the *true* acceptance probability (never the planner's
+        noisy estimate).
         """
         demand_field = self
 
@@ -829,4 +927,10 @@ def _constellation_name_from_satellite(sat_name: str) -> str:
         return "AC"
     if "ICEYE" in u:
         return "ICEYE"
+    if "FOREST" in u:
+        return "OroraTech"
+    if "SKYBEE" in u:
+        return "constellr"
+    if "HOTSAT" in u:
+        return "SatVu"
     return "Unknown"

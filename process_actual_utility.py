@@ -1,18 +1,18 @@
-"""Reconstruct causally valid run metrics and generate the standard plots.
+"""Score runs from the simulator's live observation table, then plot.
 
-This script pairs every ``run_*.json`` summary with its corresponding
-``executions_*.json`` file.  It uses the execution records for metrics that can
-be corrupted by later case-specific summary rewrites:
+Primary metrics come from each ``run_*.json``.  That file was written from the
+request table at the end of the simulation: every DATA_RECEIVED pass with a
+product, after the case-specific reachability override.  The dispatcher already
+blocked children whose success constraints were not met, including OR via
+``success_constraint_mode = 'any'``, so those numbers are the observations that
+actually flew.
 
-* realized quality: best successful quality per causally valid task;
-* completed tasks: number of distinct causally valid tasks;
-* completion rate: valid completed tasks divided by the run's corrected
-  reachability denominator.
-
-Costs remain based on the run summary's submission and execution cost
-components.  The execution-detail file is intentionally not used as the
-primary cost source because it omits failed executions and causally invalid
-executions, even though those bookings still incur cost.
+``executions_*.json`` is optional diagnostic detail, not the score.  Older
+exports dropped any pass ``fame_metrics`` judged unreachable under a strict AND
+of success parents.  That deleted real triage/hires/access collects that the
+dispatcher had correctly released after one urban modality succeeded.  Summing
+those files therefore under-counts the campaign.  Failed bookings are also
+absent, so cost still comes from the run summary.
 
 The plotting functions and filenames are imported from ``plot_runs_results.py``
 so both scripts produce the same figures and folder layout.
@@ -35,14 +35,18 @@ import pandas as pd
 # ==============================================================================
 # CONFIGURATION â€” same pattern as plot_runs_results.py
 # ==============================================================================
-BASE_DIR = "/Users/davidf/Code/federated-scheduling/results"
+BASE_DIR = r"E:\Code\federated-scheduling\results"
 
-RUN_FOLDERS = [
-    "volcano_campaign_20260817_015417",
-    "volcano_2026-08-17_194449"
+# RUN_FOLDERS = [
+#     "volcano_2026-08-17_194449",
+#     "volcano_campaign_20260817_015417"
+# ]
+
+RUN_FOLDERS=[
+    "acc_sens_2026-09-17_085950\earthquake__err00pct"
 ]
 # RUN_FOLDERS = [
-#     "earthquake_campaign_20260817_002759",
+#     "earthquake_2026-09-11_100304",
 # ]
 HEDGING_SCHEDULER_ALIASES = {"stochastic_log", "stochastic_logical"}
 HEDGING_SCHEDULER_ID = "hedging_milp"
@@ -143,15 +147,17 @@ def _load_json(path: Path) -> Any:
         return json.load(stream)
 
 
-def _valid_best_entries(executions: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Select the highest-quality causally valid execution for every task."""
+def _best_entries(executions: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Highest-quality record per task.  Does not re-filter ``is_valid``.
+
+    Older execution files already deleted AND-unreachable rows, so ``is_valid``
+    is True on everything that remains.  New exports keep every DATA_RECEIVED
+    pass; the run summary, not this list, is the campaign score.
+    """
     best: dict[str, dict[str, Any]] = {}
     for entry in executions:
         if not isinstance(entry, dict) or not entry.get("task"):
             continue
-        if entry.get("is_valid", True) is not True:
-            continue
-
         task = str(entry["task"])
         quality = _as_float(entry.get("quality"), 0.0)
         if task not in best or quality > _as_float(best[task].get("quality"), 0.0):
@@ -192,22 +198,17 @@ def reconstruct_run(
     run: dict[str, Any],
     executions: list[dict[str, Any]],
     run_file: Path,
-    execution_file: Path,
+    execution_file: Path | None,
 ) -> dict[str, Any]:
-    """Return one corrected run record without modifying either source file."""
+    """Return one scored run.  Primary numbers come from the run summary."""
     corrected = dict(run)
-    best = _valid_best_entries(executions)
+    best = _best_entries(executions)
     selected = list(best.values())
+    quality_from_executions = float(
+        sum(_as_float(row.get("quality")) for row in selected)
+    )
+    n_from_executions = len(selected)
 
-    realized_quality = float(sum(_as_float(row.get("quality")) for row in selected))
-    n_completed = len(selected)
-    denominator = _completion_denominator(run, n_completed)
-    completion_rate = n_completed / denominator if denominator else 0.0
-
-    # The run summary contains costs for all billable outcomes, including failed
-    # and causally invalid executions that do not appear in the exported detail
-    # file.  Recombine its two components instead of charging only the pass that
-    # supplied each task's credited quality.
     submission_cost = _as_float(run.get("submission_cost"), 0.0)
     if "execution_cost" in run:
         execution_cost = _as_float(run.get("execution_cost"), 0.0)
@@ -222,12 +223,38 @@ def reconstruct_run(
         cost_source = "execution-detail fallback"
 
     total_cost = submission_cost + execution_cost
-    utility = realized_quality - total_cost
 
-    completed_groups = {
-        str(row.get("group") or row.get("task")) for row in selected
-    }
-    n_groups_completed = len(completed_groups)
+    if "realized_quality" in run:
+        realized_quality = _as_float(run.get("realized_quality"))
+        quality_source = "run realized_quality (live request table)"
+    elif "quality" in run:
+        realized_quality = _as_float(run.get("quality"))
+        quality_source = "run quality"
+    else:
+        realized_quality = quality_from_executions
+        quality_source = "execution-detail fallback"
+
+    n_completed = (
+        _as_nonnegative_int(run.get("n_tasks_completed"))
+        or _as_nonnegative_int(run.get("n_tasks_completed_valid"))
+        or n_from_executions
+    )
+    denominator = _completion_denominator(run, n_completed)
+    if "task_completion_rate" in run:
+        completion_rate = _as_float(run.get("task_completion_rate"))
+    else:
+        completion_rate = n_completed / denominator if denominator else 0.0
+
+    if "utility" in run:
+        utility = _as_float(run.get("utility"))
+    else:
+        utility = realized_quality - total_cost
+
+    n_groups_completed = _as_nonnegative_int(run.get("n_groups_completed"))
+    if n_groups_completed is None:
+        n_groups_completed = len({
+            str(row.get("group") or row.get("task")) for row in selected
+        })
     n_groups_total = _as_nonnegative_int(run.get("n_groups_total"))
 
     corrected.update(
@@ -246,17 +273,23 @@ def reconstruct_run(
             "reachable_task_completion_rate": completion_rate,
             "task_completion_rate_pct": 100.0 * completion_rate,
             "n_groups_completed": n_groups_completed,
-            "corrected_from_executions": True,
-            "quality_definition": "best valid execution per task",
-            "completion_definition": "valid completed tasks / corrected reachable tasks",
+            "corrected_from_executions": False,
+            "quality_from_executions": quality_from_executions,
+            "n_completed_from_executions": n_from_executions,
+            "quality_definition": quality_source,
+            "completion_definition": (
+                "run n_tasks_completed / n_tasks_reachable "
+                "(dispatcher-enforced gates; parent failures stay misses)"
+            ),
             "cost_source": cost_source,
             "source_file": run_file.name,
-            "execution_source_file": execution_file.name,
+            "execution_source_file": execution_file.name if execution_file else "",
         }
     )
 
     if n_groups_total:
-        corrected["group_completion_rate"] = n_groups_completed / n_groups_total
+        if "group_completion_rate" not in run:
+            corrected["group_completion_rate"] = n_groups_completed / n_groups_total
 
     n_tasks_total = _as_nonnegative_int(run.get("n_tasks_total"))
     if n_tasks_total:
@@ -293,18 +326,20 @@ def load_corrected_results(folders: list[str], base_dir: str = ".") -> pd.DataFr
         folder_name = folder_path.name
         for run_file in sorted(folder_path.glob("run_*.json")):
             execution_file = _find_execution_file(run_file)
-            if execution_file is None:
-                print(f"  [Warning] No unique execution file for {run_file.name} â€” skipping")
-                skipped += 1
-                continue
-
             try:
                 run = _load_json(run_file)
-                executions = _load_json(execution_file)
                 if not isinstance(run, dict) or "scheduler" not in run:
                     raise ValueError("run JSON is not a scheduler summary")
-                if not isinstance(executions, list):
-                    raise ValueError("execution JSON is not a list")
+
+                executions: list[dict[str, Any]] = []
+                if execution_file is not None:
+                    raw_exec = _load_json(execution_file)
+                    if not isinstance(raw_exec, list):
+                        raise ValueError("execution JSON is not a list")
+                    executions = raw_exec
+                else:
+                    print(f"  [Note] No execution file for {run_file.name}; "
+                          "scoring from the run summary only")
 
                 record = reconstruct_run(
                     run, executions, run_file=run_file, execution_file=execution_file
@@ -336,7 +371,7 @@ def load_corrected_results(folders: list[str], base_dir: str = ".") -> pd.DataFr
                 skipped += 1
 
         print(
-            f"  [Folder] {folder_name}: reconstructed {loaded} runs "
+            f"  [Folder] {folder_name}: scored {loaded} runs "
             f"(skipped {skipped})"
         )
 
