@@ -188,6 +188,17 @@ class InstrumentType(Enum):
     HYPERSPECTRAL = 2
     TIR = 3
 
+    # The three original sensors conflated "needs the sun" with "blocked by
+    # cloud". TIR separates them: thermal works at night but not through cloud,
+    # because water is opaque at 8-14 um just as it is in the visible.
+    @property
+    def illumination_required(self) -> bool:
+        return self in (InstrumentType.RGB, InstrumentType.HYPERSPECTRAL)
+
+    @property
+    def cloud_sensitive(self) -> bool:
+        return self is not InstrumentType.SAR
+
 class AttitudeController(Enum):
     FREE = 0
     INSTRUMENT = 1

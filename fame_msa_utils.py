@@ -1,52 +1,5 @@
 """
 MSA ship-tracking utilities: particle-filter tracker, propagator, H3 tessellation.
-
-=============================================================================
-CHANGES vs the previous version
-=============================================================================
-
-F1. ship_propagator returned LAND POINTS silently.
-    The rejection loop is `while (on_land and _it_guesses < max_iters)`, so on
-    exhaustion `_it_guesses == max_iters` (5000) -- but the guard tested
-    `== max_iters - 1` (4999), which can never hold.  After 5000 failed draws
-    the function fell through and returned the last computed point, which is on
-    land.  Near Rotterdam that happens often.  The error message was also
-    inverted ("stay on land").
-    FIX: explicit `if next_point_is_on_land:` check that HOLDS POSITION, which
-    is what generate_ship_trajectory does on the same failure -- so truth and
-    filter degrade identically instead of diverging.
-
-F2. The filter's process model did not match the generative model.
-    propagate_locations was called with max_dt=3h: ONE heading perturbation
-    followed by a straight ~55 km ray.  The ground truth walks six perturbed
-    30-minute segments.  The resulting cloud was angularly too narrow and
-    geometrically the wrong shape (ray vs. curved walk), so the ship could sit
-    outside the cloud while the filter was confident.
-    FIX: `filter_step` parameter, default 30 min, threaded through every
-    propagation call.  It must equal the truth's step.
-
-F3. The particle cloud multiplied combinatorially.
-    propagate_locations fanned out EVERY existing particle into `samples` new
-    ones: a 200-particle cloud became 40,000 propagations per query time,
-    each running a land-rejection loop, before being pruned back to 200.
-    Quadratic work for no extra information.
-    FIX: fan out only enough to reach the target population -- N particles
-    propagate 1:1; a 1-particle cloud (just re-initialised from a fix) fans out
-    to the full target.
-
-F4. The filter could not re-initialise on the redundant dispatch path.
-    Re-init scanned for completed tasks with `observation_opportunity is not
-    None`; that attribute is set by the legacy dispatcher but not by
-    Broker.schedule_workflow_redundant, so the scan came back empty and the
-    filter propagated from the t=0 initial pose for the entire run -- every
-    follow-up aimed at the harbour, hours stale.
-    FIX: _observation_time() falls back to the data product's own timestamps,
-    so re-init works regardless of which dispatcher ran.
-
-F5. Assorted robustness: `len(r.data_product)` crashed when data_product was
-    None; an empty cloud after negative-sample filtering was not detected;
-    NaN point_counts from the spatial join were not filled; a query time
-    earlier than last_update_time silently moved the clock backwards.
 """
 
 from shapely import Polygon

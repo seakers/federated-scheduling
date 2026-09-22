@@ -338,14 +338,16 @@ def compute_metrics_v3(workflow_graph, broker, ObservationStatus,
     # ---------------------------------------------------------------------------
     # 3. Per-execution detail list
     # ---------------------------------------------------------------------------
-    # For every pass that actually executed (DATA_RECEIVED), record quality and
-    # realized cost. Quality is geometry-based (task.rewarder), not detection-based.
-    # Only passes for reachable tasks are included — same causal filter as
-    # task_completion_rate.
+    # Every DATA_RECEIVED pass, including those this function's AND-cascade
+    # judged unreachable.  The dispatcher already enforced SUCCESS (and OR via
+    # success_constraint_mode='any'); dropping those rows made the export a
+    # strict subset of what actually flew.  is_valid still records the AND
+    # judgement for diagnostics.  Post-processing scores the run summary, not
+    # this list.
     execution_details = []
     for _, row in reqs[reqs['status'] == S['received']].iterrows():
         task = obsreq_to_task.get(row['request'])
-        if task is None or task not in reachable_tasks:
+        if task is None:
             continue
         rp = row['requested_pass']
         sat = row['satellite']

@@ -511,9 +511,9 @@ def _solve_with_gurobi(
             # prunes the log machinery to zero, so most windows build as a PURE
             # MILP with no nonlinear constraints at all.
             if stochastic_formulation == "general_logical_dag":
-                model.setParam('FuncNonlinear', 1)
-                # model.setParam('FuncPieceError', 1e-2)  # Tighten tolerance (default: 1e-3)
-                # model.setParam('FuncPieces', -2)
+                model.setParam('FuncNonlinear', 0)
+                model.setParam('FuncPieceError', 1e-1)  # Tighten tolerance (default: 1e-3)
+                model.setParam('FuncPieces', -2)
             else:
                 model.setParam('FuncNonlinear', 0)
                 model.setParam('FuncPieceError', 1e-2)  # Tighten tolerance (default: 1e-3)
@@ -716,47 +716,98 @@ def _solve_with_gurobi(
                     f"(logs={sum(1 for gc in model.getGenConstrs() if gc.GenConstrType == GRB.GENCONSTR_LOG)})")
 
             # === MIP STARTS ===
-            # Two starts; Gurobi keeps whichever produces an incumbent.
-            #   0: temporal-aware greedy -- best-quality non-overlapping pass per
-            #      task, walked in DAG order so a child is only placed against an
-            #      already-placed parent.
-            #   1: mandatory-only fallback -- one pass per mandatory task, zeros
-            #      elsewhere. Trivially satisfies the recurrence (unbooked tasks
-            #      collapse to y=1, S=0) and is the safety net when 0 is rejected.
-            #
-            # The original single greedy start ignored the pairwise TEMPORAL
-            # exclusions and ordered tasks by quality rather than topologically,
-            # so it violated a constraint on essentially every solve and left hard
-            # solves with NO incumbent.
+            # Gurobi keeps whichever start produces an incumbent.
+            #   0: greedy-N -- same policy as the greedy scheduler: up to
+            #      min(task.max_num_instances, default_max_instances) highest-
+            #      quality non-overlapping passes, DAG order, TEMPORAL + SUCCESS.
+            #   1: expected-value greedy-N -- same filters; pick by
+            #      Q * theta * remaining first-success risk (diminishing).
+            #   2: mandatory-only -- one pass per mandatory task (safety net).
             from fame_workflow import ConstraintClass, TemporalConstraintType
 
-            def _temporal_ok(_child, _t_child, _placed_times):
+            def _temporal_ok(_child, _t_child, _placed_slots):
                 if workflow_graph is None or _child not in workflow_graph:
                     return True
                 for _parent in workflow_graph.predecessors(_child):
-                    _t_parent = _placed_times.get(_parent)
-                    if _t_parent is None:
+                    _slots = _placed_slots.get(_parent)
+                    if not _slots:
                         continue
+                    _rel = []
                     for _k, _c in (workflow_graph.get_edge_data(_parent, _child) or {}).items():
                         if _c.get('constraint_class') != ConstraintClass.TEMPORAL:
                             continue
-                        _off = (_c.get('parameters') or {}).get('offset', dt.timedelta(0))
-                        _ct = _c.get('constraint_type')
-                        if _ct == TemporalConstraintType.START_AFTER and _t_parent > _t_child:
-                            return False
-                        if _ct == TemporalConstraintType.START_AFTER_OFFSET and _t_parent + _off > _t_child:
-                            return False
-                        if _ct == TemporalConstraintType.START_BEFORE and _t_parent < _t_child:
-                            return False
-                        if _ct == TemporalConstraintType.START_BEFORE_OFFSET and _t_parent + _off < _t_child:
-                            return False
+                        _rel.append((
+                            _c.get('constraint_type'),
+                            (_c.get('parameters') or {}).get('offset', dt.timedelta(0)),
+                        ))
+                    if not _rel:
+                        continue
+
+                    def _ok_one(_t_parent, _rel=_rel):
+                        for _ct, _off in _rel:
+                            if _ct == TemporalConstraintType.START_AFTER and _t_parent > _t_child:
+                                return False
+                            if _ct == TemporalConstraintType.START_AFTER_OFFSET and _t_parent + _off > _t_child:
+                                return False
+                            if _ct == TemporalConstraintType.START_BEFORE and _t_parent < _t_child:
+                                return False
+                            if _ct == TemporalConstraintType.START_BEFORE_OFFSET and _t_parent + _off < _t_child:
+                                return False
+                        return True
+
+                    if not any(_ok_one(_s) for _s, _e in _slots):
+                        return False
                 return True
+
+            def _success_ok(_child, _t_child, _placed_slots):
+                if not getattr(_child, 'enforce_success_precedence', False):
+                    return True
+                if workflow_graph is None or _child not in workflow_graph:
+                    return True
+                _parents = []
+                for _parent in workflow_graph.predecessors(_child):
+                    _edges = workflow_graph.get_edge_data(_parent, _child) or {}
+                    if any(_c.get('constraint_class') == ConstraintClass.SUCCESS
+                           for _c in _edges.values()):
+                        _parents.append(_parent)
+                if not _parents:
+                    return True
+
+                def _precedes(_parent):
+                    for _s, _e in _placed_slots.get(_parent, []):
+                        if _e <= _t_child:
+                            return True
+                    if _parent in solution_holder:
+                        return False
+                    _oo = getattr(_parent, 'observation_opportunity', None)
+                    _t = getattr(_oo, 'time', None)
+                    if _t is not None:
+                        _dur = getattr(_oo, 'duration', dt.timedelta(0))
+                        return _t + _dur <= _t_child
+                    for _b in getattr(_parent, 'scheduled_bookings', None) or []:
+                        _p = _b.get('pass')
+                        if _p is None:
+                            continue
+                        if _p.highest.time + _p.highest.duration <= _t_child:
+                            return True
+                    return False
+
+                _mode = getattr(_child, 'success_constraint_mode', 'all')
+                if _mode == 'any':
+                    return any(_precedes(_p) for _p in _parents)
+                return all(_precedes(_p) for _p in _parents)
 
             def _free_on_sat(_busy, _sat, _s0, _e0):
                 return all(_e0 <= s or _s0 >= e for (s, e) in _busy.get(_sat, []))
 
-            def _build_start(mandatory_only: bool):
-                _busy, _placed_times, _x_vals, _ok = {}, {}, {}, True
+            def _task_k(_req, mandatory_only):
+                if mandatory_only:
+                    return 1
+                _per = int(getattr(_req, 'max_num_instances', 1) or 1)
+                return max(1, min(_per, int(default_max_instances)))
+
+            def _build_start(mandatory_only: bool, score="quality"):
+                _busy, _placed_slots, _x_vals, _ok = {}, {}, {}, True
                 try:
                     _order = [r for r in nx.topological_sort(workflow_graph) if r in solution_holder]
                     _order += [r for r in solution_holder if r not in set(_order)]
@@ -769,31 +820,54 @@ def _solve_with_gurobi(
                         _x_vals[(_req, _sat, _sp)] = 0.0
                     if mandatory_only and not getattr(_req, 'is_mandatory', False):
                         continue
-                    _cands = sorted(_passes,
-                                    key=lambda sp_: -solution_holder[_req][sp_[0]][sp_[1]]['quality'])
-                    _placed = False
-                    for _sat, _sp in _cands:
-                        _s0 = _sp.highest.time
-                        _e0 = _s0 + _sp.highest.duration
-                        if not _free_on_sat(_busy, _sat, _s0, _e0):
-                            continue
-                        if not _temporal_ok(_req, _s0, _placed_times):
-                            continue
+                    _k_want = _task_k(_req, mandatory_only)
+                    _remaining = list(_passes)
+                    _y = 1.0
+                    _n_placed = 0
+                    while _n_placed < _k_want and _remaining:
+                        _best_i = None
+                        _best_sc = None
+                        _best = None
+                        for _i, (_sat, _sp) in enumerate(_remaining):
+                            _s0 = _sp.highest.time
+                            _e0 = _s0 + _sp.highest.duration
+                            if not _free_on_sat(_busy, _sat, _s0, _e0):
+                                continue
+                            if not _temporal_ok(_req, _s0, _placed_slots):
+                                continue
+                            if not _success_ok(_req, _s0, _placed_slots):
+                                continue
+                            _h = solution_holder[_req][_sat][_sp]
+                            if score == "ev":
+                                _sc = float(_h['quality']) * float(_h.get('theta', 1.0)) * _y
+                            else:
+                                _sc = float(_h['quality'])
+                            if _best is None or _sc > _best_sc:
+                                _best = (_sat, _sp, _s0, _e0, _h)
+                                _best_sc = _sc
+                                _best_i = _i
+                        if _best is None:
+                            break
+                        _sat, _sp, _s0, _e0, _h = _best
                         _x_vals[(_req, _sat, _sp)] = 1.0
                         _busy.setdefault(_sat, []).append((_s0, _e0))
-                        _placed_times[_req] = _s0
-                        _placed = True
-                        break
-                    if (not _placed) and getattr(_req, 'is_mandatory', False) and _passes:
+                        _placed_slots.setdefault(_req, []).append((_s0, _e0))
+                        _y *= (1.0 - float(_h.get('theta', 1.0)))
+                        _remaining.pop(_best_i)
+                        _n_placed += 1
+                    if _n_placed == 0 and getattr(_req, 'is_mandatory', False) and _passes:
                         _ok = False
                 return _x_vals, _ok
 
             try:
                 _starts = []
-                _greedy_x, _greedy_ok = _build_start(mandatory_only=False)
-                if _greedy_ok:
-                    _starts.append(("greedy", _greedy_x))
-                _fallback_x, _fallback_ok = _build_start(mandatory_only=True)
+                _gn_x, _gn_ok = _build_start(mandatory_only=False, score="quality")
+                if _gn_ok:
+                    _starts.append(("greedy-n", _gn_x))
+                _ev_x, _ev_ok = _build_start(mandatory_only=False, score="ev")
+                if _ev_ok:
+                    _starts.append(("ev-greedy-n", _ev_x))
+                _fallback_x, _fallback_ok = _build_start(mandatory_only=True, score="quality")
                 if _fallback_ok:
                     _starts.append(("mandatory-only", _fallback_x))
 
@@ -803,13 +877,10 @@ def _solve_with_gurobi(
                         model.params.StartNumber = _i
                         for (_req, _sat, _sp), _v in _xv.items():
                             solution_holder[_req][_sat][_sp]['x'].Start = _v
-                        # Propagate the continuous chain ONLY under PWL. With
-                        # FuncNonlinear=1 the numerical forward pass cannot satisfy
-                        # the exact exp/log constraints to tolerance, and a single
-                        # violated value invalidates the whole start -- binaries
-                        # alone let Gurobi solve the continuous completion itself.
-                        if (_general_logical_warm_start_fn is not None
-                                and stochastic_formulation != "general_logical_dag"):
+                        # general_logical_dag is PWL (FuncNonlinear=0). A binary-
+                        # only start is incomplete against the log/exp pieces and
+                        # Gurobi drops it ("did not produce a new incumbent").
+                        if _general_logical_warm_start_fn is not None:
                             _general_logical_warm_start_fn(_xv)
                     model.params.StartNumber = -1
                     if verbose > 0:
