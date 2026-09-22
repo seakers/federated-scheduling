@@ -91,7 +91,7 @@ FOLLOW_UP_INTERVAL_H = 2
 HOURS_TO_DETECT = 3
 MAX_SOLVER_TIME_S = 120
 MAX_NUM_INSTANCES = 10
-NUM_MC_RUNS = 1
+NUM_MC_RUNS = 20
 
 # === COST CONFIGURATION ===
 TAX_RATE = 0.0              # Legacy per-booking tax (disabled)
@@ -117,6 +117,10 @@ PROVIDER_RATES = {
     "Mission Control": 0.08,
     "AC":              0.08,
     "ICEYE":           0.15,
+    # Wide-swath uncooled thermal: cheap per collect.
+    "OroraTech":       0.06,
+    # Cryocooled MCT thermal, 15x15 km scenes: premium, capacity-limited.
+    "constellr":       0.18,
 }
 # PROVIDER_RATES = { #Stochastic > deterministic > Greedy > Random
 #     "Planet":          0.01,
@@ -159,6 +163,7 @@ P_EXEC_MAX = 0.80           # Maximum execution probability (best geometry)
 
 SCHEDULERS = ['greedy_n','stochastic_log', 'greedy','deterministic', 'random', 'super_random']
 #SCHEDULERS = ['greedy']
+#SCHEDULERS = ['greedy_n']
 #SCHEDULERS = ['deterministic']
 #SCHEDULERS = ['super_random', 'greedy']
 
@@ -198,6 +203,8 @@ def create_world_and_constellations(cached_satellites: list[Satellite],
     mission_control_sats = [s for s in local_satellites if "PERSISTENCE" in s.name.upper() or "LEMUR" in s.name.upper()]
     aerospace_sats = [s for s in local_satellites if "AEROCUBE" in s.name.upper()]
     iceye_sats = [s for s in local_satellites if "ICEYE" in s.name.upper()]
+    ororatech_sats = [s for s in local_satellites if "FOREST" in s.name.upper()]
+    constellr_sats = [s for s in local_satellites if "SKYBEE" in s.name.upper()]
 
     if demand_field is not None:
         _sim_acc_fn = demand_field.make_simulator_acceptance_function()
@@ -224,10 +231,13 @@ def create_world_and_constellations(cached_satellites: list[Satellite],
     scheduler_mission_control = _make_scheduler(mission_control_sats, "Mission Control", 0.64)
     scheduler_aerospace       = _make_scheduler(aerospace_sats,       "AC",              0.67)
     scheduler_iceye           = _make_scheduler(iceye_sats,           "ICEYE",           0.74)
+    scheduler_ororatech       = _make_scheduler(ororatech_sats,       "OroraTech",       0.78)
+    scheduler_constellr       = _make_scheduler(constellr_sats,       "constellr",       0.72)
 
     all_constellations = [
         scheduler_planet, scheduler_umbra, scheduler_capella, scheduler_loft,
-        scheduler_ubotica, scheduler_mission_control, scheduler_aerospace, scheduler_iceye
+        scheduler_ubotica, scheduler_mission_control, scheduler_aerospace, scheduler_iceye,
+        scheduler_ororatech, scheduler_constellr
     ]
 
     for constellation in all_constellations:
@@ -259,7 +269,8 @@ def build_demand_field(volcano_db_locations, min_time):
         demand_field.add_spike(vloc.lat_deg, vloc.lon_deg, min_time)
 
     _all_constellation_names = ["Planet", "Umbra", "Capella", "LOFT",
-                                "Ubotica", "Mission Control", "AC", "ICEYE"]
+                                "Ubotica", "Mission Control", "AC", "ICEYE",
+                                "OroraTech", "constellr"]
     print("[DemandField] Precomputing demand trajectories...")
     demand_field.precompute(_all_constellation_names)
     print("[DemandField] Precompute complete.")
@@ -443,6 +454,35 @@ def run_one_scheduler(scheduler, seed, cached_satellites, volcano_db_locations,
                 max_reschedule_depth=10000,
                 plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
                 results_path=plots_dir
+            )
+        elif scheduler == 'greedy_n':
+            # REDUNDANCY ABLATION. Same redundancy budget as the stochastic
+            # planner (MAX_NUM_INSTANCES) and the same cancellation policy, but
+            # selection is purely local: top-N passes by quality per task, no
+            # cross-task contention reasoning, no acceptance/execution
+            # probabilities, no gates.
+            #
+            # This is the baseline that separates "books backups" from "sees the
+            # DAG". Expected best-of-successes is monotone submodular in the
+            # horizontal track, so quality-ordered greedy is NEAR-OPTIMAL there --
+            # any remaining gap to the stochastic planner is attributable to the
+            # AND/OR/NOT structure rather than to the redundancy itself.
+            #
+            # enable_cancellations MUST match the stochastic run: without it
+            # greedy-N pays for all N passes even after one succeeds, and the
+            # cost comparison stops meaning anything.
+            broker.schedule_workflow_redundant(
+                current_time=world.time, use_ilp=False, use_stochastic=False,
+                max_solver_time_s=MAX_SOLVER_TIME_S,
+                update_timelines=False, update_requests=True, tax_rate=TAX_RATE,
+                receding_horizon_duration=_horizon,
+                submission_cost_rate=SUBMISSION_COST,
+                execution_cost_fn=execution_cost_fn,
+                max_reschedule_depth=10000,
+                plot_schedule=plot_schedule, save_schedule_plot=plot_schedule,
+                results_path=plots_dir,
+                enable_cancellations=ENABLE_CANCELLATIONS,
+                greedy_max_instances=MAX_NUM_INSTANCES,
             )
         elif scheduler == 'random':
             broker.schedule_workflow_redundant(
